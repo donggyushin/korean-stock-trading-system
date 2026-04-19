@@ -164,6 +164,7 @@ stock-agent/
 - 2번째 전략 추가 (예: VWAP 반등) 후 A/B
 - 장시간 안정성 요구되면 네이버클라우드/AWS Seoul VPS 이전 (월 5천~2만원)
 - 종목 선정 로직 고도화 (거래대금 상위, 변동성 필터)
+- `scripts/update_universe.py` — CSV 기반 `config/universe.yaml` 갱신 자동화. 분기 수동 갱신 워크플로우의 휴먼 에러 제거. `data/universe_imports/*.csv` 최신 파일 자동 선택(또는 `--csv <path>`), 인코딩 자동 감지, 로더 정규식과 동일한 티커 검증, 임시 가상 코드(`NNNNZ0` 등) 자동 제외 + 주석 기록, 티커 수 ±20% 편차 가드, 기본 드라이런(diff 출력) + 명시적 `--apply` 플래그로만 YAML 덮어쓰기. 부팅 시 자동 스캔은 지양(결정론성 보호 — 장중에 파일이 떨어져 유니버스가 바뀌는 사고 방지). git add/commit 은 운영자 책임.
 - 성능 모니터링 대시보드 (Streamlit 또는 Grafana)
 
 ---
