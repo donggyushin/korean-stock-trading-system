@@ -91,8 +91,17 @@ Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국
   - GitHub Actions CI 도입 (`.github/workflows/ci.yml`): PR 및 main push 시 `uv sync --frozen` → ruff/black 정적 분석 → pytest 자동 실행. 첫 실행 12초, 10/10 통과 (PR #1 검증).
   - main 브랜치 보호 적용: required status check `Lint, format, test` (CI job), `strict=true`, force push/삭제 금지.
 
-- **다음 단계: Phase 1 — 브로커 래퍼 + 데이터 파이프라인**
-  1. `src/stock_agent/broker/kis_client.py` — 토큰 발급/갱신, 잔고 조회, 매수/매도 주문, 미체결 조회
+- **Phase 1 진행 중 — 브로커 래퍼 + 데이터 파이프라인** (첫 산출물 완료 2026-04-19)
+  - `src/stock_agent/broker/` 패키지 신설 (`__init__.py`, `kis_client.py`)
+  - `KisClient` 클래스: 공개 API 4종 — `get_balance()`, `place_buy()`, `place_sell()`, `get_pending_orders()`. `BalanceSnapshot`, `OrderTicket`, `PendingOrder`, `Holding` DTO(`@dataclass(frozen=True, slots=True)`)로 정규화. 컨텍스트 매니저(`__enter__`/`__exit__`) 지원.
+  - paper 완전 지원. `kis_env == "live"` 시 `NotImplementedError` 즉시 발생 — Phase 4 실전 키 발급 전까지 방어.
+  - 예외 정책: `RuntimeError`(설정 오류)는 래핑 없이 전파, 그 외 `Exception`은 `KisClientError(...from e)` + loguru `exception` 로그.
+  - 의존성 주입(`pykis_factory`)으로 테스트에서 실제 `pykis.PyKis` import 원천 차단.
+  - `scripts/healthcheck.py` — `KisClient` 컨텍스트 매니저로 전환, 예수금 10,000,000원 조회 회귀 없음.
+  - pytest 22건 green (test_config 5 + test_kis_client 12 + test_safety 5).
+
+- **다음 작업 (Phase 1 잔여)**
+  1. ~~`src/stock_agent/broker/kis_client.py`~~ — 완료
   2. `src/stock_agent/broker/rate_limiter.py` — KIS 초당 호출 제한 대응
   3. `src/stock_agent/data/historical.py` — pykrx로 KOSPI 200 분봉/일봉 수집 & SQLite 캐시
   4. `src/stock_agent/data/realtime.py` — 장중 분봉 폴링 또는 WebSocket 실시간 체결가
