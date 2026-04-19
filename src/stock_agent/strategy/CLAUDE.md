@@ -1,0 +1,149 @@
+# strategy — ORB 전략 엔진
+
+stock-agent 의 전략 경계 모듈. `Strategy` Protocol + `ORBStrategy` 구현체를 제공하고,
+분봉 DTO(`MinuteBar`) 와 시각 이벤트(`on_time`) 를 소비해 상위 레이어(backtest/execution)에 정규화된 시그널 DTO만 노출한다.
+
+> 이 파일은 root [CLAUDE.md](../../../CLAUDE.md) 의 하위 문서이다. 프로젝트 전반
+> 규약·리스크 고지·승인된 결정 사항은 root 문서를 따른다.
+
+## 공개 심볼 (`strategy/__init__.py`)
+
+`EntrySignal`, `ExitReason`, `ExitSignal`, `ORBStrategy`, `Signal`, `Strategy`, `StrategyConfig`, `StrategyError`
+
+## 현재 상태 (2026-04-20 기준)
+
+**Phase 2 첫 산출물 완료 (코드·테스트 레벨)** (2026-04-20). Phase 2 전체 PASS 선언은 `risk/manager.py` · `backtest/engine.py` 완료 이후.
+
+### `base.py` — Protocol + DTO + 상수
+
+- **`Strategy` Protocol** (`@runtime_checkable` 미부착 — 타입 체커 레벨 강제만)
+  - `on_bar(self, bar: MinuteBar) -> list[Signal]`
+  - `on_time(self, now: datetime) -> list[Signal]`
+  - 두 메서드 모두 생성 시그널이 없으면 **빈 리스트** 반환. 잘못된 입력은 `RuntimeError` 로 전파. "없음" 을 `None` 으로 표현하지 않는다.
+- **`EntrySignal`** (`@dataclass(frozen=True, slots=True)`)
+  - 필드: `symbol: str`, `price: Decimal`, `ts: datetime` (KST aware), `stop_price: Decimal`, `take_price: Decimal`.
+  - `price` 는 분봉 close 참고가, `stop_price` / `take_price` 는 진입가 × (1 ∓ pct). executor 가 실제 체결가로 덮어쓰는 것을 전제. 호가 단위 반올림은 strategy 범위 밖 — Decimal 원시값을 그대로 전달한다 (executor 책임).
+- **`ExitSignal`** (`@dataclass(frozen=True, slots=True)`)
+  - 필드: `symbol: str`, `price: Decimal`, `ts: datetime`, `reason: ExitReason`.
+  - `price` 는 `stop_price` / `take_price` / 마지막 관찰 close (또는 entry_price 폴백) 중 사유에 맞는 값. executor 가 실제 체결가로 덮어씀.
+- **`ExitReason`** (`Literal`): `"stop_loss" | "take_profit" | "force_close"`. plan.md / 로그 / 텔레그램 알림 용어와 일관.
+- **`Signal`** 타입 별칭: `EntrySignal | ExitSignal`. (`None` 포함 안 함 — "없음" 은 빈 `list[Signal]` 로 표현.)
+- **`KST`** 상수: `timezone(timedelta(hours=9))` (고정 오프셋 — `zoneinfo` 미사용. `data/realtime.py` 의 `KST` 와 값 동일하지만 교차 import 회피 목적의 로컬 선언).
+
+### `orb.py` — ORBStrategy 상태 머신
+
+- **`StrategyConfig`** (`@dataclass(frozen=True, slots=True)`, `__post_init__` 검증)
+
+  | 필드 | 기본값 | 설명 |
+  |---|---|---|
+  | `or_start` | `time(9, 0)` | OR 집계 시작 (**포함**) |
+  | `or_end` | `time(9, 30)` | OR 집계 종료 (**미포함** — 09:30 정각 bar 는 돌파 판정 분기) |
+  | `force_close_at` | `time(15, 0)` | 강제청산 시각 및 신규 진입 금지 경계 (해당 시각 **이상**이면 진입 금지) |
+  | `stop_loss_pct` | `Decimal("0.015")` | 손절 비율 (1.5%) |
+  | `take_profit_pct` | `Decimal("0.030")` | 익절 비율 (3.0%) |
+
+  `__post_init__` 검증 (위반 시 **`RuntimeError`** — `ValueError` 아님): `stop_loss_pct > 0`, `take_profit_pct > 0`, `or_start < or_end`, `or_end < force_close_at`. 시각 필드는 **naive `datetime.time`** (KST 기준 암묵 해석 — `bar.bar_time.time()` 이 naive 를 반환하므로 일관성). `RuntimeError` 채택은 broker/data 의 "사용자 수정 필요 입력 오류 → `RuntimeError` 전파" 기조와 일관.
+
+- **`ORBStrategy`** — per-symbol 독립 상태 머신.
+  - `PositionState = Literal["flat", "long", "closed"]` — **IDLE 상태는 없다**. `_SymbolState` 는 초기부터 `position_state="flat"` 으로 생성되고, OR 구간 이전·누적 중 모두 같은 `flat` 값이다. FLAT 은 "아직 진입 전" 을 포괄한다.
+  - 상태 전이:
+
+    ```text
+    flat  ──(bar.close > or_high  &&  or_end ≤ bar_t < force_close_at)──▶ long
+    long  ──(bar.low ≤ stop_price)──▶ closed   [reason=stop_loss]
+    long  ──(bar.high ≥ take_price)──▶ closed  [reason=take_profit]
+    long  ──(on_time: now.time() ≥ force_close_at)──▶ closed  [reason=force_close]
+    closed ──(새 session_date 진입)──▶ flat  (상태 리셋)
+    ```
+
+  - **세션 경계 자동 리셋**: `bar.bar_time.date()` 변경 감지 시 `_SymbolState.reset(new_date)` — OR 누적·포지션·`last_bar_time`·`last_close`·`or_missing_warned` 플래그까지 전부 초기화. 멀티데이 백테스트·장일 경계에서 추가 훅 불필요.
+  - **OR 집계**: `or_start ≤ bar.bar_time.time() < or_end` 구간 분봉을 누적해 `or_high` / `or_low` 갱신. `or_start` 미만 bar 는 조용히 무시(장 시작 전 데이터, 정상 케이스).
+  - **진입 조건 (FLAT → LONG)** — 모두 AND:
+    1. `bar.bar_time.time() ≥ or_end` (OR 확정 이후)
+    2. `bar.bar_time.time() < force_close_at` (마감 30분 이내 신규 진입 금지 — `≥ force_close_at` 이면 `logger.debug` 후 스킵)
+    3. `state.or_high is not None` (OR 구간에 bar 가 최소 1건 수집됨 — 미수집이면 세션당 1회 `logger.warning` 후 당일 포기, 이후 같은 세션에서는 dedupe)
+    4. `bar.close > or_high` (strict greater — 터치만은 진입 아님)
+  - **청산 판정 (LONG, `_check_exit`)** — 우선순위 순:
+    1. `bar.low ≤ stop_price` → `ExitSignal(reason="stop_loss", price=stop_price)` — **손절 우선** (동일 bar 에서 익절도 성립 시 슬리피지 과소평가 방지).
+    2. `bar.high ≥ take_price` → `ExitSignal(reason="take_profit", price=take_price)`.
+    3. 둘 다 미성립 → `None` (상태 유지).
+  - **강제청산 (`on_time`)**: `now.time() ≥ force_close_at` 이고 `position_state == "long"` 인 모든 심볼에 대해 `ExitSignal(reason="force_close")` 를 생성하고 `closed` 로 전이.
+    - 가격 선택: `state.last_close` 우선, 없으면 `state.entry_price` 로 폴백 + `logger.warning` (데이터 파이프라인 이상 신호 — 분봉이 한 번도 업데이트되지 않은 채 force_close 시각을 맞았다는 뜻). 둘 다 `None` 이면 `StrategyError` (long 상태에서 도달 불가능한 상태 머신 무결성 오류 — `_enter_long` 호출 누락 가능성).
+  - **1일 1심볼 재진입 금지**: `closed` 상태에서 돌파가 반복돼도 `logger.debug` 기록 후 빈 리스트 반환.
+
+- **입력 검증 (사전 가드, `RuntimeError` 전파)**
+  - `symbol` 6자리 숫자 정규식 (`^\d{6}$`).
+  - `bar.bar_time.tzinfo is None` → 거부 (aware datetime 강제).
+  - `now.tzinfo is None` (on_time) → 거부.
+  - per-symbol 시간 역행: `bar.bar_time < state.last_bar_time` → 거부 (백테스트 인덱스 실수·실시간 중복 수신 조기 발견). 동등 `bar_time` 은 통과.
+
+- **`StrategyError`** — 상태 머신 무결성 오류 (`_check_exit` 의 stop/take 미세팅, `on_time` 의 last_close·entry_price 둘 다 None) 또는 `Decimal` 연산 실패(`DecimalException`) 를 래핑. `logger.exception` 동반, 원본 예외는 `__cause__` 로 보존. broker/data 의 `*Error` 와 동일 기조.
+
+### 예외 경계 설계
+
+순수 로직 모듈이므로 **generic `except Exception` 을 쓰지 않는다.** 잡아야 할 예외 타입을 좁혀 선언해 코드 버그(AttributeError 등)가 silent 하게 익명화되는 것을 막는다.
+
+- `on_bar`: `except (RuntimeError, StrategyError): raise` + `except DecimalException` 만 `StrategyError` 로 래핑. 다른 예외는 직접 propagate.
+- `on_time`: 래퍼 자체 없음 — `Decimal` 연산이 없고 `RuntimeError` / `StrategyError` 만 발생.
+- 불변식 보호는 `assert` 대신 **명시적 `raise StrategyError(...)`** 로 한다 (`python -O` 에서 assert 가 제거되어 silent 하게 무너지는 위험 차단).
+
+### 운영 가시성 로그 (silent skip 금지)
+
+의도된 "빈 리스트 반환" 경로도 흔적은 남긴다. 운영 중 "왜 진입/청산이 없지?" 를 디버깅할 수 있어야 한다.
+
+| 경로 | 레벨 | dedupe |
+|---|---|---|
+| `force_close_at` 이후 FLAT 상태 진입 스킵 | `debug` | 없음 |
+| OR 구간 bar 미수집 → 당일 포기 | `warning` | 세션당 1회 (`or_missing_warned`) |
+| CLOSED 상태 재돌파 스킵 | `debug` | 없음 |
+| `on_time` 에서 `last_close` 없어 `entry_price` 폴백 | `warning` | 없음 (데이터 이상 신호) |
+
+### 테스트 현황
+
+pytest **36 케이스 green** (Phase 2 신규). 외부 목킹 불필요 — 순수 로직, 네트워크·시계·파일·DB 미사용.
+
+| 그룹 | 내용 |
+|---|---|
+| OR 누적 | 09:00~09:29 분봉 집계, 09:00 미만 무시, 지각 시작 bar 처리 |
+| 진입 시그널 | strict greater, OR 확정 전 돌파 거부, 진입 직후 추가 시그널 없음 |
+| 청산 시그널 | 손절 / 익절 / 동시성립 손절 우선 / 청산 후 재진입 차단 |
+| 강제청산 | `on_time(15:00)` long 심볼 → `force_close`, flat·closed 무시, `force_close_at` 커스터마이즈 |
+| 세션 전환 | 날짜 변경 리셋, 전날 closed 후 새 세션 재진입 허용 |
+| 복수 심볼 독립 | 상태 격리 |
+| 입력 검증 | symbol 포맷, naive datetime, 시간 역행 |
+| `StrategyConfig` 검증 | pct 음수·0, 시각 순서 위반 |
+
+I3 지적에 따른 경계 커버리지 보강(09:30 정각·`force_close_at` 이후 flat 진입 차단·`last_close is None` 폴백 경로·`or_confirmed` 전이) 은 별도 커밋에서 추가.
+
+## 설계 원칙
+
+- **라이브러리 타입 누출 금지**. `MinuteBar` 는 `data` 공개 DTO 로 소비. pykrx/python-kis 타입은 노출하지 않는다.
+- **얇은 래퍼**. 포지션 사이징·주문 실행·일일 손실 한도는 각각 `risk/manager.py`, `execution/executor.py` 책임. 이 모듈은 "분봉·시각 → 시그널" 변환만.
+- **코드 상수 우선**. `StrategyConfig` 는 생성자 주입. `config/strategy.yaml` 은 Phase 3 `main.py` 착수 시 도입 (지금은 코드 상수 + 주입). broker/data 와 동일 원칙.
+- **결정론**. 동일 입력 → 동일 출력. 외부 상태 읽기 없음. 시각은 `bar.bar_time` 과 `on_time(now)` 인자로만 받는다.
+- **얕은 예외 경계**. 순수 로직이므로 generic `except Exception` 을 쓰지 않는다. 잡아야 할 예외가 없는 가드는 코드 버그를 삼키는 해악이 크다.
+
+## 테스트 정책
+
+- 실 네트워크·시계·파일·DB 에 절대 접촉하지 않는다.
+- 외부 목킹 불필요 — `ORBStrategy` 는 순수 로직 클래스이고 주입 의존이 없다.
+- 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root CLAUDE.md 하드 규칙, `.claude/hooks/tests-writer-guard.sh` fail-closed).
+- 관련 테스트 파일: `tests/test_strategy_orb.py`.
+
+## 소비자 참고
+
+- **`backtest/engine.py`** (Phase 2 세 번째 산출물, 미착수): `backtesting.py` 래퍼가 `ORBStrategy.on_bar` 를 과거 `MinuteBar` 시계열에 순차 호출해 시그널을 수집하고 PnL 을 계산한다. `StrategyConfig` 는 백테스트 실행 시 생성자로 주입.
+- **`execution/executor.py`** (Phase 3, 미착수): 장중 루프에서 `RealtimeDataStore.get_current_bar(symbol)` 로 최신 분봉을 얻어 `ORBStrategy.on_bar` 에 넘기고, 분봉 경계 외 시각은 `on_time` 으로 강제청산 판정을 수행한다. 모든 시그널의 `price` 는 참고가이므로 executor 가 실제 체결가로 덮어써야 한다.
+- **`main.py`** (Phase 3, 미착수): `StrategyConfig` 를 `config/strategy.yaml` (Phase 3 착수 시 도입) 에서 로드해 `ORBStrategy` 생성자에 주입한다.
+
+## 범위 제외 (의도적 defer)
+
+- **포지션 사이징** — `risk/manager.py` (Phase 2 다음 산출물)
+- **일일 손실 한도·서킷브레이커** — `risk/manager.py`
+- **주문 실행·체결 추적** — `execution/executor.py` (Phase 3)
+- **거래대금·유동성 필터** — `MinuteBar.volume=0` 고정 제약 (Phase 1 메모). Phase 3 volume 실사 후 유니버스 필터 레이어에서 도입.
+- **틱 기반 진입 (`on_tick`)** — `Strategy` Protocol 확장 지점으로 열어둠. 현재는 분봉 close 기반으로 충분.
+- **백테스트 엔진** — `backtest/engine.py` (Phase 2 세 번째 산출물)
+- **`config/strategy.yaml`** — Phase 3 `main.py` 착수 시 도입
+- **복수 전략 조합·A/B** — Phase 5
+- **멀티스레드·프로세스 safe** — 단일 프로세스 전용 (broker/data 와 동일)
