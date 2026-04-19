@@ -137,8 +137,8 @@ stock-agent/
 - 레이트 리미터 (KIS 초당 ~20회 제한 대응)
 - **산출물**: 단위 테스트 + `healthcheck.py`에서 특정 종목 현재가 조회 성공
 
-### Phase 2 — 전략 + 백테스팅 + 리스크 모듈 (5~7일)
-- `strategy/orb.py`: 규칙 구현 (진입/청산 시그널 생성)
+### Phase 2 — 전략 + 백테스팅 + 리스크 모듈 (5~7일) — 진행 중
+- [x] `strategy/orb.py`: 규칙 구현 (진입/청산 시그널 생성) — 완료 2026-04-20
 - `risk/manager.py`: 포지션 사이징, 손절/익절, 일일 손실 한도
 - `backtest/engine.py`: 최근 2~3년 KOSPI 200 분봉 데이터로 ORB 백테스트
   - 리포트 항목: 총수익률, MDD, 샤프, 승률, 평균 손익비, 일평균 거래수, 수수료·세금 반영 후 순수익
@@ -240,3 +240,16 @@ Phase 0 완료 (2026-04-19). Phase 1 코드·테스트 레벨 PASS 선언 (2026-
 **미완료 조건**: 장중 실시간 시세 수신 end-to-end 확인(실전 키 + IP 화이트리스트 + 평일 장중 틱 수신)은 **Phase 3 착수 전제**로 이관 (plan.md Phase 3 섹션 착수 전제 항목 참조). 코드 경로 완성 + WebSocket 구독 등록 성공까지는 달성.
 
 **Phase 1 PASS 선언. Phase 2 착수.**
+
+---
+
+## Phase 2 진행 요약 (2026-04-20 기준)
+
+Phase 2 첫 산출물 완료. 전체 PASS 선언은 이후.
+
+1. [x] `src/stock_agent/strategy/orb.py` + `base.py` + `__init__.py` — 완료. `ORBStrategy` 상태 머신(IDLE→FLAT→LONG→CLOSED), `StrategyConfig`(frozen dataclass, 생성자 주입), `Strategy` Protocol(최소 — `on_bar`/`on_time`), `EntrySignal`/`ExitSignal`/`ExitReason` DTO. 설계 결정: 분봉 close 기준 strict 돌파, 동일 분봉 손절·익절 동시 성립 시 손절 우선, 1일 1회 진입, `force_close_at` 이후 신규 진입 금지, 세션 경계 자동 리셋. 의존성 추가 없음.
+2. [ ] `src/stock_agent/risk/manager.py` — 미착수
+3. [ ] `src/stock_agent/backtest/engine.py` — 미착수
+4. [ ] 파라미터 민감도 리포트 — 미착수
+
+pytest **167건 green** (기존 131 + 신규 36 — test_strategy_orb). ruff check/format 모두 green.
