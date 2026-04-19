@@ -20,7 +20,9 @@ _VALID_BASE_ENV: dict[str, str] = {
 
 
 @pytest.fixture(autouse=True)
-def _clear_settings_cache_and_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _clear_settings_cache_and_env(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
     """매 테스트 시작·종료 시 lru_cache 와 .env 영향 제거."""
     # .env 파일이 자동 로드되지 않도록 model_config 의 env_file 을 무력화
     monkeypatch.setenv("PYDANTIC_SETTINGS_DOTENV_DISABLED", "1")

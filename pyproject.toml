@@ -47,3 +47,12 @@ target-version = ["py311"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.pyright]
+# nvim/VS Code 등의 pyright LSP 가 프로젝트 venv 와 src layout 을 인식하도록.
+venvPath = "."
+venv = ".venv"
+include = ["src", "scripts", "tests"]
+extraPaths = ["src"]
+pythonVersion = "3.11"
+reportMissingImports = "error"

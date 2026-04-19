@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 동일 PR/브랜치에서 새 커밋이 푸시되면 이전 실행은 취소.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, format, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (frozen lock)
+        run: uv sync --frozen
+
+      - name: Lint (ruff check)
+        run: uv run ruff check src scripts tests
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check src scripts tests
+
+      - name: Format check (black)
+        run: uv run black --check src scripts tests
+
+      - name: Tests (pytest)
+        run: uv run pytest -v
