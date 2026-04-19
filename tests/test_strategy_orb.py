@@ -16,6 +16,7 @@ from stock_agent.strategy import (
     ExitSignal,
     ORBStrategy,
     StrategyConfig,
+    StrategyError,
 )
 
 # ---------------------------------------------------------------------------
@@ -148,8 +149,8 @@ def test_진입_stop_take_price_정확():
     entry = Decimal("71000")
     expected_stop = entry * (Decimal("1") - Decimal("0.015"))
     expected_take = entry * (Decimal("1") + Decimal("0.030"))
-    assert sig.stop_price == pytest.approx(expected_stop, rel=Decimal("1e-10"))
-    assert sig.take_price == pytest.approx(expected_take, rel=Decimal("1e-10"))
+    assert sig.stop_price == expected_stop
+    assert sig.take_price == expected_take
 
 
 def test_진입_close_or_high_동일_터치_진입없음():
@@ -269,8 +270,8 @@ def test_청산_후_closed_재진입_없음():
 # ---------------------------------------------------------------------------
 
 
-def test_강제청산_15시_long_심볼_session_close():
-    """on_time(15:00) 호출 시 long 심볼 → ExitSignal(session_close), price=last_close."""
+def test_강제청산_15시_long_심볼_force_close():
+    """on_time(15:00) 호출 시 long 심볼 → ExitSignal(force_close), price=last_close."""
     strategy = ORBStrategy()
     _setup_long(strategy, 71000)
     # 15:00 이전 분봉으로 last_close 갱신
@@ -280,7 +281,7 @@ def test_강제청산_15시_long_심볼_session_close():
     assert len(signals) == 1
     sig = signals[0]
     assert isinstance(sig, ExitSignal)
-    assert sig.reason == "session_close"
+    assert sig.reason == "force_close"
     assert sig.price == Decimal("71100")  # last_close
     assert strategy.get_state(_SYMBOL).position_state == "closed"  # type: ignore[union-attr]
 
@@ -319,10 +320,10 @@ def test_강제청산_force_close_at_커스터마이즈():
     # 14:30 미만 → 빈 리스트
     assert strategy.on_time(_now(14, 29)) == []
 
-    # 14:30 이상 → session_close
+    # 14:30 이상 → force_close
     signals = strategy.on_time(_now(14, 30))
     assert len(signals) == 1
-    assert signals[0].reason == "session_close"  # type: ignore[union-attr]
+    assert signals[0].reason == "force_close"  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
@@ -512,3 +513,108 @@ def test_config_기본값_검증():
     cfg = StrategyConfig()
     assert cfg.stop_loss_pct == Decimal("0.015")
     assert cfg.take_profit_pct == Decimal("0.030")
+
+
+# ---------------------------------------------------------------------------
+# 9. 경계 커버리지 (I3)
+# ---------------------------------------------------------------------------
+
+
+def test_or_09시30분_bar_경계_pin_or_high_불변():
+    """09:30:00 정각 bar 는 OR 누적에 포함되지 않고 돌파 판정 분기로 진입한다.
+
+    09:00~09:29 bar 30개로 or_high 를 X 로 확정시킨 뒤,
+    09:30 bar 의 close ≤ X 이면 EntrySignal 없고 or_high 가 X 그대로임을 검증.
+    """
+    strategy = ORBStrategy()
+    # 09:00~09:29 bar 30개 — or_high = 70129
+    for m in range(30):
+        strategy.on_bar(_bar(_SYMBOL, 9, m, 70000, 70100 + m, 69900, 70000))
+
+    state = strategy.get_state(_SYMBOL)
+    assert state is not None
+    or_high_fixed = state.or_high  # Decimal("70129")
+
+    # 09:30 bar — close(70129, ≤ or_high) 이므로 진입 없음
+    result = strategy.on_bar(_bar(_SYMBOL, 9, 30, 70129, 70200, 70050, 70129))
+    assert result == []
+
+    # or_high 가 09:30 bar 의 high(70200) 로 바뀌지 않고 그대로 유지
+    state_after = strategy.get_state(_SYMBOL)
+    assert state_after is not None
+    assert state_after.or_high == or_high_fixed
+    assert state_after.or_confirmed is True
+    assert state_after.position_state == "flat"
+
+
+def test_force_close_at_이후_flat_신규_진입_차단():
+    """force_close_at(15:00) 이후 돌파 bar 가 와도 EntrySignal 없이 flat 유지."""
+    strategy = ORBStrategy()
+    # OR 누적
+    strategy.on_bar(_bar(_SYMBOL, 9, 0, 70000, 70500, 69800, 70200))
+
+    # 15:00 이후 bar — close(72000) > or_high(70500) 이지만 진입 금지 구간
+    result = strategy.on_bar(_bar(_SYMBOL, 15, 0, 70500, 72500, 70400, 72000))
+    assert result == []
+
+    state = strategy.get_state(_SYMBOL)
+    assert state is not None
+    assert state.position_state == "flat"
+
+
+def test_on_time_last_close_none_entry_price_폴백_ExitSignal():
+    """on_time 강제청산 시 last_close 가 None 이면 entry_price 로 폴백해 ExitSignal 반환."""
+    strategy = ORBStrategy()
+    entry = _setup_long(strategy, 71000)  # last_close = Decimal("71000")
+
+    # 의도적으로 last_close 만 None 으로 덮어써 폴백 경로를 강제 실행
+    state = strategy.get_state(_SYMBOL)
+    assert state is not None
+    state.last_close = None  # type: ignore[misc]
+
+    signals = strategy.on_time(_now(15, 0))
+    assert len(signals) == 1
+    sig = signals[0]
+    assert isinstance(sig, ExitSignal)
+    assert sig.reason == "force_close"
+    # entry_price 폴백이므로 price == entry_price
+    assert sig.price == entry
+    assert strategy.get_state(_SYMBOL).position_state == "closed"  # type: ignore[union-attr]
+
+
+def test_on_time_last_close_entry_price_모두_none_StrategyError():
+    """on_time 강제청산 시 last_close·entry_price 모두 None → StrategyError(상태 머신 무결성)."""
+    strategy = ORBStrategy()
+    _setup_long(strategy, 71000)
+
+    # 두 필드 모두 None 으로 강제 세팅 (상태 머신 불가능 경우를 재현)
+    state = strategy.get_state(_SYMBOL)
+    assert state is not None
+    state.last_close = None  # type: ignore[misc]
+    state.entry_price = None  # type: ignore[misc]
+
+    with pytest.raises(StrategyError, match="상태 머신 무결성"):
+        strategy.on_time(_now(15, 0))
+
+
+def test_or_confirmed_false_to_true_전이_검증():
+    """OR 구간 bar 주입 중 or_confirmed False, 09:30 이상 첫 bar 주입 후 or_confirmed True."""
+    strategy = ORBStrategy()
+
+    # OR 구간 bar 주입 — or_confirmed 는 아직 False
+    for m in range(30):
+        strategy.on_bar(_bar(_SYMBOL, 9, m, 70000, 70200, 69800, 70000))
+
+    state = strategy.get_state(_SYMBOL)
+    assert state is not None
+    assert state.or_confirmed is False
+    assert state.position_state == "flat"
+
+    # 09:30 bar — close(70000) ≤ or_high(70200) 이므로 진입은 없지만 or_confirmed 전이
+    result = strategy.on_bar(_bar(_SYMBOL, 9, 30, 70000, 70100, 69900, 70000))
+    assert result == []
+
+    state_after = strategy.get_state(_SYMBOL)
+    assert state_after is not None
+    assert state_after.or_confirmed is True
+    assert state_after.position_state == "flat"

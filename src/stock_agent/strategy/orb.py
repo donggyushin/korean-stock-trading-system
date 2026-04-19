@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from typing import Literal
 
 from loguru import logger
@@ -95,7 +95,12 @@ class StrategyConfig:
 
 @dataclass
 class _SymbolState:
-    """심볼별 상태. 세션 단위로 `reset()` 된다."""
+    """심볼별 상태. 세션 단위로 `reset()` 된다.
+
+    `or_missing_warned` 는 "OR 구간에 bar 가 단 하나도 없어 당일 포기" 경고가
+    같은 세션에서 반복 로그를 남기지 않도록 한 플래그 (동일 심볼에 매 분봉마다
+    warning 이 찍히는 스팸 방지).
+    """
 
     session_date: date | None = None
     or_high: Decimal | None = None
@@ -107,6 +112,7 @@ class _SymbolState:
     take_price: Decimal | None = None
     last_bar_time: datetime | None = None
     last_close: Decimal | None = None
+    or_missing_warned: bool = False
 
     def reset(self, session_date: date) -> None:
         self.session_date = session_date
@@ -119,6 +125,7 @@ class _SymbolState:
         self.take_price = None
         self.last_bar_time = None
         self.last_close = None
+        self.or_missing_warned = False
 
 
 class ORBStrategy:
@@ -167,11 +174,16 @@ class ORBStrategy:
             state.last_close = bar.close
 
             return self._dispatch_bar(state, bar)
-        except RuntimeError:
+        except (RuntimeError, StrategyError):
+            # 사용자 수정 필요 입력 오류(RuntimeError)와 상태 머신 무결성 오류
+            # (StrategyError — _check_exit 의 명시적 raise) 는 그대로 전파.
             raise
-        except Exception as e:  # noqa: BLE001 — 예기치 못한 예외는 StrategyError 로 래핑
-            logger.exception(f"ORB on_bar 실패 ({bar.symbol}): {e.__class__.__name__}: {e}")
-            raise StrategyError(f"ORB on_bar 실패 ({bar.symbol}): {e}") from e
+        except DecimalException as e:
+            # Decimal 연산 실패만 좁혀 StrategyError 로 래핑. AttributeError 같은
+            # 코드 버그는 의도적으로 propagate 시켜 디버깅 단서(스택트레이스/예외
+            # 타입)를 보존한다.
+            logger.exception(f"ORB on_bar Decimal 연산 실패 ({bar.symbol})")
+            raise StrategyError(f"ORB on_bar Decimal 연산 실패 ({bar.symbol}): {e}") from e
 
     def _dispatch_bar(self, state: _SymbolState, bar: MinuteBar) -> list[Signal]:
         cfg = self._config
@@ -191,10 +203,21 @@ class ORBStrategy:
 
         if state.position_state == "flat":
             if bar_t >= cfg.force_close_at:
-                # 장 마감 30분 이내에는 신규 진입 금지.
+                # 장 마감 30분 이내에는 신규 진입 금지. 디버그 레벨로 흔적만.
+                logger.debug(
+                    f"ORB 진입 스킵 (force_close_at 이후): {bar.symbol} "
+                    f"@ bar_t={bar_t} (force_close_at={cfg.force_close_at})"
+                )
                 return []
             if state.or_high is None:
                 # OR 구간에 bar 가 단 하나도 없었던 극단 케이스 — 당일 포기.
+                # 같은 세션에서 1회만 warning (중복 스팸 방지).
+                if not state.or_missing_warned:
+                    logger.warning(
+                        f"ORB 당일 포기 ({bar.symbol}): OR 구간 bar 수집 없음 "
+                        f"(or_start={cfg.or_start}, or_end={cfg.or_end})"
+                    )
+                    state.or_missing_warned = True
                 return []
             if bar.close > state.or_high:
                 return [self._enter_long(state, bar)]
@@ -204,7 +227,11 @@ class ORBStrategy:
             exit_signal = self._check_exit(state, bar)
             return [exit_signal] if exit_signal is not None else []
 
-        # "closed" — 당일 재진입 금지.
+        # "closed" — 당일 재진입 금지. 돌파 재발생 등 누락 추적용 디버그 흔적.
+        logger.debug(
+            f"ORB 재진입 스킵 ({bar.symbol}): 당일 청산 완료 상태 "
+            f"(bar_t={bar_t}, close={bar.close})"
+        )
         return []
 
     def _accumulate_or(self, state: _SymbolState, bar: MinuteBar) -> None:
@@ -236,9 +263,16 @@ class ORBStrategy:
         )
 
     def _check_exit(self, state: _SymbolState, bar: MinuteBar) -> ExitSignal | None:
-        # long 상태에서는 stop/take 가 모두 세팅되어 있다.
-        assert state.stop_price is not None
-        assert state.take_price is not None
+        # long 상태에서는 stop/take 가 _enter_long 에서 세팅된 상태여야 한다.
+        # assert 가 `-O` 최적화 플래그에서 사라지면 `bar.low <= None` 이 TypeError
+        # 를 뱉고 generic except 가 silent 하게 삼킬 위험이 있어 명시적 raise 로
+        # 교체. 실제로 이 분기에 도달했다면 상태 머신 무결성 오류이므로
+        # StrategyError 가 올바른 표현.
+        if state.stop_price is None or state.take_price is None:
+            raise StrategyError(
+                f"long 상태인데 stop_price/take_price 미세팅 ({bar.symbol}) — "
+                "상태 머신 무결성 오류 (_enter_long 호출 누락 가능성)"
+            )
 
         if bar.low <= state.stop_price:
             state.position_state = "closed"
@@ -275,39 +309,47 @@ class ORBStrategy:
     def on_time(self, now: datetime) -> list[Signal]:
         """시각 이벤트 진입점. 현재는 `force_close_at` 이후 강제청산만 발생.
 
-        `long` 상태인 모든 심볼에 대해 `ExitSignal(reason="session_close")` 를
+        `long` 상태인 모든 심볼에 대해 `ExitSignal(reason="force_close")` 를
         생성하고 상태를 `closed` 로 전이한다. 가격은 마지막 관찰 분봉 close
-        (없으면 entry_price) — executor 가 실제 체결가로 덮어쓰는 것을 전제.
+        (`state.last_close`) — 없으면 `entry_price` 로 폴백하되 이 경우
+        데이터 파이프라인 이상 신호이므로 `logger.warning` 으로 흔적을 남긴다.
+        **executor 가 실제 체결가로 덮어쓰는 것을 전제로 한다.** 둘 다 None 이면
+        `StrategyError` — long 상태에서는 도달 불가능한 상태 머신 무결성 오류.
         """
-        try:
-            self._require_aware(now, "now")
-            cfg = self._config
-            if now.time() < cfg.force_close_at:
-                return []
+        self._require_aware(now, "now")
+        cfg = self._config
+        if now.time() < cfg.force_close_at:
+            return []
 
-            signals: list[Signal] = []
-            for symbol, state in self._states.items():
-                if state.position_state != "long":
-                    continue
-                price = state.last_close if state.last_close is not None else state.entry_price
-                # long 상태면 _enter_long 에서 entry_price 가 세팅되었으므로 price 는 항상 존재.
-                assert price is not None
-                state.position_state = "closed"
-                logger.info(f"ORB 강제청산: {symbol} @ {price} (ts={now.isoformat()})")
-                signals.append(
-                    ExitSignal(
-                        symbol=symbol,
-                        price=price,
-                        ts=now,
-                        reason="session_close",
-                    )
+        signals: list[Signal] = []
+        for symbol, state in self._states.items():
+            if state.position_state != "long":
+                continue
+            if state.last_close is not None:
+                price = state.last_close
+            elif state.entry_price is not None:
+                logger.warning(
+                    f"ORB 강제청산: {symbol} last_close 없음 → entry_price 로 폴백 "
+                    f"(price={state.entry_price}). 데이터 파이프라인 이상 가능성."
                 )
-            return signals
-        except RuntimeError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.exception(f"ORB on_time 실패: {e.__class__.__name__}: {e}")
-            raise StrategyError(f"ORB on_time 실패: {e}") from e
+                price = state.entry_price
+            else:
+                # long 상태면 _enter_long 에서 entry_price 가 세팅되어야 하므로 도달 불가.
+                raise StrategyError(
+                    f"ORB 강제청산 시점에 {symbol} 의 last_close·entry_price 모두 None "
+                    "— 상태 머신 무결성 오류 (long 상태에서 발생 불가)"
+                )
+            state.position_state = "closed"
+            logger.info(f"ORB 강제청산: {symbol} @ {price} (ts={now.isoformat()})")
+            signals.append(
+                ExitSignal(
+                    symbol=symbol,
+                    price=price,
+                    ts=now,
+                    reason="force_close",
+                )
+            )
+        return signals
 
     # ---- 공통 가드 -----------------------------------------------------
 

@@ -24,7 +24,7 @@ from stock_agent.data import MinuteBar
 
 KST = timezone(timedelta(hours=9))
 
-ExitReason = Literal["stop_loss", "take_profit", "session_close"]
+ExitReason = Literal["stop_loss", "take_profit", "force_close"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,10 +33,12 @@ class EntrySignal:
 
     Attributes:
         symbol: 6자리 종목 코드.
-        price: 시그널 생성 당시 참고가 (분봉 close).
+        price: 시그널 생성 당시 참고가 (분봉 close). executor 가 실제 체결가로
+            덮어쓰는 것을 전제로 한다. 호가 단위 반올림은 strategy 범위 밖 —
+            Decimal 원시값을 그대로 전달한다 (executor 책임).
         ts: 시그널 생성 시각 (KST aware).
-        stop_price: 진입가 × (1 - stop_loss_pct).
-        take_price: 진입가 × (1 + take_profit_pct).
+        stop_price: 진입가 × (1 - stop_loss_pct). 호가 단위 미반올림.
+        take_price: 진입가 × (1 + take_profit_pct). 호가 단위 미반올림.
     """
 
     symbol: str
@@ -52,9 +54,11 @@ class ExitSignal:
 
     Attributes:
         symbol: 6자리 종목 코드.
-        price: 시그널 생성 당시 참고가.
+        price: 시그널 생성 당시 참고가 (stop/take 는 고정 보호선, force_close 는
+            마지막 관찰 close 또는 entry_price 폴백). executor 가 실제 체결가로
+            덮어쓰는 것을 전제로 한다.
         ts: 시그널 생성 시각 (KST aware).
-        reason: `"stop_loss" | "take_profit" | "session_close"`.
+        reason: `"stop_loss" | "take_profit" | "force_close"`.
     """
 
     symbol: str
