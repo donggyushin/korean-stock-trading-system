@@ -92,7 +92,7 @@ stock-agent/
 │   ├── data/
 │   │   ├── historical.py       # pykrx 일봉 + SQLite 캐시
 │   │   ├── universe.py         # KOSPI 200 유니버스 YAML 로더
-│   │   └── realtime.py         # WebSocket/폴링 실시간 시세 (구현 예정)
+│   │   └── realtime.py         # WebSocket 우선 + REST 폴링 fallback 실시간 시세 (RealtimeDataStore)
 │   ├── strategy/
 │   │   ├── base.py             # Strategy 인터페이스
 │   │   └── orb.py              # Opening Range Breakout
@@ -130,7 +130,7 @@ stock-agent/
 - 텔레그램 봇 생성 (@BotFather), 채팅 ID 확보
 - **산출물**: `scripts/healthcheck.py` 실행 시 모의 계좌 잔고 조회 성공 + "hello" 텔레그램 알림 수신 — **달성 확인** (KIS 토큰 발급 OK, 잔고 10,000,000원 조회 OK, 텔레그램 수신 OK)
 
-### Phase 1 — 데이터 파이프라인 & 브로커 래퍼 (4~5일)
+### Phase 1 — 데이터 파이프라인 & 브로커 래퍼 (4~5일) — ✅ PASS 선언 (코드·테스트 레벨) — 2026-04-19
 - `broker/kis_client.py`: 토큰 발급/갱신, 잔고 조회, 매수/매도 주문, 미체결 조회
 - `data/historical.py`: pykrx로 KOSPI 200 구성종목 + 일봉 수집 & SQLite 캐시 (pykrx는 분봉 OHLCV 미지원. 분봉은 `data/realtime.py` 장중 폴링 누적 범위)
 - `data/realtime.py`: 장중 분봉 폴링(우선) 또는 WebSocket 실시간 체결가 (후순위)
@@ -147,6 +147,7 @@ stock-agent/
 - **산출물**: 백테스트 리포트 HTML/노트북 + 파라미터 민감도 테이블
 
 ### Phase 3 — 모의투자 자동 실행 (5~7일)
+- **착수 전제**: 실전 APP_KEY (시세 전용) 발급 완료 + KIS Developers 포털에서 IP 화이트리스트 등록 + `healthcheck.py` 4종 통과.
 - `execution/executor.py`: 신호 → 주문 → 체결 추적 → 상태 동기화 루프
 - `main.py`: APScheduler로 9:00 시작, 9:30 OR 확정, 장중 루프, 15:00 청산, 15:30 리포트
 - `monitor/notifier.py`: 진입/청산/에러/일일 요약 텔레그램 알림
@@ -173,7 +174,7 @@ stock-agent/
 
 **각 Phase의 PASS 기준**
 - **Phase 0**: `python scripts/healthcheck.py` → 잔고 조회 OK, 텔레그램 알림 수신 OK
-- **Phase 1**: `pytest tests/test_kis_client.py` 통과, 삼성전자(005930) 현재가 조회 OK
+- **Phase 1**: `pytest tests/test_kis_client.py` 통과 — **충족** (pytest 131건 green). 삼성전자(005930) 현재가 조회 OK — **코드 경로 완성 + WebSocket 구독 등록 성공**. 틱 수신 end-to-end 확인(장중 + 실전 키)은 Phase 3 착수 전제로 이관.
 - **Phase 2**:
   - `pytest tests/test_strategy_orb.py` — 고정 시나리오 OHLCV 입력에 정확한 진입/청산 시그널
   - `python scripts/backtest.py --from 2023-01-01 --to 2025-12-31` → 리포트 생성, 수수료·세금 반영, MDD < -15%
@@ -219,22 +220,23 @@ python scripts/healthcheck.py
 | 감정적 개입 (수동 매매 섞임) | 시스템 검증 불가 | 실전 전환 후 **최소 1개월 수동 개입 금지**, 개선은 코드 반영으로만 |
 | `python-kis` paper-only 초기화 우회 | 설계가 라이브러리 내부 구현에 의존 | Phase 4 실전 전환 시 실전 APP_KEY/SECRET 별도 발급 및 슬롯 분리 (`PyKis.virtual` 프로퍼티로 라우팅 확인) |
 | 회귀 코드 머지 | 실거래 자금 시스템에 결함 유입 | GitHub Actions CI 자동 실행 + main 브랜치 보호로 CI 통과 필수 |
-| pykrx 분봉 미지원 | 백테스트용 과거 분봉 데이터 확보 경로 미정 | Phase 2 착수 시점에 KIS 과거 분봉 API 추가 or realtime.py 누적본 재활용 중 선택. 현재는 `data/realtime.py` 가 장중 분봉을 폴링으로 수집·누적하는 경로 유지. |
+| pykrx 분봉 미지원 | **백테스트용 과거 분봉** 데이터 확보 경로 미정 (장중 실시간 분봉은 `data/realtime.py` 로 해소) | Phase 2 착수 시점에 KIS 과거 분봉 API 추가 or realtime.py 누적본 재활용 중 선택. |
 | pykrx 1.2.7 지수 API(`get_index_portfolio_deposit_file` 등) KRX 서버 호환성 깨짐 + KIS Developers 인덱스 구성종목 API 미제공 | 자동 유니버스 갱신 불가 | `config/universe.yaml` 로 수동 관리. 연 2회 정기변경(6월·12월)마다 운영자 갱신. Phase 5 에서 자동화 경로(pykrx 수정 릴리스 대기 또는 KRX 정보데이터시스템 스크래핑) 재도입. |
+| KIS paper 도메인(`openapivts`) 시세 API(`/quotations/*`) 미제공 → python-kis 고레벨 시세 API paper 환경에서 사용 불가 | 모의투자 자동 실행(Phase 3) 에서 실시간 체결가 수신 불가 | 시세 전용 실전 APP_KEY 발급, 실전 도메인(`openapi`) 직접 호출 (`RealtimeDataStore`). Phase 3 착수 전 실전 앱 발급·IP 화이트리스트 등록 필수. |
+| 실전 키 IP 화이트리스트 이탈 (공인 IP 변경, ISP 동적 IP 할당 등) | 시세 단절 → `RealtimeDataStore` 전체 장애 | `healthcheck.py` 에서 `EGW00123` 계열 오류 감지 시 힌트 로그("KIS Developers 포털 → 앱 관리 → 허용 IP 갱신") 출력. 장기적으로 VPS 이전 시 고정 IP 확보 (Phase 5). |
 
 ---
 
-## 다음 액션 (Phase 1)
+## Phase 1 완료 요약 (2026-04-19 PASS 선언)
 
-Phase 0 완료 (2026-04-19). Phase 1 진행 중 — 브로커 래퍼 + 데이터 파이프라인 구현. 첫 산출물 완료 (2026-04-19).
+Phase 0 완료 (2026-04-19). Phase 1 코드·테스트 레벨 PASS 선언 (2026-04-19).
 
 1. [x] `src/stock_agent/broker/kis_client.py` — 완료. DTO 정규화, pykis_factory 주입, paper 전용, live는 defer.
 2. [x] `src/stock_agent/broker/rate_limiter.py` — 완료. 주문 경로 전용 `OrderRateLimiter`(기본 2 req/s + 최소 간격 350 ms). 조회 경로는 python-kis 내장 리미터에 그대로 위임.
-3. [x] `src/stock_agent/data/historical.py` — 완료. pykrx 일봉 + SQLite 캐시 (KOSPI 200 구성종목 조회는 분리). `HistoricalDataStore`는 `fetch_daily_ohlcv` 전용으로 축소. SQLite 스키마 v3 (v2→v3 자동 마이그레이션).
-3a. [x] `src/stock_agent/data/universe.py` + `config/universe.yaml` — 완료. KOSPI 200 유니버스 YAML 하드코딩. pykrx 지수 API·KIS Developers 모두 미제공으로 수동 관리. 정기변경(연 2회, 6월·12월) 때 운영자 갱신. 현재 199/200 반영. 의존성 추가: `pyyaml 6.0.3`.
-4. [ ] `src/stock_agent/data/realtime.py` — 장중 분봉 폴링(우선) 또는 WebSocket 실시간 체결가(후순위)
-5. 단위 테스트 작성 + `healthcheck.py`에서 특정 종목(예: 삼성전자 005930) 현재가 조회 성공 확인
+3. [x] `src/stock_agent/data/historical.py` + `data/universe.py` + `config/universe.yaml` — 완료. pykrx 일봉 + SQLite 캐시 v3. KOSPI 200 유니버스 YAML 하드코딩(수동 관리, 연 2회 정기변경). 의존성 추가: `pykrx 1.2.7`, `pyyaml 6.0.3`.
+4. [x] `src/stock_agent/data/realtime.py` — 완료. WebSocket 우선 + REST 폴링 fallback. **실전(live) 키 전용** (`has_live_keys=False` 시 `RealtimeDataError` fail-fast). 실전 키 PyKis 에 `install_order_block_guard` 설치(`/trading/order*` 도메인 무관 차단). 분봉 집계(분 경계 OHLC 누적)·스레드 안전(`threading.Lock`), volume Phase 1 에서 0 고정(Phase 3 실사 후 확정).
+5. [x] 단위 테스트 작성 — pytest **131건 green** (test_config 11 + test_kis_client 15 + test_safety 23 + test_rate_limiter 18 + test_historical 14 + test_universe 11 + test_realtime 28). PR #7 Critical 피드백 반영: 가드 중복 설치 방어(`GUARD_MARKER_ATTR` 재설치 거부), 폴링 연속 실패 경보(`polling_consecutive_failures` 공개 프로퍼티), docstring 정정.
 
-**Phase 1 PASS 기준**: `pytest tests/test_kis_client.py` 통과, 삼성전자(005930) 현재가 조회 OK.
+**미완료 조건**: 장중 실시간 시세 수신 end-to-end 확인(실전 키 + IP 화이트리스트 + 평일 장중 틱 수신)은 **Phase 3 착수 전제**로 이관 (plan.md Phase 3 섹션 착수 전제 항목 참조). 코드 경로 완성 + WebSocket 구독 등록 성공까지는 달성.
 
-현재 진척: broker(kis_client + rate_limiter) + data(historical + universe) 완료(pytest 68건 green, 1.43s). 다음은 data/realtime.
+**Phase 1 PASS 선언. Phase 2 착수.**
