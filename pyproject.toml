@@ -36,6 +36,10 @@ src = ["src", "scripts", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# 테스트 함수명에 한글 사용 허용 (가독성 우선).
+"tests/**/*.py" = ["N802"]
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]
