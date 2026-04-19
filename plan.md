@@ -55,7 +55,7 @@
 **언어/런타임**: Python 3.11+
 
 **주요 라이브러리**
-- `python-kis` 또는 `mojito2`: KIS Developers REST/WebSocket 래퍼 (오픈소스 검증됨)
+- `python-kis 2.x`: KIS Developers REST/WebSocket 래퍼 (오픈소스 검증됨, mojito2 미사용)
 - `pykrx`: KRX 공식 데이터(백테스트용 과거 OHLCV, KOSPI 200 구성종목)
 - `backtesting.py`: 백테스팅 엔진 (단순·직관적)
 - `pandas`, `numpy`: 데이터 처리
@@ -120,12 +120,12 @@ stock-agent/
 
 ## 단계별 로드맵 (총 약 4주)
 
-### Phase 0 — 계좌·API·환경 준비 (2~3일)
+### Phase 0 — 계좌·API·환경 준비 (2~3일) — 완료 2026-04-19
 - 한투증권 비대면 계좌 개설 (모바일 MTS)
 - KIS Developers 가입 → **모의투자용 APP_KEY/SECRET 먼저** 발급
 - 레포 초기화 (`uv init`), `.env`/`.gitignore`, `pre-commit`(ruff/black) 세팅
 - 텔레그램 봇 생성 (@BotFather), 채팅 ID 확보
-- **산출물**: `scripts/healthcheck.py` 실행 시 모의 계좌 잔고 조회 성공 + "hello" 텔레그램 알림 수신
+- **산출물**: `scripts/healthcheck.py` 실행 시 모의 계좌 잔고 조회 성공 + "hello" 텔레그램 알림 수신 — **달성 확인** (KIS 토큰 발급 OK, 잔고 10,000,000원 조회 OK, 텔레그램 수신 OK)
 
 ### Phase 1 — 데이터 파이프라인 & 브로커 래퍼 (4~5일)
 - `broker/kis_client.py`: 토큰 발급/갱신, 잔고 조회, 매수/매도 주문, 미체결 조회
@@ -213,15 +213,18 @@ python scripts/healthcheck.py
 | 데이트레이딩의 구조적 불리함 | 기대수익 잠식 | 최소 거래금액·승률 조건으로 저품질 신호 필터 |
 | 악성 코드/키 유출 | 계좌 탈취 | `.env`는 `.gitignore`, **실전 키는 권한 최소화 · IP 화이트리스트** |
 | 감정적 개입 (수동 매매 섞임) | 시스템 검증 불가 | 실전 전환 후 **최소 1개월 수동 개입 금지**, 개선은 코드 반영으로만 |
+| `python-kis` paper-only 초기화 우회 | 설계가 라이브러리 내부 구현에 의존 | Phase 4 실전 전환 시 실전 APP_KEY/SECRET 별도 발급 및 슬롯 분리 (`PyKis.virtual` 프로퍼티로 라우팅 확인) |
 
 ---
 
-## 다음 액션 (Phase 0 시작)
+## 다음 액션 (Phase 1)
 
-1. 한투증권 비대면 계좌 개설 (모바일, 약 20분)
-2. KIS Developers 회원가입 & **모의투자 APP_KEY/SECRET** 발급
-3. 텔레그램 @BotFather로 봇 생성 → 토큰·chat_id 확보
-4. 레포 초기화 (`uv init stock-agent`), `.env.example` 작성
-5. `scripts/healthcheck.py` 구현 → 3대 점검 통과 확인
+Phase 0 완료 (2026-04-19). Phase 1 — 브로커 래퍼 + 데이터 파이프라인 구현 시작.
 
-이후 Phase 1부터 본격 코드 작성 시작.
+1. `src/stock_agent/broker/kis_client.py` — 토큰 발급/갱신, 잔고 조회, 매수/매도 주문, 미체결 조회
+2. `src/stock_agent/broker/rate_limiter.py` — KIS 초당 호출 제한 대응
+3. `src/stock_agent/data/historical.py` — pykrx로 KOSPI 200 구성종목 + 분봉/일봉 수집 & SQLite 캐시
+4. `src/stock_agent/data/realtime.py` — 장중 분봉 폴링(우선) 또는 WebSocket 실시간 체결가(후순위)
+5. 단위 테스트 작성 + `healthcheck.py`에서 특정 종목(예: 삼성전자 005930) 현재가 조회 성공 확인
+
+**Phase 1 PASS 기준**: `pytest tests/test_kis_client.py` 통과, 삼성전자(005930) 현재가 조회 OK.

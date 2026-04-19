@@ -33,18 +33,20 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 | 일일 손실 한도 | 자본의 -2% 도달 시 당일 매매 중단 |
 | 일일 최대 진입 | 10회 |
 
-## 기술 스택 (예정)
+## 기술 스택
 
 - **언어**: Python 3.11+
 - **의존성 관리**: `uv`
-- **브로커 API**: `python-kis` 또는 `mojito2` (KIS Developers REST/WebSocket)
+- **브로커 API**: `python-kis 2.x` (KIS Developers REST/WebSocket)
 - **시장 데이터**: `pykrx` (KRX 공식 과거 OHLCV)
 - **백테스팅**: `backtesting.py`
 - **스케줄링**: `APScheduler`
-- **알림**: `python-telegram-bot`
+- **알림**: `python-telegram-bot 22.x`
 - **로깅**: `loguru`
+- **설정 검증**: `pydantic-settings`
 - **저장소**: SQLite (MVP)
-- **테스트**: `pytest`
+- **테스트**: `pytest`, `pytest-mock`
+- **포매터/린터**: `ruff`, `black` (`pre-commit` 훅 적용)
 
 ## 로드맵 (총 약 4주)
 
@@ -59,41 +61,76 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 ## 현재 상태
 
-**Phase 0 진입 예정** — 아직 코드는 작성되지 않았습니다. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
+**Phase 1 진행 중** — Phase 0 환경 준비 완료(2026-04-19). 브로커 래퍼 및 데이터 파이프라인 구현 단계. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
 
-### Phase 0 체크리스트
+### Phase 0 체크리스트 (완료 2026-04-19)
 
-- [ ] 한국투자증권 비대면 계좌 개설
-- [ ] KIS Developers 가입 및 **모의투자** APP_KEY / APP_SECRET 발급
-- [ ] 텔레그램 봇 생성(@BotFather) 및 chat_id 확보
-- [ ] 레포 초기화(`uv init`), `.env.example` 작성
-- [ ] `scripts/healthcheck.py` 구현 — 모의 잔고 조회 + 텔레그램 알림 수신 확인
+- [x] 한국투자증권 비대면 계좌 개설
+- [x] KIS Developers 가입 및 **모의투자** APP_KEY / APP_SECRET 발급
+- [x] 텔레그램 봇 생성(@BotFather) 및 chat_id 확보
+- [x] 레포 초기화(`uv init`), `.env.example` 작성
+- [x] `scripts/healthcheck.py` 구현 — 모의 잔고 조회 + 텔레그램 알림 수신 확인
 
-## 디렉토리 구조 (예정)
+## 디렉토리 구조
+
+현재 존재하는 파일 (Phase 0 완료 기준):
 
 ```text
 stock-agent/
-├── pyproject.toml
-├── .env.example
+├── .python-version            # 3.11
+├── pyproject.toml             # uv 기반, ruff/black/pytest 설정 포함
+├── uv.lock                    # 47개 패키지 잠금
+├── .pre-commit-config.yaml    # ruff, black, 기본 훅
+├── .env.example               # KIS·텔레그램 키 placeholder (.env는 .gitignore)
 ├── .gitignore
 ├── README.md
 ├── plan.md
-├── config/          # universe.yaml, strategy.yaml
-├── src/stock_agent/ # broker, data, strategy, risk, execution, backtest, monitor, storage
-├── tests/
-├── scripts/         # backtest.py, healthcheck.py
-└── data/            # SQLite, 캐시 (gitignore)
+├── src/stock_agent/
+│   ├── __init__.py
+│   └── config.py              # pydantic-settings Settings + get_settings() 캐시
+└── scripts/
+    └── healthcheck.py         # KIS 모의 잔고 조회 + 텔레그램 hello (실주문 없음)
 ```
 
-## 설치 및 실행 (예정)
+Phase 1 이후 추가될 구조(`broker/`, `data/`, `strategy/`, `risk/`, `execution/`, `backtest/`, `monitor/`, `storage/`, `tests/` 등)는 [`plan.md`](./plan.md)의 디렉토리 구조 청사진 참조.
 
-현재는 계획 단계이므로 실행 가능한 명령이 없습니다. Phase 1이 완료되면 다음과 같은 흐름으로 정리될 예정입니다.
+## 설치 및 실행
+
+### 사전 준비
+
+1. KIS Developers 포털에서 **모의투자계좌 API 신청** 완료 및 모의투자용 APP_KEY / APP_SECRET 발급
+   - MTS의 "상시 모의투자 참가신청"과 별개 절차임에 주의
+2. 텔레그램 @BotFather로 봇 생성 → 토큰 및 chat_id 확보
+
+### 환경 설정
 
 ```bash
-# 예정 — 현 시점에서는 동작하지 않습니다
+# 가상환경 및 의존성 설치
 uv sync
-cp .env.example .env   # KIS_APP_KEY, KIS_APP_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 입력
-python scripts/healthcheck.py
+
+# git 훅 설치 (최초 1회)
+uv run pre-commit install
+
+# 환경변수 파일 작성 (.env는 절대 커밋하지 않습니다)
+cp .env.example .env
+# .env 에서 아래 7개 값을 채웁니다:
+#   KIS_ENV          = paper
+#   KIS_HTS_ID       = 한투 HTS 아이디
+#   KIS_APP_KEY      = 모의투자 APP_KEY (36자)
+#   KIS_APP_SECRET   = 모의투자 APP_SECRET (180자)
+#   KIS_ACCOUNT_NO   = 계좌번호 (XXXXXXXX-XX 형식)
+#   TELEGRAM_BOT_TOKEN = 텔레그램 봇 토큰
+#   TELEGRAM_CHAT_ID   = 텔레그램 chat_id
+```
+
+### 환경 점검
+
+```bash
+uv run python scripts/healthcheck.py
+# 통과 기준:
+# 1) KIS 모의투자 토큰 발급 OK
+# 2) 모의 계좌 잔고 조회 OK
+# 3) 텔레그램 "hello" 메시지 수신 OK
 ```
 
 ## 참고 문서
