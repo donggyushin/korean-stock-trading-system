@@ -4,7 +4,7 @@
 
 ## 프로젝트 한 줄 요약
 
-Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국투자증권 KIS Developers API + Opening Range Breakout(ORB) 전략 + 100~200만원 초기 자본. 현재 **계획 단계(Phase 0 진입 예정)**, 코드 미작성.
+Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국투자증권 KIS Developers API + Opening Range Breakout(ORB) 전략 + 100~200만원 초기 자본. 현재 **Phase 1 진행 중** (환경 준비 완료, 브로커 래퍼 + 데이터 파이프라인 구현 단계).
 
 상세 설계는 `plan.md`를 참조한다. 외부 독자용 개요는 `README.md`.
 
@@ -19,7 +19,7 @@ Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국
 - 초기 자본: 100~200만원
 - 실행: 로컬 맥북, 장중(9:00~15:30 KST)
 - 알림: 텔레그램 봇
-- 스택: Python 3.11+, `uv`, `python-kis`/`mojito2`, `pykrx`, `backtesting.py`, `APScheduler`, `loguru`, `python-telegram-bot`, SQLite
+- 스택: Python 3.11+, `uv`, `python-kis 2.x`, `pykrx`, `backtesting.py`, `APScheduler`, `loguru`, `python-telegram-bot`, SQLite
 - 리스크 한도: 종목당 진입 자본의 20%, 동시 3종목, 손절 -1.5% / 익절 +3.0% / 15:00 강제청산, 일일 손실 -2% 서킷브레이커
 
 자세한 수치와 근거는 `plan.md` 참조.
@@ -72,7 +72,7 @@ Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국
 - 커밋·PR 전 diff에 키 문자열이 섞여들어가지 않았는지 확인.
 - 모의투자 키와 실전 키는 환경변수로만 구분, 코드에 하드코딩하지 않는다.
 
-## 코드 스타일 (Phase 1부터 적용 예정)
+## 코드 스타일 (Phase 0에서 도구 도입 완료, Phase 1부터 본격 적용)
 
 - Python 3.11+, `uv`로 의존성 관리.
 - 타입 힌트 필수. 설정·외부 경계는 `pydantic`으로 검증.
@@ -82,13 +82,20 @@ Python 기반 한국주식 **데이트레이딩** 자동매매 시스템. 한국
 
 ## 현재 상태 (2026-04-19 기준)
 
-- 계획 승인 완료. `plan.md`, `README.md`, `CLAUDE.md`, `.claude/agents/markdown-writer.md` 존재.
-- Phase 0 다음 액션:
-  1. 한국투자증권 비대면 계좌 개설
-  2. KIS Developers 가입 · **모의투자** APP_KEY/SECRET 발급
-  3. 텔레그램 봇 토큰 · chat_id 확보
-  4. `uv init` · `.env.example` 작성
-  5. `scripts/healthcheck.py` 구현 (모의 잔고 조회 + 텔레그램 hello)
+- **Phase 0 완료** (2026-04-19)
+  - `scripts/healthcheck.py` 3종 통과: KIS 모의투자 토큰 발급 OK, 모의 계좌 잔고 조회 OK (시드 10,000,000원), 텔레그램 "hello" 수신 OK
+  - 신규 파일: `.python-version`, `pyproject.toml`, `uv.lock`, `.pre-commit-config.yaml`, `.env.example`, `src/stock_agent/__init__.py`, `src/stock_agent/config.py`, `scripts/healthcheck.py`
+  - 의존성 확정: `python-kis 2.1.6`, `python-telegram-bot 22.7`, `pydantic 2.13`, `pydantic-settings 2.13`, `loguru 0.7` / dev: `ruff 0.15`, `black 26.3`, `pytest 9.0`, `pytest-mock 3.15`, `pre-commit 4.5`
+  - `python-kis` paper-only 초기화 우회: 모의 키를 실전 슬롯과 모의 슬롯 양쪽에 동일 입력 → `PyKis.virtual = True`로 모든 요청이 모의 도메인으로만 라우팅됨. Phase 4 실전 전환 시 실전 APP_KEY/SECRET 별도 발급 후 슬롯 분리.
+  - 운영 메모: KIS Developers에서 "모의투자계좌 API 신청"을 MTS의 "상시 모의투자 참가신청"과 별도로 완료해야 모의 키 발급 가능 (미신청 시 `EGW2004` 에러). 토큰 첫 발급 시 레이트 리밋 경고 2회 후 자동 재시도 통과 — 정상 동작 범위.
+  - GitHub Actions CI 도입 (`.github/workflows/ci.yml`): PR 및 main push 시 `uv sync --frozen` → ruff/black 정적 분석 → pytest 자동 실행. 첫 실행 12초, 10/10 통과 (PR #1 검증).
+  - main 브랜치 보호 적용: required status check `Lint, format, test` (CI job), `strict=true`, force push/삭제 금지.
+
+- **다음 단계: Phase 1 — 브로커 래퍼 + 데이터 파이프라인**
+  1. `src/stock_agent/broker/kis_client.py` — 토큰 발급/갱신, 잔고 조회, 매수/매도 주문, 미체결 조회
+  2. `src/stock_agent/broker/rate_limiter.py` — KIS 초당 호출 제한 대응
+  3. `src/stock_agent/data/historical.py` — pykrx로 KOSPI 200 분봉/일봉 수집 & SQLite 캐시
+  4. `src/stock_agent/data/realtime.py` — 장중 분봉 폴링 또는 WebSocket 실시간 체결가
 
 ## 참고
 
