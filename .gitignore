@@ -29,3 +29,5 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+.omc
