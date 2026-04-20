@@ -46,7 +46,11 @@ from stock_agent.backtest import (
     run_sensitivity,
     write_csv,
 )
-from stock_agent.data import MinuteCsvBarLoader, load_kospi200_universe
+from stock_agent.data import MinuteCsvBarLoader, MinuteCsvLoadError, load_kospi200_universe
+
+# exit code 규약: 2 = 입력·설정 오류 (재시도 무의미), 3 = I/O 오류 (재시도 가치 있음).
+_EXIT_INPUT_ERROR = 2
+_EXIT_IO_ERROR = 3
 
 _SORTABLE_KEYS = (
     "total_return_pct",
@@ -127,11 +131,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _resolve_symbols(raw: str) -> tuple[str, ...]:
-    """`--symbols` 인자 해석 — 빈 값이면 유니버스 YAML 전체."""
+    """`--symbols` 인자 해석 — 빈 값이면 유니버스 YAML 전체.
+
+    `raw` 에 쉼표만 들어오는 극단 케이스는 `raw.strip()` 이 falsy 로 평가되어
+    자동으로 유니버스 로드 분기로 빠진다 (별도 RuntimeError 불필요 — 현재
+    분기 구조상 도달 불가능한 방어 코드는 두지 않는다).
+    """
     if raw.strip():
         parts = tuple(s.strip() for s in raw.split(",") if s.strip())
-        if not parts:
-            raise RuntimeError("--symbols 가 쉼표만 포함되어 있습니다.")
         return parts
     universe = load_kospi200_universe()
     if not universe.tickers:
@@ -142,25 +149,15 @@ def _resolve_symbols(raw: str) -> tuple[str, ...]:
     return universe.tickers
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+def _run_pipeline(args: argparse.Namespace) -> None:
+    """실제 파이프라인 — 호출자가 예외 분기를 책임진다.
 
-    if args.start > args.end:
-        logger.error(f"--from({args.start}) 는 --to({args.end}) 이전이어야 합니다.")
-        return 1
-
-    try:
-        symbols = _resolve_symbols(args.symbols)
-    except Exception as e:
-        logger.exception(f"symbols 해석 실패: {e}")
-        return 1
-
-    try:
-        loader = MinuteCsvBarLoader(args.csv_dir)
-    except Exception as e:
-        logger.exception(f"MinuteCsvBarLoader 초기화 실패 (csv_dir={args.csv_dir}): {e}")
-        return 1
-
+    경계를 single-purpose 로 분리해 `main()` 의 wrapper 는 오직 예외 → exit
+    code 매핑에만 집중한다. 라이브러리 모듈의 `RuntimeError` fail-fast 기조를
+    그대로 전파.
+    """
+    symbols = _resolve_symbols(args.symbols)
+    loader = MinuteCsvBarLoader(args.csv_dir)
     base_config = BacktestConfig(starting_capital_krw=args.starting_capital)
     grid = default_grid()
     logger.info(
@@ -170,41 +167,61 @@ def main(argv: list[str] | None = None) -> int:
         n=len(symbols),
         c=grid.size,
     )
-
-    try:
-        rows = run_sensitivity(
-            loader=loader,
-            start=args.start,
-            end=args.end,
-            symbols=symbols,
-            base_config=base_config,
-            grid=grid,
-        )
-    except Exception as e:
-        logger.exception(f"run_sensitivity 실패: {e}")
-        return 1
-
+    rows = run_sensitivity(
+        loader=loader,
+        start=args.start,
+        end=args.end,
+        symbols=symbols,
+        base_config=base_config,
+        grid=grid,
+    )
     args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        markdown = render_markdown_table(
-            rows,
-            sort_by=args.sort_by,
-            descending=not args.ascending,
-        )
-        args.output_markdown.write_text(markdown, encoding="utf-8")
-        write_csv(rows, args.output_csv)
-    except Exception as e:
-        logger.exception(f"리포트 출력 실패: {e}")
-        return 1
-
+    markdown = render_markdown_table(
+        rows,
+        sort_by=args.sort_by,
+        descending=not args.ascending,
+    )
+    args.output_markdown.write_text(markdown, encoding="utf-8")
+    write_csv(rows, args.output_csv)
     logger.info(
         "sensitivity.done rows={n} markdown={m} csv={c}",
         n=len(rows),
         m=args.output_markdown,
         c=args.output_csv,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 엔트리포인트 — 예외 → exit code 매핑만 책임진다.
+
+    예외 분류 (프로젝트 가드레일 "generic except Exception 금지" 기조 준수 —
+    좁힌 세 타입으로만 잡고 나머지는 Python 기본 전파):
+
+    - `MinuteCsvLoadError` · `RuntimeError` → exit 2 (입력·설정 오류, 재시도
+      무의미). CSV 스키마 오류, 알 수 없는 prefix/필드, 범위 검증 위반 등.
+    - `OSError` → exit 3 (I/O 오류, 재시도 가치 있음). 디스크 풀·권한·경로
+      오류 등.
+    - 위 이외의 예외는 버그로 간주해 Python traceback 그대로 종료 (loguru 가
+      stderr 에 기록).
+    """
+    args = _parse_args(argv)
+
+    if args.start > args.end:
+        logger.error(f"--from({args.start}) 는 --to({args.end}) 이전이어야 합니다.")
+        return _EXIT_INPUT_ERROR
+
+    try:
+        _run_pipeline(args)
+    except MinuteCsvLoadError as e:
+        logger.error(f"CSV 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except RuntimeError as e:
+        logger.error(f"설정·검증 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except OSError as e:
+        logger.exception(f"I/O 오류 (재시도 가능): {e}")
+        return _EXIT_IO_ERROR
     return 0
 
 

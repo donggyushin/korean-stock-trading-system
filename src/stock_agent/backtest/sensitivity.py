@@ -38,7 +38,7 @@ import csv
 import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -88,9 +88,12 @@ class ParameterAxis:
     `name` 은 `prefix.field` 형태 (예: `"strategy.stop_loss_pct"`). prefix 는
     `strategy`/`risk`/`engine` 중 하나. field 는 해당 config 의 실제 필드명.
 
-    `values` 는 비어있을 수 없고 중복도 허용하지 않는다 (그리드 크기가 예측
-    가능해야 함). 값의 **타입** 은 대상 config 필드와 일치시켜야 한다 — 검증은
-    `run_sensitivity` 실행 시점에 `dataclasses.replace` 가 수행.
+    `values` 는 비어있을 수 없고 `==` 기준 중복도 허용하지 않는다 (그리드 크기가
+    예측 가능해야 함). 값의 **타입** 은 호출자 책임 — `dataclasses.replace` 는
+    런타임 타입 체크를 하지 않는다. 대신 범위·순서 검증(예:
+    `stop_loss_pct > 0`, `or_start < or_end`) 은 `run_sensitivity` 실행 시점에
+    `StrategyConfig.__post_init__` / `RiskConfig.__post_init__` /
+    `BacktestConfig.__post_init__` 이 수행한다.
 
     Raises:
         RuntimeError: `name` 이 빈 문자열 · prefix 불명 · field 공란,
@@ -184,27 +187,45 @@ class SensitivityGrid:
 class SensitivityRow:
     """민감도 그리드 1 조합의 실행 결과 스냅샷.
 
-    `params` 는 축 이름(`prefix.field`) → 적용된 값의 dict. `BacktestMetrics`
-    7 필드를 flat 하게 풀어두고, 조합 비교에 유용한 보조 지표 3종을 추가한다.
+    `params` 는 `(축 이름, 적용된 값)` 의 순서 있는 튜플. 축 선언 순서가
+    `iter_combinations` 의 yield 순서와 일치한다. **튜플을 쓰는 이유**: frozen
+    dataclass 에서 `dict` 필드는 내부 변이가 가능해 실질적 불변성이 깨진다
+    (`BacktestResult.rejected_counts` 는 이 한계를 docstring 으로 고지). 여기선
+    외부가 `row.params` 를 변이시켜 renderer 의 두 번째 소비 결과를 바꾸는
+    실수를 원천 차단한다.
 
-    보조 지표:
+    `metrics` 는 `BacktestMetrics` 를 그대로 재사용 (엔진 진화 자동 추종). 조합
+    비교에 유용한 보조 지표 3종은 별도 필드:
+
     - `trade_count`: `BacktestResult.trades` 길이.
     - `rejected_total`: `BacktestResult.rejected_counts` 값의 합 (RiskManager
       사전 거부 6종 합산).
     - `post_slippage_rejections`: 엔진 사후 슬리피지 거부 횟수.
+
+    소비자는 `row.metrics.total_return_pct` 처럼 접근. 평면 키(`sort_by`) 는
+    렌더러가 `metrics` + 보조 3종을 합쳐 동일하게 노출한다.
+
+    Raises:
+        RuntimeError: `params` 튜플에 중복된 축 이름이 포함될 때 (그리드
+            상태 무결성 위반).
     """
 
-    params: dict[str, Any]
-    total_return_pct: Decimal
-    max_drawdown_pct: Decimal
-    sharpe_ratio: Decimal
-    win_rate: Decimal
-    avg_pnl_ratio: Decimal
-    trades_per_day: Decimal
-    net_pnl_krw: int
+    params: tuple[tuple[str, Any], ...]
+    metrics: BacktestMetrics
     trade_count: int
     rejected_total: int
     post_slippage_rejections: int
+
+    def __post_init__(self) -> None:
+        names = [name for name, _ in self.params]
+        if len(set(names)) != len(names):
+            raise RuntimeError(
+                f"SensitivityRow.params 에 중복된 축 이름이 있습니다: {sorted(set(names))}"
+            )
+
+    def params_dict(self) -> dict[str, Any]:
+        """소비자 편의용 dict 복사본. 원본 튜플은 불변 유지."""
+        return dict(self.params)
 
 
 def run_sensitivity(
@@ -218,7 +239,15 @@ def run_sensitivity(
     """그리드의 각 조합으로 `BacktestEngine.run()` 을 반복 실행해 결과 수집.
 
     동일 `loader` 를 조합마다 재호출 (`loader.stream(start, end, symbols)`).
-    `BarLoader` Protocol 은 호출마다 새 `Iterable` 을 반환하므로 안전.
+    `BarLoader` Protocol 이 "호출마다 새 Iterable 을 반환" 하는 재호출 안전성을
+    명시 계약으로 요구한다 (`loader.py` docstring 참조) — 이 계약을 어기는
+    구현을 주입하면 두 번째 조합부터 빈 스트림을 받게 되어 silent 하게 모든
+    메트릭이 0 이 나온다.
+
+    **Fail-fast 정책**: 조합 N 에서 `BacktestEngine.run()` 예외가 발생하면
+    이전 N-1 성공 결과도 함께 버려지고 예외가 호출자로 전파된다. 중간 실패
+    지점을 추적하기 쉽도록 `engine.run()` 호출 직전에 `logger.debug` 로 combo
+    를 남긴다 — traceback 과 함께 실패 조합을 즉시 식별할 수 있다.
 
     Args:
         loader: 분봉 스트림 소스 — 조합마다 `stream` 을 새로 호출한다.
@@ -233,12 +262,15 @@ def run_sensitivity(
         조합 순서대로 생성된 `SensitivityRow` 튜플 (결정론).
 
     Raises:
-        RuntimeError: 알 수 없는 prefix/필드명, 잘못된 타입 등 config 생성 실패.
+        RuntimeError: 알 수 없는 prefix/필드명 등 config 생성 실패. 또는 config
+            `__post_init__` 의 범위·순서 검증 위반.
     """
     rows: list[SensitivityRow] = []
     for combo in grid.iter_combinations():
         config = _apply_combo(base_config, combo)
         engine = BacktestEngine(config)
+        # 실패 시 traceback 만으로 combo 추적 가능하도록 직전에 debug 로그.
+        logger.debug("sensitivity.run.attempt combo={combo}", combo=combo)
         result = engine.run(loader.stream(start, end, symbols))
         rows.append(_result_to_row(combo, result))
         logger.info(
@@ -278,14 +310,15 @@ def render_markdown_table(
     param_keys = _consistent_param_keys(rows)
     metric_keys = _metric_columns()
 
-    sorted_rows = sorted(rows, key=lambda r: getattr(r, sort_by), reverse=descending)
+    sorted_rows = sorted(rows, key=lambda r: _get_metric_value(r, sort_by), reverse=descending)
 
     header = list(param_keys) + list(metric_keys)
     lines = ["| " + " | ".join(header) + " |"]
     lines.append("| " + " | ".join(["---"] * len(header)) + " |")
     for row in sorted_rows:
-        cells = [_format_param(row.params[k]) for k in param_keys] + [
-            _format_metric(k, getattr(row, k)) for k in metric_keys
+        row_params = dict(row.params)
+        cells = [_format_param(row_params[k]) for k in param_keys] + [
+            _format_metric(k, _get_metric_value(row, k)) for k in metric_keys
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
@@ -309,9 +342,10 @@ def write_csv(rows: tuple[SensitivityRow, ...], path: Path) -> None:
         writer = csv.writer(fp)
         writer.writerow(header)
         for row in rows:
+            row_params = dict(row.params)
             writer.writerow(
-                [_format_param(row.params[k]) for k in param_keys]
-                + [_format_metric(k, getattr(row, k)) for k in metric_keys]
+                [_format_param(row_params[k]) for k in param_keys]
+                + [_format_metric(k, _get_metric_value(row, k)) for k in metric_keys]
             )
 
 
@@ -377,21 +411,28 @@ def _require_dataclass_field(instance: Any, field_name: str, axis_name: str) -> 
 
 
 def _result_to_row(combo: dict[str, Any], result: BacktestResult) -> SensitivityRow:
-    m: BacktestMetrics = result.metrics
     rejected_total = sum(result.rejected_counts.values())
     return SensitivityRow(
-        params=dict(combo),
-        total_return_pct=m.total_return_pct,
-        max_drawdown_pct=m.max_drawdown_pct,
-        sharpe_ratio=m.sharpe_ratio,
-        win_rate=m.win_rate,
-        avg_pnl_ratio=m.avg_pnl_ratio,
-        trades_per_day=m.trades_per_day,
-        net_pnl_krw=m.net_pnl_krw,
+        params=tuple(combo.items()),
+        metrics=result.metrics,
         trade_count=len(result.trades),
         rejected_total=rejected_total,
         post_slippage_rejections=result.post_slippage_rejections,
     )
+
+
+# BacktestMetrics 안에 있는 7 필드 vs 보조 3 필드 분리. `sort_by`·렌더러가
+# 평면 키로 접근할 수 있게 헬퍼로 추상화.
+_METRIC_FIELDS_ON_ROW: frozenset[str] = frozenset(
+    {"trade_count", "rejected_total", "post_slippage_rejections"}
+)
+
+
+def _get_metric_value(row: SensitivityRow, key: str) -> Any:
+    """`key` 가 BacktestMetrics 필드면 `row.metrics.xxx`, 보조 필드면 `row.xxx`."""
+    if key in _METRIC_FIELDS_ON_ROW:
+        return getattr(row, key)
+    return getattr(row.metrics, key)
 
 
 def _metric_columns() -> tuple[str, ...]:
@@ -411,25 +452,28 @@ def _metric_columns() -> tuple[str, ...]:
 
 
 def _consistent_param_keys(rows: tuple[SensitivityRow, ...]) -> tuple[str, ...]:
-    """모든 row 의 params 키 집합이 동일한지 확인하고 첫 row 의 키 순서를 반환."""
+    """모든 row 의 params 축 이름 집합이 동일한지 확인하고 첫 row 의 순서를 반환.
+
+    `SensitivityRow.params` 는 축 선언 순서가 보존된 튜플이므로 첫 row 의 순서를
+    그대로 컬럼 순서로 쓴다.
+    """
     if not rows:
         return ()
-    first_keys = tuple(rows[0].params.keys())
+    first_keys = tuple(name for name, _ in rows[0].params)
     first_set = set(first_keys)
     for row in rows[1:]:
-        if set(row.params.keys()) != first_set:
+        other_keys = {name for name, _ in row.params}
+        if other_keys != first_set:
             raise RuntimeError(
-                "SensitivityRow 들의 params 키 집합이 일치하지 않습니다 — 동일 그리드에서 "
-                f"생성된 결과인지 확인 필요 (first={sorted(first_set)}, "
-                f"other={sorted(row.params.keys())})"
+                "SensitivityRow 들의 params 축 이름 집합이 일치하지 않습니다 — "
+                f"동일 그리드에서 생성된 결과인지 확인 필요 (first={sorted(first_set)}, "
+                f"other={sorted(other_keys)})"
             )
     return first_keys
 
 
 def _format_param(value: Any) -> str:
-    """파라미터 값 표기 — Decimal 은 그대로, time/기타는 str()."""
-    if isinstance(value, Decimal):
-        return str(value)
+    """파라미터 값 표기 — Decimal·time·기타 모두 `str()` 로 통일."""
     return str(value)
 
 
@@ -460,8 +504,6 @@ def default_grid() -> SensitivityGrid:
     현재 운영 기본값(or_end=09:30, stop=0.015, take=0.030) 은 반드시 그리드
     안에 포함된다 — "현재 기본값 vs 그리드 최상위" 비교가 자동으로 나온다.
     """
-    from datetime import time
-
     return SensitivityGrid(
         axes=(
             ParameterAxis(

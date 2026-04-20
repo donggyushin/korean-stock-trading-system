@@ -8,7 +8,7 @@ render_markdown_table / write_csv / default_grid 를 검증한다.
 from __future__ import annotations
 
 import csv as csv_mod
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,6 +16,7 @@ import pytest
 
 from stock_agent.backtest import (
     BacktestConfig,
+    BacktestMetrics,
     InMemoryBarLoader,
     ParameterAxis,
     SensitivityGrid,
@@ -70,24 +71,40 @@ def _make_base_config(capital: int = 1_000_000) -> BacktestConfig:
     return BacktestConfig(starting_capital_krw=capital)
 
 
-def _make_row(params: dict, net_pnl_krw: int = 0) -> SensitivityRow:
-    """테스트용 SensitivityRow 헬퍼."""
-    return SensitivityRow(
-        params=params,
-        total_return_pct=Decimal(net_pnl_krw) / Decimal(1_000_000),
+def _make_metrics(net_pnl_krw: int = 0) -> BacktestMetrics:
+    """테스트용 BacktestMetrics 헬퍼."""
+    total_return = Decimal(net_pnl_krw) / Decimal(1_000_000)
+    return BacktestMetrics(
+        total_return_pct=total_return,
         max_drawdown_pct=Decimal("0"),
         sharpe_ratio=Decimal("0"),
         win_rate=Decimal("1") if net_pnl_krw > 0 else Decimal("0"),
         avg_pnl_ratio=Decimal("0"),
         trades_per_day=Decimal("0"),
         net_pnl_krw=net_pnl_krw,
-        trade_count=1 if net_pnl_krw != 0 else 0,
+    )
+
+
+def _make_row(
+    params: dict,
+    net_pnl_krw: int = 0,
+    trade_count: int = 0,
+) -> SensitivityRow:
+    """테스트용 SensitivityRow 헬퍼.
+
+    params: {축이름: 값} dict → tuple[tuple[str, Any], ...] 로 변환.
+    trade_count: 호출자가 명시 전달 (비즈니스 로직 혼입 회피).
+    """
+    return SensitivityRow(
+        params=tuple(params.items()),
+        metrics=_make_metrics(net_pnl_krw),
+        trade_count=trade_count,
         rejected_total=0,
         post_slippage_rejections=0,
     )
 
 
-def _취_익절_시나리오_bars(symbol: str, date_: date) -> list[MinuteBar]:
+def _익절_시나리오_bars(symbol: str, date_: date) -> list[MinuteBar]:
     """단일 심볼 1일치 — OR + 진입(09:30) + 익절(09:32).
 
     or_high=70500, close=71000 → 진입, high=73130 → 익절(+3.0% 기본값).
@@ -281,7 +298,7 @@ class TestSensitivityGrid:
         """2 × 4 × 4 = 32 — default_grid 와 동일 구조."""
         axis_or = ParameterAxis(
             name="strategy.or_end",
-            values=(__import__("datetime").time(9, 15), __import__("datetime").time(9, 30)),
+            values=(time(9, 15), time(9, 30)),
         )
         axis_stop = ParameterAxis(
             name="strategy.stop_loss_pct",
@@ -306,7 +323,91 @@ class TestSensitivityGrid:
 
 
 # ---------------------------------------------------------------------------
-# C. run_sensitivity 회귀 / prefix 라우팅
+# C. SensitivityRow 구조 계약
+# ---------------------------------------------------------------------------
+
+
+class TestSensitivityRow:
+    """SensitivityRow 신규 구조 계약 — params:tuple, metrics:BacktestMetrics."""
+
+    def test_params_타입이_tuple이다(self):
+        """SensitivityRow.params 는 tuple[tuple[str, Any], ...] 타입이다."""
+        row = _make_row({"strategy.stop_loss_pct": Decimal("0.015")}, net_pnl_krw=1000)
+        assert isinstance(row.params, tuple)
+
+    def test_metrics_타입이_BacktestMetrics이다(self):
+        """SensitivityRow.metrics 는 BacktestMetrics 인스턴스이다."""
+        row = _make_row({"strategy.stop_loss_pct": Decimal("0.015")}, net_pnl_krw=1000)
+        assert isinstance(row.metrics, BacktestMetrics)
+
+    def test_trade_count_타입이_int이다(self):
+        """SensitivityRow.trade_count 는 int 이다."""
+        row = _make_row({}, net_pnl_krw=0, trade_count=3)
+        assert isinstance(row.trade_count, int)
+        assert row.trade_count == 3
+
+    def test_rejected_total_타입이_int이다(self):
+        """SensitivityRow.rejected_total 는 int 이다."""
+        row = _make_row({})
+        assert isinstance(row.rejected_total, int)
+
+    def test_post_slippage_rejections_타입이_int이다(self):
+        """SensitivityRow.post_slippage_rejections 는 int 이다."""
+        row = _make_row({})
+        assert isinstance(row.post_slippage_rejections, int)
+
+    def test_metrics_필드_접근(self):
+        """row.metrics.net_pnl_krw 로 메트릭에 접근한다."""
+        row = _make_row({"strategy.stop_loss_pct": Decimal("0.015")}, net_pnl_krw=5000)
+        assert row.metrics.net_pnl_krw == 5000
+        assert isinstance(row.metrics.total_return_pct, Decimal)
+        assert isinstance(row.metrics.max_drawdown_pct, Decimal)
+        assert isinstance(row.metrics.sharpe_ratio, Decimal)
+        assert isinstance(row.metrics.win_rate, Decimal)
+        assert isinstance(row.metrics.avg_pnl_ratio, Decimal)
+        assert isinstance(row.metrics.trades_per_day, Decimal)
+
+    def test_params_dict_복사본_동작(self):
+        """params_dict() 는 dict 복사본을 반환하고, 원본 params 튜플은 불변이다."""
+        row = _make_row({"strategy.stop_loss_pct": Decimal("0.015")}, net_pnl_krw=0)
+        d = row.params_dict()
+        assert isinstance(d, dict)
+        assert d["strategy.stop_loss_pct"] == Decimal("0.015")
+        # 반환된 dict 를 변경해도 원본 row.params 에 영향이 없다
+        d["strategy.stop_loss_pct"] = Decimal("0.999")
+        assert row.params_dict()["strategy.stop_loss_pct"] == Decimal("0.015")
+
+    def test_중복_축이름_RuntimeError(self):
+        """params 에 중복된 축 이름이 있으면 RuntimeError 를 발생시킨다."""
+        with pytest.raises(RuntimeError, match="중복"):
+            SensitivityRow(
+                params=(("x", 1), ("x", 2)),
+                metrics=_make_metrics(0),
+                trade_count=0,
+                rejected_total=0,
+                post_slippage_rejections=0,
+            )
+
+    def test_중복_축이름_세_개_RuntimeError(self):
+        """세 항목 중 하나만 중복이어도 RuntimeError 발생."""
+        with pytest.raises(RuntimeError, match="중복"):
+            SensitivityRow(
+                params=(("a", 1), ("b", 2), ("a", 3)),
+                metrics=_make_metrics(0),
+                trade_count=0,
+                rejected_total=0,
+                post_slippage_rejections=0,
+            )
+
+    def test_frozen_불변성(self):
+        """frozen dataclass — 필드 직접 변경 시도 AttributeError."""
+        row = _make_row({"strategy.stop_loss_pct": Decimal("0.015")})
+        with pytest.raises(AttributeError):
+            row.trade_count = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# D. run_sensitivity 회귀 / prefix 라우팅
 # ---------------------------------------------------------------------------
 
 
@@ -317,8 +418,8 @@ class TestRunSensitivity:
         """2 심볼 × 3일치 합성 분봉 — OR(09:00) + 진입(09:30) + 익절(09:32)."""
         bars: list[MinuteBar] = []
         for d in [_DATE1, _DATE2, _DATE3]:
-            bars.extend(_취_익절_시나리오_bars(_SYM_A, d))
-            bars.extend(_취_익절_시나리오_bars(_SYM_B, d))
+            bars.extend(_익절_시나리오_bars(_SYM_A, d))
+            bars.extend(_익절_시나리오_bars(_SYM_B, d))
         return InMemoryBarLoader(bars)
 
     def _2x2_grid(self) -> SensitivityGrid:
@@ -359,12 +460,12 @@ class TestRunSensitivity:
             assert isinstance(row, SensitivityRow)
 
     def test_결과_params_키_축_이름_일치(self):
-        """각 row.params 키가 축 이름과 일치한다."""
+        """각 row.params_dict() 키가 축 이름과 일치한다."""
         loader = self._loader()
         grid = self._2x2_grid()
         rows = run_sensitivity(loader, _DATE1, _DATE3, (_SYM_A,), _make_base_config(), grid)
         for row in rows:
-            assert set(row.params.keys()) == {
+            assert set(row.params_dict().keys()) == {
                 "strategy.stop_loss_pct",
                 "strategy.take_profit_pct",
             }
@@ -389,7 +490,7 @@ class TestRunSensitivity:
 
         bars: list[MinuteBar] = []
         for d in [_DATE1, _DATE2]:
-            bars.extend(_취_익절_시나리오_bars(_SYM_A, d))
+            bars.extend(_익절_시나리오_bars(_SYM_A, d))
         loader = InMemoryBarLoader(bars)
 
         rows1 = run_sensitivity(loader, _DATE1, _DATE2, (_SYM_A,), _make_base_config(), grid)
@@ -398,7 +499,7 @@ class TestRunSensitivity:
         assert len(rows1) == len(rows2)
         for r1, r2 in zip(rows1, rows2, strict=True):
             assert r1.params == r2.params
-            assert r1.net_pnl_krw == r2.net_pnl_krw
+            assert r1.metrics.net_pnl_krw == r2.metrics.net_pnl_krw
             assert r1.trade_count == r2.trade_count
 
     def test_그리드_size_0_빈_튜플_반환(self):
@@ -409,8 +510,8 @@ class TestRunSensitivity:
         assert rows == ()
 
     def test_strategy_prefix_적용(self):
-        """strategy.take_profit_pct 변경 → 적용된 파라미터가 row.params 에 반영."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        """strategy.take_profit_pct 변경 → 적용된 파라미터가 row.params_dict() 에 반영."""
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -421,12 +522,12 @@ class TestRunSensitivity:
             )
         )
         rows = run_sensitivity(loader, _DATE1, _DATE1, (_SYM_A,), _make_base_config(), grid)
-        assert rows[0].params["strategy.take_profit_pct"] == Decimal("0.030")
-        assert rows[1].params["strategy.take_profit_pct"] == Decimal("0.050")
+        assert rows[0].params_dict()["strategy.take_profit_pct"] == Decimal("0.030")
+        assert rows[1].params_dict()["strategy.take_profit_pct"] == Decimal("0.050")
 
     def test_risk_prefix_적용(self):
-        """risk.max_positions 변경 → params 에 기록된다."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        """risk.max_positions 변경 → params_dict() 에 기록된다."""
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -437,12 +538,12 @@ class TestRunSensitivity:
             )
         )
         rows = run_sensitivity(loader, _DATE1, _DATE1, (_SYM_A,), _make_base_config(), grid)
-        assert rows[0].params["risk.max_positions"] == 1
-        assert rows[1].params["risk.max_positions"] == 3
+        assert rows[0].params_dict()["risk.max_positions"] == 1
+        assert rows[1].params_dict()["risk.max_positions"] == 3
 
     def test_engine_prefix_slippage_rate_적용(self):
-        """engine.slippage_rate 변경 → params 에 기록된다."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        """engine.slippage_rate 변경 → params_dict() 에 기록된다."""
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -453,12 +554,12 @@ class TestRunSensitivity:
             )
         )
         rows = run_sensitivity(loader, _DATE1, _DATE1, (_SYM_A,), _make_base_config(), grid)
-        assert rows[0].params["engine.slippage_rate"] == Decimal("0.001")
-        assert rows[1].params["engine.slippage_rate"] == Decimal("0.002")
+        assert rows[0].params_dict()["engine.slippage_rate"] == Decimal("0.001")
+        assert rows[1].params_dict()["engine.slippage_rate"] == Decimal("0.002")
 
     def test_engine_starting_capital_krw_RuntimeError(self):
         """engine.starting_capital_krw 는 그리드 대상 아님 → RuntimeError."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -473,7 +574,7 @@ class TestRunSensitivity:
 
     def test_알수없는_strategy_필드_RuntimeError(self):
         """strategy.nonexistent_field → RuntimeError."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -488,7 +589,7 @@ class TestRunSensitivity:
 
     def test_알수없는_risk_필드_RuntimeError(self):
         """risk.nonexistent_field → RuntimeError."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -506,7 +607,7 @@ class TestRunSensitivity:
 
         max_positions=1 로 제한하고 2 심볼 동시 돌파 → 1건 거부 발생.
         """
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1) + _취_익절_시나리오_bars(_SYM_B, _DATE1)
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1) + _익절_시나리오_bars(_SYM_B, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -527,8 +628,8 @@ class TestRunSensitivity:
         assert rows[0].rejected_total >= 1, "max_positions=1 → 최소 1건 거부 기대"
 
     def test_SensitivityRow_필드_타입_정합성(self):
-        """SensitivityRow 필드 타입이 계약과 일치한다."""
-        bars = _취_익절_시나리오_bars(_SYM_A, _DATE1)
+        """SensitivityRow 필드 타입이 계약과 일치한다 (신규 구조)."""
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
         loader = InMemoryBarLoader(bars)
         grid = SensitivityGrid(
             axes=(
@@ -540,21 +641,196 @@ class TestRunSensitivity:
         )
         rows = run_sensitivity(loader, _DATE1, _DATE1, (_SYM_A,), _make_base_config(), grid)
         r = rows[0]
-        assert isinstance(r.params, dict)
-        assert isinstance(r.total_return_pct, Decimal)
-        assert isinstance(r.max_drawdown_pct, Decimal)
-        assert isinstance(r.sharpe_ratio, Decimal)
-        assert isinstance(r.win_rate, Decimal)
-        assert isinstance(r.avg_pnl_ratio, Decimal)
-        assert isinstance(r.trades_per_day, Decimal)
-        assert isinstance(r.net_pnl_krw, int)
+        # params 는 tuple (dict 아님)
+        assert isinstance(r.params, tuple)
+        # metrics 는 BacktestMetrics
+        assert isinstance(r.metrics, BacktestMetrics)
+        # metrics 내 필드 타입
+        assert isinstance(r.metrics.total_return_pct, Decimal)
+        assert isinstance(r.metrics.max_drawdown_pct, Decimal)
+        assert isinstance(r.metrics.sharpe_ratio, Decimal)
+        assert isinstance(r.metrics.win_rate, Decimal)
+        assert isinstance(r.metrics.avg_pnl_ratio, Decimal)
+        assert isinstance(r.metrics.trades_per_day, Decimal)
+        assert isinstance(r.metrics.net_pnl_krw, int)
+        # 보조 필드
         assert isinstance(r.trade_count, int)
         assert isinstance(r.rejected_total, int)
         assert isinstance(r.post_slippage_rejections, int)
 
+    # -------------------------------------------------------------------
+    # I4. post_slippage_rejections 집계 경로 회귀
+    # -------------------------------------------------------------------
+
+    def test_post_slippage_rejections_집계_end_to_end(self):
+        """사후 슬리피지 거부가 SensitivityRow.post_slippage_rejections 에 전파된다.
+
+        재현 조건:
+        - starting_capital=1_050 원 (극소 자본)
+        - 참고가 1_000 원대 OR 돌파 시나리오
+        - RiskManager 는 qty=1 승인 (position_pct=1.0, min_notional=1_000)
+        - 슬리피지 0.1% 반영 후 notional+commission > cash 가 되어 사후 거부
+        """
+        from stock_agent.risk import RiskConfig
+
+        # OR 분봉(09:00) high=1010 → or_high=1010
+        # 09:30 close=1015 → or_high(1010) 돌파 → 진입 시도
+        # entry_fill = 1015 * 1.001 = 1016.015 → int = 1016
+        # notional = 1 * 1016 = 1016, commission = int(1016 * 0.00015) = 0
+        # 1016 + 0 = 1016 > 1_050 ? → 1016 <= 1050 → 통과할 수 있으므로
+        # 더 확실하게: starting_capital=1_010, position_pct=1.0 → target=1010
+        # qty = int(1010 / 1015) = 0 → below_min_notional 으로 RiskManager 거부될 수 있음
+        # → min_notional=0 으로 낮추고 position_pct=1.0, capital=1_010
+        # qty = int(Decimal(1010)/Decimal("1015")) = int(0.99...) = 0
+        # qty=0 이면 filled_notional=0 → below_min_notional(min=0 이면 통과)
+        # qty=0 이면 진입 자체가 의미 없으므로 다른 접근 필요
+        #
+        # 올바른 재현:
+        # capital=1_100, position_pct=Decimal("1.00"), min_notional=0
+        # 참고가=1_000 → qty = int(1100 / 1000) = 1
+        # entry_fill = 1000 * 1.001 = 1001 → notional = 1001
+        # commission(buy) = int(1001 * 0.00015) = 0
+        # 1001 + 0 = 1001 <= 1100 → 통과 (사후 거부 안 됨)
+        #
+        # 사후 거부를 유발하려면 notional+commission > capital 이어야 함
+        # slippage=0.1% → fill = 1000*1.001=1001, commission=int(1001*0.015%)=0
+        # capital=1_001 이면 1001+0 = 1001 <= 1001 → 통과
+        # capital=1_000 이면 1001+0 = 1001 > 1000 → 사후 거부!
+        #
+        # capital=1_000, qty=1 이 RiskManager 를 통과하려면:
+        # filled_notional = qty * ref_price = 1 * 1000 = 1000 >= min_notional
+        # filled_notional(1000) <= available_cash(1000) → insufficient_cash 로 거부됨!
+        # → RiskManager 의 insufficient_cash(6번) 가 먼저 거부
+        #
+        # RiskManager insufficient_cash 를 피하고 엔진 사후 거부만 유발하는 조건:
+        # evaluate_entry 의 available_cash 판정은 ref_price 기준(슬리피지 전),
+        # 엔진의 사후 거부는 fill_price 기준(슬리피지 후).
+        # ref_price=1000, capital=1000 → filled_notional=1000 <= 1000 → RiskManager 통과
+        # fill_price = 1000*1.001 = 1001 → notional=1001 > 1000 → 사후 거부!
+        # 수치 계산 (or_end=09:30 기본값 기준, OR 구간=09:00):
+        # OR high = 1010 (09:00 bar)
+        # 09:30 close=1011 > or_high(1010) → 진입 시도, signal.price=1011
+        # capital=1_011, position_pct=1.0
+        # target_notional = int(1011 * 1.0) = 1011
+        # qty = int(Decimal(1011) / Decimal("1011")) = 1
+        # filled_notional = 1 * 1011 = 1011
+        # min_notional(1) 통과
+        # insufficient_cash: filled_notional(1011) <= available_cash(1011) → 통과
+        # ∴ RiskManager 승인
+        # 엔진 사후 검사:
+        # entry_fill = buy_fill_price(1011, 0.001) = 1011 * 1.001 = 1012.011
+        # notional_int = int(1 * 1012.011) = 1012
+        # commission = int(1012 * 0.00015) = 0
+        # 1012 + 0 = 1012 > cash(1011) → 사후 거부!
+        bars = [
+            _bar(_SYM_A, 9, 0, 1000, 1010, 990, 1000, date_=_DATE1),
+            _bar(_SYM_A, 9, 30, 1005, 1015, 1000, 1011, date_=_DATE1),
+            _bar(_SYM_A, 9, 31, 1011, 1050, 1005, 1030, date_=_DATE1),
+        ]
+        loader = InMemoryBarLoader(bars)
+        risk_cfg = RiskConfig(
+            position_pct=Decimal("1.00"),
+            max_positions=3,
+            min_notional_krw=1,  # 양수 최솟값 — filled_notional(1011) >= 1 통과
+            daily_max_entries=10,
+            daily_loss_limit_pct=Decimal("0.02"),
+        )
+        grid = SensitivityGrid(
+            axes=(
+                ParameterAxis(
+                    name="strategy.stop_loss_pct",
+                    values=(Decimal("0.015"),),
+                ),
+            )
+        )
+        base_cfg = BacktestConfig(
+            starting_capital_krw=1_011,  # capital=signal.price → RiskManager 통과, 사후 거부
+            slippage_rate=Decimal("0.001"),
+            commission_rate=Decimal("0.00015"),
+            sell_tax_rate=Decimal("0.0018"),
+            risk_config=risk_cfg,
+        )
+        rows = run_sensitivity(loader, _DATE1, _DATE1, (_SYM_A,), base_cfg, grid)
+        assert len(rows) == 1
+        assert rows[0].post_slippage_rejections >= 1
+
+    # -------------------------------------------------------------------
+    # I5-a. engine.commission_rate prefix 라우팅 회귀
+    # -------------------------------------------------------------------
+
+    def test_engine_commission_rate_메트릭_차이(self):
+        """engine.commission_rate 높을수록 net_pnl_krw 가 낮아진다.
+
+        동일 분봉, commission_rate=0.0001 vs 0.001 두 후보.
+        매도가 일어나는 익절 시나리오 → 수수료 차이 → net_pnl 차이.
+        """
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
+        loader = InMemoryBarLoader(bars)
+        grid = SensitivityGrid(
+            axes=(
+                ParameterAxis(
+                    name="engine.commission_rate",
+                    values=(Decimal("0.0001"), Decimal("0.001")),
+                ),
+            )
+        )
+        rows = run_sensitivity(
+            loader,
+            _DATE1,
+            _DATE1,
+            (_SYM_A,),
+            BacktestConfig(starting_capital_krw=1_000_000),
+            grid,
+        )
+        assert len(rows) == 2
+        net_low_commission = rows[0].metrics.net_pnl_krw
+        net_high_commission = rows[1].metrics.net_pnl_krw
+        # 낮은 수수료(0.0001) 쪽이 높은 수수료(0.001) 보다 net_pnl 이 크거나 같아야 함
+        assert net_low_commission >= net_high_commission
+        # 체결이 일어난 경우엔 반드시 차이가 있어야 함
+        if rows[0].trade_count > 0:
+            assert net_low_commission > net_high_commission
+
+    # -------------------------------------------------------------------
+    # I5-b. engine.sell_tax_rate prefix 라우팅 회귀
+    # -------------------------------------------------------------------
+
+    def test_engine_sell_tax_rate_메트릭_차이(self):
+        """engine.sell_tax_rate 높을수록 net_pnl_krw 가 낮아진다.
+
+        sell_tax_rate=0 vs 0.005 두 후보.
+        매도가 일어나는 익절 시나리오 → 거래세 차이 → net_pnl 차이.
+        """
+        bars = _익절_시나리오_bars(_SYM_A, _DATE1)
+        loader = InMemoryBarLoader(bars)
+        grid = SensitivityGrid(
+            axes=(
+                ParameterAxis(
+                    name="engine.sell_tax_rate",
+                    values=(Decimal("0"), Decimal("0.005")),
+                ),
+            )
+        )
+        rows = run_sensitivity(
+            loader,
+            _DATE1,
+            _DATE1,
+            (_SYM_A,),
+            BacktestConfig(starting_capital_krw=1_000_000),
+            grid,
+        )
+        assert len(rows) == 2
+        net_no_tax = rows[0].metrics.net_pnl_krw
+        net_high_tax = rows[1].metrics.net_pnl_krw
+        # 거래세 0 쪽이 거래세 0.5% 보다 net_pnl 이 크거나 같아야 함
+        assert net_no_tax >= net_high_tax
+        # 체결이 일어난 경우엔 반드시 차이가 있어야 함
+        if rows[0].trade_count > 0:
+            assert net_no_tax > net_high_tax
+
 
 # ---------------------------------------------------------------------------
-# D. render_markdown_table
+# E. render_markdown_table
 # ---------------------------------------------------------------------------
 
 
@@ -564,8 +840,8 @@ class TestRenderMarkdownTable:
         p1 = {"strategy.stop_loss_pct": Decimal("0.010")}
         p2 = {"strategy.stop_loss_pct": Decimal("0.020")}
         return (
-            _make_row(p1, net_pnl_krw=3_000),
-            _make_row(p2, net_pnl_krw=1_000),
+            _make_row(p1, net_pnl_krw=3_000, trade_count=1),
+            _make_row(p2, net_pnl_krw=1_000, trade_count=1),
         )
 
     def test_잘못된_sort_by_RuntimeError(self):
@@ -677,7 +953,7 @@ class TestRenderMarkdownTable:
 
 
 # ---------------------------------------------------------------------------
-# E. write_csv
+# F. write_csv
 # ---------------------------------------------------------------------------
 
 
@@ -686,8 +962,8 @@ class TestWriteCsv:
         p1 = {"strategy.stop_loss_pct": Decimal("0.010")}
         p2 = {"strategy.stop_loss_pct": Decimal("0.020")}
         return (
-            _make_row(p1, net_pnl_krw=3_000),
-            _make_row(p2, net_pnl_krw=-500),
+            _make_row(p1, net_pnl_krw=3_000, trade_count=1),
+            _make_row(p2, net_pnl_krw=-500, trade_count=1),
         )
 
     def test_파일_생성(self, tmp_path: Path):
@@ -762,7 +1038,7 @@ class TestWriteCsv:
 
 
 # ---------------------------------------------------------------------------
-# F. default_grid
+# G. default_grid
 # ---------------------------------------------------------------------------
 
 
@@ -787,12 +1063,10 @@ class TestDefaultGrid:
 
     def test_현재_기본값_조합_포함_or_end(self):
         """현재 운영 기본값 or_end=09:30 이 그리드에 포함된다."""
-        import datetime as dt
-
         grid = default_grid()
         combos = list(grid.iter_combinations())
         or_end_values = {c["strategy.or_end"] for c in combos}
-        assert dt.time(9, 30) in or_end_values
+        assert time(9, 30) in or_end_values
 
     def test_현재_기본값_조합_포함_stop(self):
         """현재 운영 기본값 stop=0.015 이 그리드에 포함된다."""
@@ -810,12 +1084,10 @@ class TestDefaultGrid:
 
     def test_현재_기본값_조합_정확히_한번_등장(self):
         """or_end=09:30 / stop=0.015 / take=0.030 조합이 정확히 1회 등장한다."""
-        import datetime as dt
-
         grid = default_grid()
         combos = list(grid.iter_combinations())
         target = {
-            "strategy.or_end": dt.time(9, 30),
+            "strategy.or_end": time(9, 30),
             "strategy.stop_loss_pct": Decimal("0.015"),
             "strategy.take_profit_pct": Decimal("0.030"),
         }
@@ -855,9 +1127,7 @@ class TestDefaultGrid:
 
     def test_or_end_값_범위(self):
         """or_end 후보값 2종: 09:15, 09:30."""
-        import datetime as dt
-
         grid = default_grid()
         or_axis = next(a for a in grid.axes if a.name == "strategy.or_end")
-        expected = {dt.time(9, 15), dt.time(9, 30)}
+        expected = {time(9, 15), time(9, 30)}
         assert set(or_axis.values) == expected
