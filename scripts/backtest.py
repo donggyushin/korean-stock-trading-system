@@ -23,10 +23,13 @@ uv run python scripts/backtest.py \
 - 리포트 3종 출력: Markdown (육안), metrics CSV, trades CSV (운영자 재검증 용).
 
 PASS 판정
-- 리포트 상단에 `max_drawdown_pct < -0.15` (더 작은 음수) 이면 PASS, 아니면
-  FAIL 라벨을 기록한다. **exit code 에는 반영하지 않는다** — Phase 2 PASS
-  선언은 운영자가 walk-forward·데이터 편향·슬리피지 실측 괴리까지 수동
-  검토하는 영역이다 (CI 자동화 금지).
+- 리포트 상단에 `max_drawdown_pct > -0.15` (낙폭 절대값 15% 미만) 이면 PASS,
+  아니면 FAIL 라벨을 기록한다. 경계 `-0.15` 정확값은 FAIL (strict greater).
+  즉 MDD = -10% → PASS, MDD = -15% → FAIL, MDD = -20% → FAIL.
+  PASS/FAIL 라벨은 리포트 Markdown 에만 기록하며 **exit code 에는 반영하지
+  않는다** — Phase 2 전체 PASS 선언은 운영자가 walk-forward·데이터 편향·
+  슬리피지 실측 괴리까지 수동 검토하는 영역이다 (CI 자동화 금지). exit code
+  는 오류 분류(2 입력, 3 I/O) 전용.
 
 제약
 - 외부 네트워크·KIS·pykis 접촉 없음 — 순수 CSV + 엔진.
@@ -53,7 +56,12 @@ from stock_agent.backtest import (
     BacktestResult,
     TradeRecord,
 )
-from stock_agent.data import MinuteCsvBarLoader, MinuteCsvLoadError, load_kospi200_universe
+from stock_agent.data import (
+    MinuteCsvBarLoader,
+    MinuteCsvLoadError,
+    UniverseLoadError,
+    load_kospi200_universe,
+)
 
 # exit code 규약 (scripts/sensitivity.py 와 동일): 2 = 입력·설정 오류 (재시도
 # 무의미), 3 = I/O 오류 (재시도 가치 있음).
@@ -211,8 +219,9 @@ def _render_markdown(result: BacktestResult, context: _ReportContext) -> str:
     lines.append(f"## Phase 2 PASS 판정: **{verdict}**")
     lines.append("")
     lines.append(
-        f"- 기준: `max_drawdown_pct < {_format_pct(_MDD_PASS_THRESHOLD)}` "
-        f"(plan.md Verification — Phase 2)"
+        f"- 기준: `max_drawdown_pct > {_format_pct(_MDD_PASS_THRESHOLD)}` "
+        f"(낙폭 절대값 15% 미만 — plan.md Verification § Phase 2). "
+        f"경계 `{_format_pct(_MDD_PASS_THRESHOLD)}` 정확값은 FAIL."
     )
     lines.append(f"- 실측: `{_format_pct(metrics.max_drawdown_pct)}`")
     lines.append("")
@@ -322,8 +331,17 @@ def _write_trades_csv(trades: tuple[TradeRecord, ...], path: Path) -> None:
 
 
 def _verdict_label(mdd: Decimal) -> str:
-    """MDD 가 임계값보다 더 작은 음수(낙폭 15% 이하) 이면 PASS."""
-    return "PASS" if mdd < _MDD_PASS_THRESHOLD else "FAIL"
+    """`mdd > -0.15` (낙폭 절대값 15% 미만) 이면 PASS.
+
+    MDD 는 음수 또는 0 (`BacktestMetrics.max_drawdown_pct` 계약). 임계값
+    `-0.15` 보다 **더 얕은 음수**(0 에 가까움 — 손실이 적음) 이면 PASS.
+    경계값 `-0.15` 정확일치는 FAIL (strict greater). 예: `-0.10 → PASS`,
+    `-0.15 → FAIL`, `-0.20 → FAIL`, `0 → PASS`.
+
+    의도: plan.md Phase 2 Verification "MDD 낙폭 15% 이내" — "낙폭 제한
+    기준" 이므로 낙폭이 더 깊을수록 FAIL 이 되어야 한다.
+    """
+    return "PASS" if mdd > _MDD_PASS_THRESHOLD else "FAIL"
 
 
 def _format_pct(value: Decimal) -> str:
@@ -341,7 +359,9 @@ def main(argv: list[str] | None = None) -> int:
 
     예외 분류 (프로젝트 가드레일 "generic except Exception 금지" 기조 준수):
 
-    - `MinuteCsvLoadError` · `RuntimeError` → exit 2 (입력·설정 오류).
+    - `MinuteCsvLoadError` · `UniverseLoadError` · `RuntimeError` → exit 2
+      (입력·설정 오류, 재시도 무의미). `UniverseLoadError` 는 `Exception`
+      직상속이라 `RuntimeError` 에 잡히지 않으므로 별도 분기 필요.
     - `OSError` → exit 3 (I/O 오류, 재시도 가치 있음).
     - 그 외는 버그로 간주해 Python traceback 그대로 종료.
     """
@@ -358,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
         _run_pipeline(args)
     except MinuteCsvLoadError as e:
         logger.error(f"CSV 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except UniverseLoadError as e:
+        logger.error(f"유니버스 YAML 오류: {e}")
         return _EXIT_INPUT_ERROR
     except RuntimeError as e:
         logger.error(f"설정·검증 오류: {e}")

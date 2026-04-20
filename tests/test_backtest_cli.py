@@ -58,7 +58,7 @@ from stock_agent.backtest import (  # noqa: E402  (로드 순서상 backtest_cli
     DailyEquity,
     TradeRecord,
 )
-from stock_agent.data import MinuteCsvLoadError  # noqa: E402
+from stock_agent.data import MinuteCsvLoadError, UniverseLoadError  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 상수 / fixture 헬퍼
@@ -281,20 +281,24 @@ class TestVerdictLabel:
     @pytest.mark.parametrize(
         "mdd, expected",
         [
-            (Decimal("-0.20"), "PASS"),
-            (Decimal("-0.16"), "PASS"),
-            (Decimal("-0.15"), "FAIL"),  # 임계값 경계 — strictly less than
-            (Decimal("-0.10"), "FAIL"),
-            (Decimal("0"), "FAIL"),
-            (Decimal("0.05"), "FAIL"),
+            (Decimal("-0.20"), "FAIL"),
+            (Decimal("-0.16"), "FAIL"),
+            (Decimal("-0.15"), "FAIL"),  # 임계값 경계 — strict greater이므로 FAIL
+            (Decimal("-0.14999"), "PASS"),
+            (Decimal("-0.10"), "PASS"),
+            (Decimal("-0.05"), "PASS"),
+            (Decimal("0"), "PASS"),
+            (Decimal("0.05"), "PASS"),
         ],
         ids=[
-            "mdd_-20pct_PASS",
-            "mdd_-16pct_PASS",
+            "mdd_-20pct_FAIL",
+            "mdd_-16pct_FAIL",
             "mdd_-15pct_경계_FAIL",
-            "mdd_-10pct_FAIL",
-            "mdd_0_FAIL",
-            "mdd_양수_FAIL",
+            "mdd_-14999pct_PASS",
+            "mdd_-10pct_PASS",
+            "mdd_-5pct_PASS",
+            "mdd_0_PASS",
+            "mdd_양수_PASS",
         ],
     )
     def test_verdict_label_파라미터화(self, mdd: Decimal, expected: str):
@@ -378,14 +382,14 @@ class TestRenderMarkdown:
             assert label in md, f"레이블 '{label}' 미포함"
 
     def test_PASS_verdict(self):
-        """MDD < -0.15 → '**PASS**' 가 포함된다."""
-        metrics = _make_metrics(max_drawdown_pct=Decimal("-0.20"))
+        """MDD > -0.15 (낙폭 절대값 15% 미만) → '**PASS**' 가 포함된다."""
+        metrics = _make_metrics(max_drawdown_pct=Decimal("-0.10"))
         md = _render_markdown(_make_result(metrics=metrics), self._ctx())
         assert "**PASS**" in md
 
     def test_FAIL_verdict(self):
-        """MDD >= -0.15 → '**FAIL**' 가 포함된다."""
-        metrics = _make_metrics(max_drawdown_pct=Decimal("-0.10"))
+        """MDD <= -0.15 → '**FAIL**' 가 포함된다."""
+        metrics = _make_metrics(max_drawdown_pct=Decimal("-0.20"))
         md = _render_markdown(_make_result(metrics=metrics), self._ctx())
         assert "**FAIL**" in md
 
@@ -608,6 +612,19 @@ class TestMainExitCode:
 
         def _raise(_):
             raise MinuteCsvLoadError("테스트 오류")
+
+        monkeypatch.setattr(backtest_cli, "_run_pipeline", _raise)
+        assert main(self._BASE_ARGV) == 2
+
+    def test_UniverseLoadError_exit_2(self, monkeypatch):
+        """UniverseLoadError 발생 → exit code 2.
+
+        UniverseLoadError 는 Exception 직상속(not RuntimeError)이라
+        RuntimeError 분기에 잡히지 않는다 — 전용 분기 회귀 검증.
+        """
+
+        def _raise(_):
+            raise UniverseLoadError("universe YAML 오류 시뮬레이션")
 
         monkeypatch.setattr(backtest_cli, "_run_pipeline", _raise)
         assert main(self._BASE_ARGV) == 2

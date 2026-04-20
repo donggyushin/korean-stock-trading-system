@@ -17,7 +17,7 @@ stock-agent 의 시뮬레이션 경계 모듈. `ORBStrategy` + `RiskManager` 를
 
 ## 현재 상태 (2026-04-20 기준)
 
-**Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료** (코드·테스트 레벨, 2026-04-20). 단일 런 CLI 는 완료. 남은 PASS 조건은 KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 실데이터 수집(운영자 외부 작업) + MDD<-15% 수동 확인 3건. PASS 라벨이 리포트에 찍혀도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.
+**Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료** (코드·테스트 레벨, 2026-04-20). 단일 런 CLI 는 완료. 남은 PASS 조건은 KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 실데이터 수집(운영자 외부 작업) + **낙폭 절대값 15% 미만(MDD > -15%) 수동 확인** 3건. PASS 라벨이 리포트에 찍혀도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.
 
 ### 핵심 결정 — `backtesting.py` 라이브러리 폐기, 자체 루프 채택
 
@@ -161,7 +161,7 @@ uv run python scripts/sensitivity.py \
   --sort-by total_return_pct
 ```
 
-`--symbols` 미지정 시 `load_kospi200_universe()` 전체 사용. 외부 네트워크·KIS·pykis 접촉 없음 — 순수 CSV + 엔진. plan.md PASS 기준(2~3년 실데이터, MDD<-15%) 판정은 이 스크립트 범위 밖 — 운영자가 출력 테이블을 육안 검토해 결정.
+`--symbols` 미지정 시 `load_kospi200_universe()` 전체 사용. 외부 네트워크·KIS·pykis 접촉 없음 — 순수 CSV + 엔진. plan.md PASS 기준(2~3년 실데이터, 낙폭 절대값 15% 미만 = `MDD > -15%`) 판정은 이 스크립트 범위 밖 — 운영자가 출력 테이블을 육안 검토해 결정.
 
 exit code 규약: `0` 정상 / `2` 입력·설정 오류 (`MinuteCsvLoadError`, `RuntimeError`) / `3` I/O 오류 (`OSError`). 그 외 예외는 버그로 간주해 Python 기본 traceback 으로 전파. generic `except Exception` 폐기 — `_run_pipeline(args)` 로 파이프라인 분리 후 `main()` 은 예외 매핑만 담당.
 
@@ -184,7 +184,7 @@ exit code 규약: `0` 정상 / `2` 입력·설정 오류 (`MinuteCsvLoadError`, 
 ## 소비자 참고
 
 - **`scripts/sensitivity.py`** (완료 2026-04-20): `MinuteCsvBarLoader` + `default_grid()` + `run_sensitivity` 조합으로 32 조합 실행 → Markdown·CSV 리포트. 사용법은 위 `sensitivity.py` 섹션의 CLI 블록 참조.
-- **`scripts/backtest.py`** (완료 2026-04-20): `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown 리포트·메트릭 CSV·체결 CSV 3종 산출. 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: `max_drawdown_pct < Decimal("-0.15")` 이면 리포트에 PASS 라벨 기록, 아니면 FAIL. **exit code 에는 반영 안 함** — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 동일). 외부 네트워크·KIS 접촉 0, 의존성 추가 0.
+- **`scripts/backtest.py`** (완료 2026-04-20): `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown 리포트·메트릭 CSV·체결 CSV 3종 산출. 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: `max_drawdown_pct > Decimal("-0.15")` (낙폭 절대값 15% 미만) 이면 리포트에 PASS 라벨 기록, 아니면 FAIL. 경계 `-0.15` 정확값은 FAIL(strict greater). **exit code 에는 반영 안 함** — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`UniverseLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 규약에 `UniverseLoadError` 추가). 외부 네트워크·KIS 접촉 0, 의존성 추가 0.
 
   ```
   uv run python scripts/backtest.py \
@@ -196,7 +196,7 @@ exit code 규약: `0` 정상 / `2` 입력·설정 오류 (`MinuteCsvLoadError`, 
     --output-trades-csv data/backtest_trades.csv
   ```
 
-  plan.md PASS 기준 충족은 2~3년 실데이터 CSV 확보 이후 운영자가 수동 확인한다. 관련 테스트: `tests/test_backtest_cli.py` 62건.
+  plan.md PASS 기준 충족은 2~3년 실데이터 CSV 확보 이후 운영자가 수동 확인한다. 관련 테스트: `tests/test_backtest_cli.py` 65건.
 
 ## 범위 제외 (의도적 defer — 후속 PR)
 

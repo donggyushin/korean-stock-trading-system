@@ -147,7 +147,7 @@ stock-agent/
   - 리포트 항목: 총수익률, MDD, 샤프, 승률, 평균 손익비, 일평균 거래수, 수수료·세금 반영 후 순수익
 - [x] `data/minute_csv.py`: CSV 분봉 어댑터 — 완료 2026-04-20. 레이아웃 `{csv_dir}/{symbol}.csv`, 헤더 `bar_time,open,high,low,close,volume`. 누락 파일 fail-fast, 여러 심볼 `heapq.merge` 정렬 스트리밍, stdlib 전용 추가 의존성 0. KIS 과거 분봉 API 어댑터는 별도 PR 로 분리.
 - [x] 파라미터 민감도 그리드: OR 구간(15/30분), 손절/익절 레벨 비교 — 완료 2026-04-20. `src/stock_agent/backtest/sensitivity.py` + `scripts/sensitivity.py` + `tests/test_sensitivity.py` (80건). 기본 그리드 32 조합, 현재 운영 기본값 포함. 민감도 리포트는 sanity check 용도이며 walk-forward 검증을 대체하지 않는다.
-- [x] `scripts/backtest.py`: 단일 런 백테스트 CLI — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown·메트릭 CSV·체결 CSV 3종 산출. PASS 판정 리포트 기록(`max_drawdown_pct < -15%` 이면 PASS, 아니면 FAIL). exit code 0/2/3. 테스트 62건.
+- [x] `scripts/backtest.py`: 단일 런 백테스트 CLI — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown·메트릭 CSV·체결 CSV 3종 산출. PASS 판정 리포트 기록(낙폭 절대값 15% 미만일 때 PASS, 즉 `mdd > Decimal("-0.15")` 이면 PASS — 경계 -15% 정확값은 FAIL). exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`UniverseLoadError`·`RuntimeError` / `3` `OSError`. 테스트 65건.
 - **산출물**: 파라미터 민감도 테이블 (`scripts/sensitivity.py` CLI, CSV/Markdown 출력) — 완료. 단일 런 백테스트 CLI (`scripts/backtest.py`) — 완료. 백테스트 리포트 HTML/노트북은 Phase 5 후보 (의도적 defer).
 
 ### Phase 3 — 모의투자 자동 실행 (5~7일)
@@ -181,7 +181,7 @@ stock-agent/
 - **Phase 1**: `pytest tests/test_kis_client.py` 통과 — **충족** (pytest 131건 green). 삼성전자(005930) 현재가 조회 OK — **코드 경로 완성 + WebSocket 구독 등록 성공**. 틱 수신 end-to-end 확인(장중 + 실전 키)은 Phase 3 착수 전제로 이관.
 - **Phase 2**:
   - `pytest tests/test_strategy_orb.py` — 고정 시나리오 OHLCV 입력에 정확한 진입/청산 시그널
-  - `python scripts/backtest.py --from 2023-01-01 --to 2025-12-31` → 리포트 생성, 수수료·세금 반영, MDD < -15%
+  - `python scripts/backtest.py --from 2023-01-01 --to 2025-12-31` → 리포트 생성, 수수료·세금 반영, 낙폭 절대값 15% 미만 (MDD > -15%)
 - **Phase 3**: 모의투자 **연속 10영업일 무중단 · 0 unhandled error · 모든 주문이 SQLite에 기록 · 텔레그램 알림 100% 수신**
 - **Phase 4**: 실전 1주차 실거래 결과가 백테스트 범위 ±50% 이내 (슬리피지 과대 여부 체크)
 
@@ -250,13 +250,13 @@ Phase 0 완료 (2026-04-19). Phase 1 코드·테스트 레벨 PASS 선언 (2026-
 
 ## Phase 2 진행 요약 (2026-04-20 기준)
 
-Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료 (2026-04-20). `scripts/backtest.py` CLI 는 완료. 전체 PASS 선언은 KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 실데이터 PASS 검증(MDD < -15%) 이후. 이 PR 은 Phase 2 전체 PASS 를 선언하지 않는다.
+Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료 (2026-04-20). `scripts/backtest.py` CLI 는 완료. 전체 PASS 선언은 KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 실데이터 PASS 검증(낙폭 절대값 15% 미만, MDD > -15%) 이후. 이 PR 은 Phase 2 전체 PASS 를 선언하지 않는다.
 
 1. [x] `src/stock_agent/strategy/orb.py` + `base.py` + `__init__.py` — 완료. `ORBStrategy` 상태 머신(IDLE→FLAT→LONG→CLOSED), `StrategyConfig`(frozen dataclass, 생성자 주입), `Strategy` Protocol(최소 — `on_bar`/`on_time`), `EntrySignal`/`ExitSignal`/`ExitReason` DTO. 설계 결정: 분봉 close 기준 strict 돌파, 동일 분봉 손절·익절 동시 성립 시 손절 우선, 1일 1회 진입, `force_close_at` 이후 신규 진입 금지, 세션 경계 자동 리셋. 의존성 추가 없음.
 2. [x] `src/stock_agent/risk/manager.py` — 완료 2026-04-20. `RiskConfig` 기본값 고정(position_pct 20%, max_positions 3, daily_loss_limit_pct 2%, daily_max_entries 10, min_notional 10만원). `realized_pnl_krw` 부호 계약(손실 음수·수익 양수)은 호출자 책임. 공개 심볼 6종(`RiskManager`, `RiskConfig`, `RiskDecision`, `PositionRecord`, `RejectReason`, `RiskManagerError`) `risk/__init__` 재노출.
 3. [x] `src/stock_agent/backtest/{__init__.py, engine.py, costs.py, metrics.py, loader.py}` — 완료 2026-04-20. 자체 시뮬레이션 루프(`backtesting.py` 폐기). `ORBStrategy` + `RiskManager` 호출, 슬리피지(0.1%) + 수수료(0.015%) + 거래세(0.18% 매도만) 반영, 세션 마감 force_close 훅, 복리 자본 갱신, phantom_long 처리(rejected entry 의 후속 ExitSignal 흡수), 시간 단조증가 검증. 외부 I/O 0, 의존성 추가 0. 공개 심볼 8종(`BacktestEngine`, `BacktestConfig`, `BacktestResult`, `BacktestMetrics`, `TradeRecord`, `DailyEquity`, `BarLoader`, `InMemoryBarLoader`).
 4. [x] `src/stock_agent/data/minute_csv.py` — 완료 2026-04-20. `MinuteCsvBarLoader` + `MinuteCsvLoadError` 공개. 레이아웃 `{csv_dir}/{symbol}.csv`, 헤더 `bar_time,open,high,low,close,volume`. bar_time naive KST 파싱·오프셋 포함 거부, Decimal 가격 파싱, OHLC 일관성 검증, 분 경계 강제, 단조증가+중복 금지, 누락 파일 fail-fast. 여러 심볼 `heapq.merge` 정렬 스트리밍. stdlib 전용, 추가 의존성 0. KIS 과거 분봉 API 어댑터는 별도 PR.
 5. [x] `src/stock_agent/backtest/sensitivity.py` + `scripts/sensitivity.py` — 완료 2026-04-20. `ParameterAxis`·`SensitivityGrid`·`SensitivityRow`·`run_sensitivity`·`render_markdown_table`·`write_csv`·`default_grid` 공개 (backtest `__init__` 재노출, 7종 추가). 기본 그리드 `or_end` 2종 × `stop_loss_pct` 4종 × `take_profit_pct` 4종 = 32 조합. 파라미터 이름 공간 `strategy.*`·`risk.*`·`engine.*`. 외부 의존성 추가 0. 민감도 리포트는 sanity check 용도이며 walk-forward 검증을 대체하지 않는다 (백테스트 과적합 위험 보존). PR #12 리뷰 반영 — `SensitivityRow` frozen 계약 회복 (params tuple 화 + `BacktestMetrics` 중첩), `scripts/sensitivity.py` 예외 좁힘 (`MinuteCsvLoadError`/`RuntimeError` → exit 2, `OSError` → exit 3), `BarLoader` Protocol 재호출 안전성 계약 명시, 회귀 테스트 3건 보강 (`post_slippage_rejections` end-to-end + `engine.commission_rate`/`engine.sell_tax_rate` 라우팅).
-6. [x] `scripts/backtest.py` — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → 3종 산출물(Markdown 리포트·메트릭 CSV·체결 CSV). 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: `max_drawdown_pct < Decimal("-0.15")` 이면 리포트에 PASS 라벨 기록, 아니면 FAIL. exit code 에는 반영 안 함 — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 동일 규약). 외부 네트워크·KIS 접촉 0, 의존성 추가 0. 테스트: `tests/test_backtest_cli.py` 62건. **PASS 라벨이 출력돼도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.**
+6. [x] `scripts/backtest.py` — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → 3종 산출물(Markdown 리포트·메트릭 CSV·체결 CSV). 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: 낙폭 절대값 15% 미만일 때 PASS (`mdd > Decimal("-0.15")` 이면 PASS — 경계 정확값 -15%는 FAIL). exit code 에는 반영 안 함 — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`UniverseLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 는 `UniverseLoadError` 분기 미포함 — 별도 PR 이슈). 외부 네트워크·KIS 접촉 0, 의존성 추가 0. 테스트: `tests/test_backtest_cli.py` 65건. **PASS 라벨이 출력돼도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.**
 
-pytest **245 → 324 → 384 → 464 → 477 → 539건 green** (기존 477 + test_backtest_cli 62건). ruff check/format + black --check 모두 green. 의존성 추가 없음.
+pytest **245 → 324 → 384 → 464 → 477 → 539 → 542건 green** (기존 539 + verdict 경계값 보강 2건 + UniverseLoadError 회귀 1건). ruff check/format + black --check 모두 green. 의존성 추가 없음.
