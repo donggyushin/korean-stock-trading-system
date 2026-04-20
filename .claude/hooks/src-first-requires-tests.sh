@@ -11,17 +11,28 @@
 #   - ADR 0010 (src-first-tdd-enforcement). 기존 ADR 0005 확장.
 #
 # 스코프:
-#   - `Write` 전용. `Edit`/`NotebookEdit` 은 기존 파일 보강이므로 이 훅이
-#     통과시키고, Stop 단계의 `test-coverage-check.sh` 가 사후 검증.
-#   - 대상 파일이 이미 존재하면(`-e`) overwrite 경로 → 이 훅은 통과.
-#   - `__init__.py` 는 보통 얇은 패키지 마커 → 통과. (실제 로직이 생기면
-#     `test-coverage-check.sh` 가 Stop 단계에서 잡는다.)
+#   - `settings.json` 의 matcher 가 `Write|Edit|NotebookEdit` 세 도구에만
+#     이 훅을 호출한다. 그중 **`Write` 만 실동작** — `Edit`/`NotebookEdit`
+#     은 기존 파일 보강 경로라 내부 분기(`tool_name != "Write"` → exit 0)
+#     에서 조기 통과시키고, Stop 단계의 `test-coverage-check.sh` 가 사후
+#     검증한다. matcher 가 바뀌면 이 전제가 무너지니 함께 수정할 것.
+#   - 대상 파일이 이미 존재하면(`-e`) overwrite 경로 → 이 훅은 통과하고,
+#     Stop 단계 `test-coverage-check.sh` 가 src 변경 + tests 미갱신을
+#     사후 리마인더로 포착한다 (세션당 1회).
+#   - `__init__.py` 는 보통 얇은 패키지 마커 → 통과. 단 re-export surface
+#     (`broker/__init__.py` 등) 에 새 심볼을 추가하는 변경은 이 훅 범위
+#     밖이며, Stop 훅 리마인더에만 의존한다.
 #
 # 우회:
-#   - `STOCK_AGENT_TDD_BYPASS=1` 환경변수 (세션 단위). 훅 프로세스가 부모 쉘
-#     환경을 상속받는다. stderr 에 bypass 기록 1 줄.
+#   - `STOCK_AGENT_TDD_BYPASS=1` 환경변수. 이 훅이 실행될 때 상속된 값만
+#     보므로 "설정된 쉘에서 기동된 `claude` 프로세스 lifetime" 단위로
+#     작동한다 (쉘에 남겨두면 이후 세션에도 상속되니 export 회수 주의).
+#     BYPASS 통과 시 stderr 에 UTC 시각·대상 파일·CLAUDE.md 후속 규정을
+#     함께 남겨 추적성 확보.
 #
-# 정책: fail-closed. payload 파싱 실패는 통과가 아니라 차단.
+# 정책: fail-closed. payload 파싱 실패, `tool_name` 부재, 경계 판정 실패
+# 는 모두 exit 2 또는 stderr 경고를 동반한다 — "알 수 없으면 조용히 통과"
+# 경로를 두지 않는다 (ADR 0003 기조).
 #
 # 경로 매칭은 symlink 해소 후(`pwd -P`) `PROJECT_ROOT` prefix 로 판정해
 # macOS `/var` ↔ `/private/var` 표기 차이에 속지 않는다.
@@ -85,8 +96,24 @@ if [ -n "$AGENT_ID" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3) Write 가 아닌 도구는 통과 (Edit/NotebookEdit 는 기존 파일 보강).
+# 3) tool_name 분기.
+#    빈 값은 fail-closed (payload 에 `tool_name` 이 반드시 실리는 것이
+#    Claude Code 의 계약 — 빈 값은 비정상 입력이므로 조용히 통과시키지
+#    않는다. 원칙은 ADR 0003 "조용한 fallback 금지").
+#    Write 가 아닌 도구(Edit/NotebookEdit/기타)는 정상 통과.
 # ---------------------------------------------------------------------------
+
+if [ -z "$TOOL_NAME" ]; then
+  {
+    echo "[src-first-requires-tests] payload 에 tool_name 이 비어 있음 — 안전상 차단."
+    echo ""
+    echo "Claude Code 계약상 PreToolUse payload 는 tool_name 을 반드시 포함합니다."
+    echo "빈 값이면 업스트림 스펙 변경 또는 payload 조작이 의심됩니다."
+    echo "조치: payload 생성 지점을 확인하거나, 의도한 변경이면"
+    echo "      unit-test-writer 서브에이전트 경유로 작업하세요."
+  } >&2
+  exit 2
+fi
 
 if [ "$TOOL_NAME" != "Write" ]; then
   exit 0
@@ -94,10 +121,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 4) BYPASS 환경변수가 설정됐으면 통과 + 기록.
+#    금융 자동매매 프로젝트 특성상 우회 사실은 사용자가 명시적으로
+#    선택했더라도 추적 가능해야 한다. UTC 시각·대상 파일·후속 규정
+#    요약을 stderr 에 남긴다.
 # ---------------------------------------------------------------------------
 
 if [ "${STOCK_AGENT_TDD_BYPASS:-}" = "1" ]; then
-  echo "[src-first-requires-tests] STOCK_AGENT_TDD_BYPASS=1 — TDD 게이트 우회." >&2
+  BYPASS_TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo 'unknown')"
+  {
+    echo "[src-first-requires-tests] STOCK_AGENT_TDD_BYPASS=1 — TDD 게이트 우회."
+    echo "  시각(UTC): ${BYPASS_TS}"
+    echo "  대상 파일: ${FILE_PATH:-<unspecified>}"
+    echo ""
+    echo "CLAUDE.md \"TDD 순서 강제\" 정책상 긴급 핫픽스 우회는 24 시간 내"
+    echo "회귀 테스트 작성이 필수입니다. 우회 사실은 PR 본문·커밋 메시지에"
+    echo "명시하세요."
+  } >&2
   exit 0
 fi
 
@@ -109,16 +148,25 @@ fi
 
 # ---------------------------------------------------------------------------
 # 6) PROJECT_ROOT 확보 + symlink 해소.
+#    git 저장소 밖·suffix 불일치는 "stock-agent 작업이 아님" 판정이지만,
+#    그 판정 자체가 오진일 수 있으므로 stderr 경고를 남기고 통과한다
+#    (fail-closed 비대칭 해소 — ADR 0003).
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-[ -z "$PROJECT_ROOT" ] && exit 0
+if [ -z "$PROJECT_ROOT" ]; then
+  echo "[src-first-requires-tests] PROJECT_ROOT 확정 실패 (git 저장소 밖?) — 간섭 없이 통과." >&2
+  exit 0
+fi
 
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" 2>/dev/null && pwd -P || echo "$PROJECT_ROOT")"
 
 case "$PROJECT_ROOT" in
   */stock-agent) : ;;
-  *) exit 0 ;;
+  *)
+    echo "[src-first-requires-tests] PROJECT_ROOT='${PROJECT_ROOT}' 가 */stock-agent suffix 와 불일치 — 간섭 없이 통과." >&2
+    exit 0
+    ;;
 esac
 
 # ---------------------------------------------------------------------------
