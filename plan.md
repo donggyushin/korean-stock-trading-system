@@ -59,7 +59,7 @@
 **주요 라이브러리**
 - `python-kis 2.x`: KIS Developers REST/WebSocket 래퍼 (오픈소스 검증됨, mojito2 미사용)
 - `pykrx`: KRX 공식 데이터(백테스트용 과거 OHLCV, KOSPI 200 구성종목)
-- `backtesting.py`: 백테스팅 엔진 (단순·직관적)
+- 백테스트 엔진: 자체 시뮬레이션 루프 (`src/stock_agent/backtest/engine.py`) — `backtesting.py` 라이브러리는 다중종목·포트폴리오 게이팅(동시 3종목 한도·서킷브레이커·일일 진입 횟수 한도) 표현 불가 + AGPL 라이센스 부담으로 폐기 결정 (2026-04-20). 외부 의존성 추가 없음.
 - `pandas`, `numpy`: 데이터 처리
 - `pydantic`, `pydantic-settings`: 설정 검증
 - `loguru`: 구조화 로깅
@@ -102,7 +102,10 @@ stock-agent/
 │   │   ├── executor.py         # 주문 실행, 체결 추적, 동기화
 │   │   └── state.py            # 보유 포지션 메모리 상태
 │   ├── backtest/
-│   │   └── engine.py           # backtesting.py 래퍼
+│   │   ├── engine.py           # BacktestEngine + DTO (자체 시뮬레이션 루프)
+│   │   ├── costs.py            # 슬리피지·수수료·거래세 순수 함수
+│   │   ├── metrics.py          # 총수익률·MDD·샤프·승률·평균손익비·일평균거래수
+│   │   └── loader.py           # BarLoader Protocol + InMemoryBarLoader
 │   ├── monitor/
 │   │   ├── notifier.py         # 텔레그램 알림
 │   │   └── logger.py           # loguru 설정
@@ -139,12 +142,12 @@ stock-agent/
 
 ### Phase 2 — 전략 + 백테스팅 + 리스크 모듈 (5~7일) — 진행 중
 - [x] `strategy/orb.py`: 규칙 구현 (진입/청산 시그널 생성) — 완료 2026-04-20
-- `risk/manager.py`: 포지션 사이징, 손절/익절, 일일 손실 한도
-- `backtest/engine.py`: 최근 2~3년 KOSPI 200 분봉 데이터로 ORB 백테스트
+- [x] `risk/manager.py`: 포지션 사이징, 손절/익절, 일일 손실 한도 — 완료 2026-04-20
+- [x] `backtest/engine.py`: 자체 시뮬레이션 루프 엔진 코어 — 완료 2026-04-20 (코드·테스트 레벨). 슬리피지 0.1% 시장가 불리, 수수료 0.015%(매수·매도 대칭), 거래세 0.18%(매도만) 반영.
   - 리포트 항목: 총수익률, MDD, 샤프, 승률, 평균 손익비, 일평균 거래수, 수수료·세금 반영 후 순수익
-  - **현실적 슬리피지 가정**: 시장가 0.1% 불리하게
-- 파라미터 튜닝: OR 구간(15/30분), 손절/익절 레벨 비교
-- **산출물**: 백테스트 리포트 HTML/노트북 + 파라미터 민감도 테이블
+  - **미완료**: 실데이터 분봉 어댑터(KIS 과거 분봉 API or CSV 임포트), 2~3년 실데이터 PASS 검증(MDD < -15%) — 후속 PR
+- [ ] 파라미터 튜닝: OR 구간(15/30분), 손절/익절 레벨 비교 — 미착수
+- **산출물**: 백테스트 리포트 HTML/노트북 + 파라미터 민감도 테이블 (실데이터 어댑터 도입 후)
 
 ### Phase 3 — 모의투자 자동 실행 (5~7일)
 - **착수 전제**: 실전 APP_KEY (시세 전용) 발급 완료 + KIS Developers 포털에서 IP 화이트리스트 등록 + `healthcheck.py` 4종 통과.
@@ -224,6 +227,7 @@ python scripts/healthcheck.py
 | pykrx 1.2.7 지수 API(`get_index_portfolio_deposit_file` 등) KRX 서버 호환성 깨짐 + KIS Developers 인덱스 구성종목 API 미제공 | 자동 유니버스 갱신 불가 | `config/universe.yaml` 로 수동 관리. 연 2회 정기변경(6월·12월)마다 운영자 갱신. Phase 5 에서 자동화 경로(pykrx 수정 릴리스 대기 또는 KRX 정보데이터시스템 스크래핑) 재도입. |
 | KIS paper 도메인(`openapivts`) 시세 API(`/quotations/*`) 미제공 → python-kis 고레벨 시세 API paper 환경에서 사용 불가 | 모의투자 자동 실행(Phase 3) 에서 실시간 체결가 수신 불가 | 시세 전용 실전 APP_KEY 발급, 실전 도메인(`openapi`) 직접 호출 (`RealtimeDataStore`). Phase 3 착수 전 실전 앱 발급·IP 화이트리스트 등록 필수. |
 | 실전 키 IP 화이트리스트 이탈 (공인 IP 변경, ISP 동적 IP 할당 등) | 시세 단절 → `RealtimeDataStore` 전체 장애 | `healthcheck.py` 에서 `EGW00123` 계열 오류 감지 시 힌트 로그("KIS Developers 포털 → 앱 관리 → 허용 IP 갱신") 출력. 장기적으로 VPS 이전 시 고정 IP 확보 (Phase 5). |
+| 자체 백테스트 루프의 시뮬레이션 정확도 검증 부재 | 비용 계산 오류가 백테스트 PnL 을 왜곡 → 실전 괴리 | 후속 PR 에서 KIS 실데이터로 회귀 비교. 현 PR 은 단위 테스트(costs 18 + metrics 22)로 슬리피지·수수료·거래세 적용 정확도를 명시 assert. |
 
 ---
 
@@ -245,11 +249,12 @@ Phase 0 완료 (2026-04-19). Phase 1 코드·테스트 레벨 PASS 선언 (2026-
 
 ## Phase 2 진행 요약 (2026-04-20 기준)
 
-Phase 2 첫 산출물 완료. 전체 PASS 선언은 이후.
+Phase 2 세 번째 산출물(백테스트 엔진 코어) 완료. 전체 PASS 선언은 실데이터 어댑터 + 파라미터 민감도 리포트 이후.
 
 1. [x] `src/stock_agent/strategy/orb.py` + `base.py` + `__init__.py` — 완료. `ORBStrategy` 상태 머신(IDLE→FLAT→LONG→CLOSED), `StrategyConfig`(frozen dataclass, 생성자 주입), `Strategy` Protocol(최소 — `on_bar`/`on_time`), `EntrySignal`/`ExitSignal`/`ExitReason` DTO. 설계 결정: 분봉 close 기준 strict 돌파, 동일 분봉 손절·익절 동시 성립 시 손절 우선, 1일 1회 진입, `force_close_at` 이후 신규 진입 금지, 세션 경계 자동 리셋. 의존성 추가 없음.
 2. [x] `src/stock_agent/risk/manager.py` — 완료 2026-04-20. `RiskConfig` 기본값 고정(position_pct 20%, max_positions 3, daily_loss_limit_pct 2%, daily_max_entries 10, min_notional 10만원). `realized_pnl_krw` 부호 계약(손실 음수·수익 양수)은 호출자 책임. 공개 심볼 6종(`RiskManager`, `RiskConfig`, `RiskDecision`, `PositionRecord`, `RejectReason`, `RiskManagerError`) `risk/__init__` 재노출.
-3. [ ] `src/stock_agent/backtest/engine.py` — 미착수
-4. [ ] 파라미터 민감도 리포트 — 미착수
+3. [x] `src/stock_agent/backtest/{__init__.py, engine.py, costs.py, metrics.py, loader.py}` — 완료 2026-04-20. 자체 시뮬레이션 루프(`backtesting.py` 폐기). `ORBStrategy` + `RiskManager` 호출, 슬리피지(0.1%) + 수수료(0.015%) + 거래세(0.18% 매도만) 반영, 세션 마감 force_close 훅, 복리 자본 갱신, phantom_long 처리(rejected entry 의 후속 ExitSignal 흡수), 시간 단조증가 검증. 외부 I/O 0, 의존성 추가 0. 공개 심볼 8종(`BacktestEngine`, `BacktestConfig`, `BacktestResult`, `BacktestMetrics`, `TradeRecord`, `DailyEquity`, `BarLoader`, `InMemoryBarLoader`).
+4. [ ] 실데이터 분봉 어댑터(KIS 과거 분봉 API or CSV 임포트) — 미착수
+5. [ ] 파라미터 민감도 리포트 — 미착수
 
-pytest **245건 green** (기존 131 + test_strategy_orb 36 + test_risk_manager 73 + 기타 5). ruff check/format 모두 green.
+pytest **324건 green** (기존 245 + test_backtest_engine 79 — costs 18 + metrics 22 + loader 8 + engine 31). ruff check/format 모두 green. 의존성 추가 없음.
