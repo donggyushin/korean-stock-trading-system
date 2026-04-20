@@ -151,7 +151,7 @@ stock-agent/
 - **산출물**: 파라미터 민감도 테이블 (`scripts/sensitivity.py` CLI, CSV/Markdown 출력) — 완료. 단일 런 백테스트 CLI (`scripts/backtest.py`) — 완료. 백테스트 리포트 HTML/노트북은 Phase 5 후보 (의도적 defer).
 
 ### Phase 3 — 모의투자 자동 실행 (5~7일)
-- **착수 전제**: 실전 APP_KEY (시세 전용) 발급 완료 + KIS Developers 포털에서 IP 화이트리스트 등록 + `healthcheck.py` 4종 통과.
+- **착수 전제**: 실전 APP_KEY (시세 전용) 발급 완료 + KIS Developers 포털에서 IP 화이트리스트 등록 + `healthcheck.py` 4종 통과 (**평일 장중 09:00~15:30 KST에 실행해야 안정적으로 통과** — 4번 체크 `check_realtime_price`는 WebSocket 모드에서 장중 체결 이벤트가 있어야 2초 내 `TickQuote` 수신 가능; 나머지 3종은 시간대 무관).
 - `execution/executor.py`: 신호 → 주문 → 체결 추적 → 상태 동기화 루프
 - `main.py`: APScheduler로 9:00 시작, 9:30 OR 확정, 장중 루프, 15:00 청산, 15:30 리포트
 - `monitor/notifier.py`: 진입/청산/에러/일일 요약 텔레그램 알림
@@ -189,10 +189,12 @@ stock-agent/
 
 ```bash
 python scripts/healthcheck.py
-# 1) KIS 토큰 발급 OK
-# 2) 잔고 조회 OK
-# 3) 삼성전자 현재가 조회 OK
-# 4) 텔레그램 "장전 점검 통과" 수신
+# 1) KIS 토큰 발급 OK          — 시간대 무관
+# 2) 잔고 조회 OK              — 시간대 무관
+# 3) 텔레그램 "장전 점검 통과" 수신 — 시간대 무관
+# 4) 삼성전자(005930) 현재가 조회 OK — 평일 장중(09:00~15:30 KST) 실행 필수
+#    장외에서는 WebSocket 연결은 성공하지만 체결 이벤트 미수신 → 2초 타임아웃 후 실패 가능
+#    (실전 키 미설정 시 4번은 SKIP)
 ```
 
 ---

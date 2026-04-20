@@ -15,7 +15,7 @@
 
 ## 1. 개요
 
-stock-agent 는 한국투자증권 KIS Developers API 를 기반으로 한 **Python 3.11+ 데이트레이딩 자동매매** 시스템이다. 기술적 정체성은 다음 세 가지로 요약된다.
+stock-agent 는 한국투자증권 KIS Developers API 를 기반으로 한 **Python 3.12+ 데이트레이딩 자동매매** 시스템이다. 기술적 정체성은 다음 세 가지로 요약된다.
 
 1. **계층화된 단방향 의존** — `data → strategy → risk → backtest/execution` 순서. 순환 의존 0건.
 2. **외부 I/O 격리** — 네트워크·파일·시계 의존은 경계 모듈(`broker`, `data`)에만 두고, 정책 모듈(`strategy`, `risk`, `backtest`)은 순수 로직.

@@ -184,10 +184,11 @@ cp .env.example .env
 ```bash
 uv run python scripts/healthcheck.py
 # 통과 기준:
-# 1) KIS 모의투자 토큰 발급 OK
-# 2) 모의 계좌 잔고 조회 OK
-# 3) 텔레그램 "hello" 메시지 수신 OK
-# 4) 삼성전자(005930) 현재가 조회 OK — mode=websocket | polling
+# 1) KIS 모의투자 토큰 발급 OK  — 시간대 무관
+# 2) 모의 계좌 잔고 조회 OK    — 시간대 무관
+# 3) 텔레그램 "hello" 메시지 수신 OK — 시간대 무관
+# 4) 삼성전자(005930) 현재가 조회 OK — 평일 장중(09:00~15:30 KST) 실행 필수
+#    장외에서는 WebSocket 연결은 성공하지만 체결 이벤트 미수신 → 2초 타임아웃 후 실패 가능
 #    (실전 키 미설정 시 4번은 SKIP — Phase 3 착수 전 반드시 해결:
 #     실전 키 3종 기입 + KIS Developers 포털 IP 화이트리스트 등록 필수)
 ```
