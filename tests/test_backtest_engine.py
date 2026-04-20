@@ -228,9 +228,7 @@ class TestMetrics:
         """[100, 120, 90, 130, 80] → MDD ≈ (80-130)/130 ≈ -0.3846."""
         result = metrics.max_drawdown_pct([100, 120, 90, 130, 80])
         expected = Decimal(80 - 130) / Decimal(130)  # ≈ -0.38461538...
-        assert abs(result - expected) < Decimal("1e-4"), (
-            f"MDD {result} 이 기대값 {expected} 와 너무 다름"
-        )
+        assert abs(result - expected) < Decimal("1e-4"), f"MDD={result} expected={expected}"
 
     def test_max_drawdown_pct_빈_시리즈(self):
         """빈 시리즈 → 0."""
@@ -521,9 +519,8 @@ class TestEngineSingleTrade:
         assert trade.net_pnl_krw == 3666, f"net_pnl={trade.net_pnl_krw}"
 
         assert len(result.daily_equity) == 1
-        assert result.daily_equity[0].equity_krw == 1_003_666, (
-            f"daily_equity={result.daily_equity[0].equity_krw}"
-        )
+        eq = result.daily_equity[0].equity_krw
+        assert eq == 1_003_666, f"daily_equity={eq}"
 
     def test_단일_손절_exit_reason_및_음수_pnl(self):
         """손절 시나리오 — exit_reason="stop_loss", net_pnl < 0.
@@ -606,12 +603,10 @@ class TestEngineMultiSymbol:
         )
         result = engine.run(all_bars)
 
-        assert len(result.trades) == 2, (
-            f"max_positions=2 → trade 2건이어야 한다 (실제={len(result.trades)})"
-        )
-        assert result.rejected_counts.get("max_positions_reached", 0) == 2, (
-            f"max_positions_reached 거부 2건이어야 한다 (실제={result.rejected_counts})"
-        )
+        trade_count = len(result.trades)
+        assert trade_count == 2, f"max_positions=2 → 2건 (실제={trade_count})"
+        rejected = result.rejected_counts.get("max_positions_reached", 0)
+        assert rejected == 2, f"max_positions_reached 거부 2건 (실제={result.rejected_counts})"
 
     def test_서킷브레이커_이후_진입_거부(self):
         """첫 거래 큰 손실 → halt → 두 번째 진입 시도 halted_daily_loss 거부.
@@ -664,9 +659,8 @@ class TestEngineMultiSymbol:
         # A 손절 확인
         assert any(t.exit_reason == "stop_loss" for t in result.trades), "A 심볼 손절 trade 가 없다"
         # halted_daily_loss 거부 확인
-        assert result.rejected_counts.get("halted_daily_loss", 0) >= 1, (
-            f"halted_daily_loss 거부가 없다 (rejected={result.rejected_counts})"
-        )
+        halt_count = result.rejected_counts.get("halted_daily_loss", 0)
+        assert halt_count >= 1, f"halted_daily_loss 거부 없음 (rejected={result.rejected_counts})"
 
 
 class TestEngineMultiSession:
@@ -696,9 +690,7 @@ class TestEngineMultiSession:
         day2_equity = result.daily_equity[1].equity_krw
 
         # 첫날 수익이 있으므로 둘째날 자본 > 첫날 자본 (복리 반영)
-        assert day2_equity > day1_equity, (
-            f"둘째날 자본({day2_equity}) 이 첫날({day1_equity}) 보다 크지 않다 — 복리 실패"
-        )
+        assert day2_equity > day1_equity, f"복리 실패: day2={day2_equity} day1={day1_equity}"
         assert len(result.trades) == 2, f"trade 2건이어야 한다 (실제={len(result.trades)})"
 
     def test_세션_경계_RiskManager_카운터_리셋(self):
@@ -739,9 +731,7 @@ class TestEngineMultiSession:
 
         assert len(result.daily_equity) == 2, "2일 세션이어야 한다"
         day2_trades = [t for t in result.trades if t.entry_ts.date() == _DATE2]
-        assert len(day2_trades) >= 1, (
-            "둘째날에 거래가 없다 — halt 가 세션 경계 이후에도 유지되는 버그 가능성"
-        )
+        assert len(day2_trades) >= 1, "둘째날 거래 없음 — halt 가 세션 경계 이후에도 유지되는 버그"
 
 
 class TestEngineTimeOrdering:
@@ -773,9 +763,8 @@ class TestEngineForceCloseIdempotency:
         engine = _default_engine()
         result = engine.run(bars)
 
-        assert len(result.trades) == 1, (
-            f"force_close 이후 trade 가 중복돼선 안 된다 (실제={len(result.trades)})"
-        )
+        tc = len(result.trades)
+        assert tc == 1, f"force_close 이후 trade 중복 금지 (실제={tc})"
         assert result.trades[0].exit_reason == "force_close"
 
 
@@ -817,10 +806,8 @@ class TestEngineTradeRecordIntegrity:
 
         t = result.trades[0]
         expected_net = t.gross_pnl_krw - t.commission_krw - t.tax_krw
-        assert t.net_pnl_krw == expected_net, (
-            f"net_pnl({t.net_pnl_krw}) != gross({t.gross_pnl_krw}) "
-            f"- commission({t.commission_krw}) - tax({t.tax_krw})"
-        )
+        net, gross, comm, tax = t.net_pnl_krw, t.gross_pnl_krw, t.commission_krw, t.tax_krw
+        assert t.net_pnl_krw == expected_net, f"net={net} gross={gross} comm={comm} tax={tax}"
 
     def test_daily_equity_세션_날짜_정합성(self):
         """DailyEquity.session_date 가 실제 bar 의 날짜와 일치한다."""
@@ -885,9 +872,7 @@ class TestEngineMetricsComputation:
         engine = _default_engine()
         result = engine.run(bars)
 
-        assert result.metrics.win_rate == Decimal("1"), (
-            f"익절만 있으면 win_rate=1 이어야 한다 (실제={result.metrics.win_rate})"
-        )
+        assert result.metrics.win_rate == Decimal("1"), f"win_rate={result.metrics.win_rate}"
 
     def test_메트릭_trades_per_day_1일_1거래(self):
         """1일 1거래 → trades_per_day == 1."""
@@ -899,9 +884,8 @@ class TestEngineMetricsComputation:
         engine = _default_engine()
         result = engine.run(bars)
 
-        assert result.metrics.trades_per_day == Decimal("1"), (
-            f"1일 1거래 → trades_per_day=1 이어야 한다 (실제={result.metrics.trades_per_day})"
-        )
+        tpd = result.metrics.trades_per_day
+        assert tpd == Decimal("1"), f"trades_per_day={tpd}"
 
 
 class TestEngineSafetyNet:
@@ -959,13 +943,10 @@ class TestEngineSafetyNet:
         )
         result = engine.run(bars)
 
-        assert result.post_slippage_rejections == 1, (
-            f"사후 슬리피지 거부가 1건이어야 한다 (실제={result.post_slippage_rejections})"
-        )
-        assert result.rejected_counts.get("insufficient_cash", 0) == 0, (
-            "사전 거부 insufficient_cash 카운터가 증가해선 안 된다 "
-            f"(rejected={result.rejected_counts})"
-        )
+        psr = result.post_slippage_rejections
+        assert psr == 1, f"사후 슬리피지 거부 1건이어야 한다 (실제={psr})"
+        icash = result.rejected_counts.get("insufficient_cash", 0)
+        assert icash == 0, f"insufficient_cash must be 0 (rejected={result.rejected_counts})"
         assert len(result.trades) == 0, "사후 거부이므로 체결 trade 가 없어야 한다"
         # 세션 마감 정상 종료 — phantom_long 흡수 확인 (RuntimeError 미발생이 곧 검증)
         assert len(result.daily_equity) == 1, "세션은 정상 마감되어야 한다"
@@ -1034,23 +1015,17 @@ class TestEngineSafetyNet:
 
         # D1: SYM_A 손절 trade 확인
         d1_trades = [t for t in result.trades if t.entry_ts.date() == _DATE]
-        assert any(t.symbol == _SYMBOL and t.exit_reason == "stop_loss" for t in d1_trades), (
-            "D1 SYM_A 손절 trade 가 없다"
-        )
+        has_sl = any(t.symbol == _SYMBOL and t.exit_reason == "stop_loss" for t in d1_trades)
+        assert has_sl, "D1 SYM_A 손절 trade 없음"
         # D1: SYM_B trade 없음 (phantom_long 흡수, 거래 기록 없음)
-        assert not any(t.symbol == _SYMBOL_B for t in d1_trades), (
-            "D1 SYM_B 는 phantom_long 이므로 trade 가 없어야 한다"
-        )
+        assert not any(t.symbol == _SYMBOL_B for t in d1_trades), "D1 SYM_B phantom_long → no trade"
         # D2: SYM_B 정상 진입 trade 확인
         d2_trades = [t for t in result.trades if t.entry_ts.date() == _DATE2]
-        assert any(t.symbol == _SYMBOL_B for t in d2_trades), (
-            "D2 SYM_B 는 halt 리셋 후 정상 진입이어야 한다"
-        )
+        assert any(t.symbol == _SYMBOL_B for t in d2_trades), "D2 SYM_B halt 리셋 후 정상 진입 없음"
         assert len(result.daily_equity) == 2, "2일 세션 → DailyEquity 2건"
         # halted_daily_loss 거부 1건 확인
-        assert result.rejected_counts.get("halted_daily_loss", 0) >= 1, (
-            f"halted_daily_loss 거부가 없다 (rejected={result.rejected_counts})"
-        )
+        halt_count2 = result.rejected_counts.get("halted_daily_loss", 0)
+        assert halt_count2 >= 1, f"halted_daily_loss 거부 없음 (rejected={result.rejected_counts})"
 
     # ------------------------------------------------------------------
     # 3. _handle_exit 안전망 — 미보유·비phantom 심볼 ExitSignal → RuntimeError
@@ -1191,6 +1166,5 @@ class TestEngineExactArithmetic:
         assert t.tax_krw == 263, f"tax={t.tax_krw}"
         assert t.net_pnl_krw == 3666, f"net_pnl={t.net_pnl_krw}"
         assert eq.equity_krw == 1_003_666, f"equity={eq.equity_krw}"
-        assert result.metrics.net_pnl_krw == 3666, (
-            f"metrics.net_pnl_krw={result.metrics.net_pnl_krw}"
-        )
+        mnp = result.metrics.net_pnl_krw
+        assert mnp == 3666, f"metrics.net_pnl_krw={mnp}"
