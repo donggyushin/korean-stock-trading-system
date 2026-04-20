@@ -17,7 +17,7 @@ stock-agent 의 시뮬레이션 경계 모듈. `ORBStrategy` + `RiskManager` 를
 
 ## 현재 상태 (2026-04-20 기준)
 
-**Phase 2 다섯 번째(마지막) 산출물 — 파라미터 민감도 그리드 완료** (코드·테스트 레벨). 후속 PR 에서 `scripts/backtest.py` CLI + KIS 과거 분봉 API 어댑터 + 2~3년 실데이터 PASS 검증을 추가한다.
+**Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료** (코드·테스트 레벨, 2026-04-20). 단일 런 CLI 는 완료. 남은 PASS 조건은 KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 실데이터 수집(운영자 외부 작업) + MDD<-15% 수동 확인 3건. PASS 라벨이 리포트에 찍혀도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.
 
 ### 핵심 결정 — `backtesting.py` 라이브러리 폐기, 자체 루프 채택
 
@@ -184,12 +184,23 @@ exit code 규약: `0` 정상 / `2` 입력·설정 오류 (`MinuteCsvLoadError`, 
 ## 소비자 참고
 
 - **`scripts/sensitivity.py`** (완료 2026-04-20): `MinuteCsvBarLoader` + `default_grid()` + `run_sensitivity` 조합으로 32 조합 실행 → Markdown·CSV 리포트. 사용법은 위 `sensitivity.py` 섹션의 CLI 블록 참조.
-- **`scripts/backtest.py`** (후속 PR): `BacktestEngine` + 실데이터 어댑터 조합으로 단일 실행 CLI. plan.md PASS 기준 (`--from 2023-01-01 --to 2025-12-31`, MDD < -15%, 수수료·세금 반영) 충족 — 2~3년 실데이터 CSV 2~3년치 확보 후.
+- **`scripts/backtest.py`** (완료 2026-04-20): `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown 리포트·메트릭 CSV·체결 CSV 3종 산출. 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: `max_drawdown_pct < Decimal("-0.15")` 이면 리포트에 PASS 라벨 기록, 아니면 FAIL. **exit code 에는 반영 안 함** — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 동일). 외부 네트워크·KIS 접촉 0, 의존성 추가 0.
+
+  ```
+  uv run python scripts/backtest.py \
+    --csv-dir data/minute_csv \
+    --from 2023-01-01 --to 2025-12-31 \
+    --starting-capital 1000000 \
+    --output-markdown data/backtest_report.md \
+    --output-csv data/backtest_metrics.csv \
+    --output-trades-csv data/backtest_trades.csv
+  ```
+
+  plan.md PASS 기준 충족은 2~3년 실데이터 CSV 확보 이후 운영자가 수동 확인한다. 관련 테스트: `tests/test_backtest_cli.py` 62건.
 
 ## 범위 제외 (의도적 defer — 후속 PR)
 
-- **실데이터 어댑터**: KIS 과거 분봉 API 통합. `BarLoader` Protocol + `MinuteCsvBarLoader` 는 완료, KIS API 는 30일 롤링 제약으로 별도 PR.
-- **단일 실행 CLI 스크립트**: `scripts/backtest.py` (argparse 기반 — `scripts/sensitivity.py` 패턴 재사용 가능).
+- **실데이터 어댑터**: KIS 과거 분봉 API 통합. `BarLoader` Protocol + `MinuteCsvBarLoader` + `scripts/backtest.py` CLI 는 완료, KIS API 는 30일 롤링 제약으로 별도 PR.
 - **HTML/노트북 리포트**: `BacktestResult` → 시각화 (Streamlit/Jupyter — Phase 5 후보).
 - **Walk-forward 검증**: 과적합 방어 (Phase 5). 민감도 그리드는 sanity check 이지 walk-forward 를 대체하지 않는다.
 - **호가 단위 라운딩**: 현재 `Decimal` 원시 그대로 — KRX 호가 단위 반영은 Phase 3 executor 책임 영역과 합쳐 재설계.

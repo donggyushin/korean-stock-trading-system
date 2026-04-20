@@ -66,7 +66,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 **Phase 1 PASS (코드·테스트 레벨)** (2026-04-19 선언). Phase 0 환경 준비 완료. broker(KisClient + rate_limiter) + data(historical + universe + realtime) 모두 완료. pytest **131건 green**. **paper 주문 + live 시세 하이브리드 키 정책 도입**: KIS paper 도메인에 시세 API가 없어 `RealtimeDataStore`는 별도 실전 APP_KEY로 실전 도메인을 호출하며, 실전 키 PyKis 인스턴스에는 `install_order_block_guard`를 설치해 주문 경로를 구조적으로 차단한다. **주의**: 장중 실시간 시세 수신 end-to-end 확인(실전 키 + IP 화이트리스트 + 평일 장중 틱 수신)은 Phase 3 착수 전제로 이관됨.
 
-**Phase 2 진행 중 — ORB 전략 엔진 + 리스크 매니저 + 백테스트 엔진 코어 완료** (2026-04-20). `strategy/` + `risk/` + `backtest/` 패키지 신설. pytest **324건 green**. 미완료: 실데이터 분봉 어댑터, `scripts/backtest.py` CLI, 파라미터 민감도 리포트. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
+**Phase 2 진행 중 — ORB 전략 엔진 + 리스크 매니저 + 백테스트 엔진 코어 + CSV 분봉 어댑터 + 파라미터 민감도 그리드 + backtest.py CLI 완료** (2026-04-20). `strategy/` + `risk/` + `backtest/` 패키지 신설. pytest **539건 green**. `scripts/backtest.py` 실행 가능. **PASS 선언은 실데이터 수집 후 MDD<-15% 수동 확인까지 보류** — KIS 과거 분봉 API 어댑터(별도 PR) + 2~3년 분봉 CSV 확보(운영자 외부 작업) 필요. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
 
 **운영 주의**: KOSPI 200 구성종목은 `config/universe.yaml`에 수동 관리합니다. KRX KOSPI 200 정기변경(연 2회 — 매년 6월·12월의 선물·옵션 동시만기일 익영업일 기준)에 맞춰 운영자가 직접 갱신해야 합니다. 현재 KRX 정보데이터시스템 [11006] 기준 199/200 반영(2026-04-17 조회, 임시 가상 코드 1건 제외). 정식 티커 발급 후 다음 갱신에 추가 예정.
 
@@ -80,7 +80,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 ## 디렉토리 구조
 
-현재 존재하는 파일 (Phase 2 세 번째 산출물 완료 기준):
+현재 존재하는 파일 (Phase 2 여섯 번째 산출물 완료 기준):
 
 ```text
 stock-agent/
