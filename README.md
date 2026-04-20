@@ -41,7 +41,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 - **의존성 관리**: `uv`
 - **브로커 API**: `python-kis 2.x` (KIS Developers REST/WebSocket)
 - **시장 데이터**: `pykrx` (KRX 공식 과거 OHLCV), `pyyaml` (유니버스 설정 파일 로드)
-- **백테스팅**: `backtesting.py`
+- **백테스팅**: 자체 시뮬레이션 루프 (`backtest/engine.py`) — `backtesting.py` 라이브러리는 다중종목·포트폴리오 게이팅 표현 불가 + AGPL 라이센스 부담으로 폐기 (2026-04-20)
 - **스케줄링**: `APScheduler`
 - **알림**: `python-telegram-bot 22.x`
 - **로깅**: `loguru`
@@ -66,7 +66,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 **Phase 1 PASS (코드·테스트 레벨)** (2026-04-19 선언). Phase 0 환경 준비 완료. broker(KisClient + rate_limiter) + data(historical + universe + realtime) 모두 완료. pytest **131건 green**. **paper 주문 + live 시세 하이브리드 키 정책 도입**: KIS paper 도메인에 시세 API가 없어 `RealtimeDataStore`는 별도 실전 APP_KEY로 실전 도메인을 호출하며, 실전 키 PyKis 인스턴스에는 `install_order_block_guard`를 설치해 주문 경로를 구조적으로 차단한다. **주의**: 장중 실시간 시세 수신 end-to-end 확인(실전 키 + IP 화이트리스트 + 평일 장중 틱 수신)은 Phase 3 착수 전제로 이관됨.
 
-**Phase 2 진행 중 — ORB 전략 엔진 완료** (2026-04-20). `strategy/` 패키지 신설 — `ORBStrategy` + `StrategyConfig` + `Strategy` Protocol + `EntrySignal`/`ExitSignal` DTO. pytest **167건 green** (신규 36 추가). 미완료: `risk/manager.py`, `backtest/engine.py`. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
+**Phase 2 진행 중 — ORB 전략 엔진 + 리스크 매니저 + 백테스트 엔진 코어 완료** (2026-04-20). `strategy/` + `risk/` + `backtest/` 패키지 신설. pytest **324건 green**. 미완료: 실데이터 분봉 어댑터, `scripts/backtest.py` CLI, 파라미터 민감도 리포트. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
 
 **운영 주의**: KOSPI 200 구성종목은 `config/universe.yaml`에 수동 관리합니다. KRX KOSPI 200 정기변경(연 2회 — 매년 6월·12월의 선물·옵션 동시만기일 익영업일 기준)에 맞춰 운영자가 직접 갱신해야 합니다. 현재 KRX 정보데이터시스템 [11006] 기준 199/200 반영(2026-04-17 조회, 임시 가상 코드 1건 제외). 정식 티커 발급 후 다음 갱신에 추가 예정.
 
@@ -80,7 +80,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 ## 디렉토리 구조
 
-현재 존재하는 파일 (Phase 2 첫 산출물 완료 기준):
+현재 존재하는 파일 (Phase 2 세 번째 산출물 완료 기준):
 
 ```text
 stock-agent/
@@ -115,6 +115,17 @@ stock-agent/
 │   │   ├── base.py            # Strategy Protocol, EntrySignal/ExitSignal DTO, ExitReason Literal, KST 상수
 │   │   ├── orb.py             # ORBStrategy 상태 머신 + StrategyConfig (frozen dataclass)
 │   │   └── CLAUDE.md          # 모듈 세부 문서
+│   ├── risk/
+│   │   ├── __init__.py        # RiskManager, RiskConfig, RiskDecision, PositionRecord, RejectReason, RiskManagerError export
+│   │   ├── manager.py         # RiskManager — 포지션 사이징·진입 게이팅·서킷브레이커
+│   │   └── CLAUDE.md          # 모듈 세부 문서
+│   └── backtest/
+│       ├── __init__.py        # BacktestEngine, BacktestConfig, BacktestResult, BacktestMetrics, TradeRecord, DailyEquity, BarLoader, InMemoryBarLoader export
+│       ├── engine.py          # BacktestEngine — 자체 시뮬레이션 루프
+│       ├── costs.py           # 슬리피지·수수료·거래세 순수 함수
+│       ├── metrics.py         # 총수익률·MDD·샤프·승률·평균손익비·일평균거래수
+│       ├── loader.py          # BarLoader Protocol + InMemoryBarLoader
+│       └── CLAUDE.md          # 모듈 세부 문서
 ├── tests/
 │   ├── test_config.py
 │   ├── test_kis_client.py
@@ -123,12 +134,14 @@ stock-agent/
 │   ├── test_historical.py     # 14 케이스
 │   ├── test_universe.py       # 11 케이스
 │   ├── test_realtime.py       # 28 케이스
-│   └── test_strategy_orb.py   # 36 케이스 (pytest 167건 green)
+│   ├── test_strategy_orb.py   # 36 케이스
+│   ├── test_risk_manager.py   # 73 케이스
+│   └── test_backtest_engine.py # 79 케이스 (pytest 324건 green)
 └── scripts/
     └── healthcheck.py         # KIS 모의 잔고 조회 + 텔레그램 hello (실주문 없음)
 ```
 
-`risk/`, `execution/`, `backtest/`, `monitor/`, `storage/` 등 미구현 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
+`execution/`, `monitor/`, `storage/` 등 미구현 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
 
 ## 설치 및 실행
 
