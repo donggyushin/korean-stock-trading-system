@@ -376,6 +376,68 @@ class TestEvaluateEntryRejected:
         dec = rm2.evaluate_entry(_signal("000011", 1_000), available_cash_krw=10_000_000)
         assert dec.reason == "halted_daily_loss"
 
+    def test_판정_우선권_below_min_notional_이_insufficient_cash_보다_먼저(self):
+        """below_min_notional(순위 5) + insufficient_cash(순위 6) 동시 성립 시
+        below_min_notional 이 먼저 반환된다 — 두 단독 케이스가 따로 통과해도
+        이 순서 계약 위반을 잡지 못하므로 별도 검증이 필요하다."""
+        # starting_capital=400,000 → target=80,000, qty=8, filled=80,000
+        # (a) filled(80,000) < min_notional(100,000) → below_min_notional 성립
+        # (b) filled(80,000) > available_cash(50,000) → insufficient_cash 성립
+        cfg = RiskConfig(position_pct=Decimal("0.20"), min_notional_krw=100_000)
+        rm = _started_manager(400_000, cfg)
+
+        dec = rm.evaluate_entry(
+            _signal(_SYMBOL_A, 10_000),
+            available_cash_krw=50_000,
+        )
+
+        assert dec.approved is False
+        assert dec.reason == "below_min_notional"
+        assert dec.qty == 0
+
+    def test_판정_우선권_daily_entry_cap_이_max_positions_보다_먼저_halt_미발동(self):
+        """daily_entry_cap(순위 2) + max_positions_reached(순위 3) 동시 성립 시
+        daily_entry_cap 이 먼저 반환된다 — halt 없는 상태에서 2·3 우선권만 격리 검증."""
+        # 시나리오: 진입 10회 - 청산 7회 = active 3개, entries_today=10
+        # → daily_entry_cap(entries=10 >= 10) + max_positions_reached(active=3 >= 3) 동시 성립
+        cfg = RiskConfig(max_positions=3, daily_max_entries=10)
+        rm = _started_manager(10_000_000, cfg)
+
+        # A, B, C 진입 (active=3, entries=3)
+        _record_entry(rm, "000001", price=1_000, qty=1)
+        _record_entry(rm, "000002", price=1_000, qty=1)
+        _record_entry(rm, "000003", price=1_000, qty=1)
+        # A 청산 → active=2, entries=3 / D 진입 → active=3, entries=4
+        rm.record_exit("000001", 0)
+        _record_entry(rm, "000004", price=1_000, qty=1)
+        # B 청산 / E 진입 → active=3, entries=5
+        rm.record_exit("000002", 0)
+        _record_entry(rm, "000005", price=1_000, qty=1)
+        # C 청산 / F 진입 → active=3, entries=6
+        rm.record_exit("000003", 0)
+        _record_entry(rm, "000006", price=1_000, qty=1)
+        # D 청산 / G 진입 → active=3, entries=7
+        rm.record_exit("000004", 0)
+        _record_entry(rm, "000007", price=1_000, qty=1)
+        # E 청산 / H 진입 → active=3, entries=8
+        rm.record_exit("000005", 0)
+        _record_entry(rm, "000008", price=1_000, qty=1)
+        # F 청산 / I 진입 → active=3, entries=9
+        rm.record_exit("000006", 0)
+        _record_entry(rm, "000009", price=1_000, qty=1)
+        # G 청산 / J 진입 → active=3, entries=10
+        rm.record_exit("000007", 0)
+        _record_entry(rm, "000010", price=1_000, qty=1)
+
+        assert rm.entries_today == 10
+        assert len(rm.active_positions) == 3
+        assert rm.is_halted is False  # halt 미발동 확인
+
+        dec = rm.evaluate_entry(_signal("000011", 1_000), available_cash_krw=10_000_000)
+
+        assert dec.approved is False
+        assert dec.reason == "daily_entry_cap"
+
 
 # ---------------------------------------------------------------------------
 # 5. evaluate_entry — 입력 검증 오류 (RuntimeError)

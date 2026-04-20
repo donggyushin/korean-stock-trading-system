@@ -252,4 +252,4 @@ Phase 2 첫 산출물 완료. 전체 PASS 선언은 이후.
 3. [ ] `src/stock_agent/backtest/engine.py` — 미착수
 4. [ ] 파라미터 민감도 리포트 — 미착수
 
-pytest **243건 green** (기존 131 + test_strategy_orb 36 + test_risk_manager 71 + 기타 5). ruff check/format 모두 green.
+pytest **245건 green** (기존 131 + test_strategy_orb 36 + test_risk_manager 73 + 기타 5). ruff check/format 모두 green.

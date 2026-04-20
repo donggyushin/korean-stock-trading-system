@@ -321,7 +321,7 @@ class RiskManager:
             daily=self._daily_realized_pnl_krw,
         )
 
-        threshold = -int(Decimal(self._starting_capital_krw) * self._config.daily_loss_limit_pct)
+        threshold = self._halt_threshold_krw()
         if self._daily_realized_pnl_krw <= threshold and not self._halt_logged:
             self._halt_logged = True
             logger.warning(
@@ -365,10 +365,18 @@ class RiskManager:
         """서킷브레이커 활성 여부. 세션 미시작 상태면 False."""
         if self._session_date is None or self._starting_capital_krw is None:
             return False
-        threshold = -int(Decimal(self._starting_capital_krw) * self._config.daily_loss_limit_pct)
-        return self._daily_realized_pnl_krw <= threshold
+        return self._daily_realized_pnl_krw <= self._halt_threshold_krw()
 
     # ---- internal helpers ----
+
+    def _halt_threshold_krw(self) -> int:
+        """서킷브레이커 임계치 — `is_halted` 와 halt 전환 로그 양쪽에서 재사용.
+
+        호출자 불변식: `self._starting_capital_krw is not None`. 이 메서드는
+        타입 체커 만족을 위해 assert 를 두지 않고 호출자 보장을 신뢰한다
+        (현재 호출부 2곳 모두 상위에서 None 체크 이후에만 진입).
+        """
+        return -int(Decimal(self._starting_capital_krw or 0) * self._config.daily_loss_limit_pct)
 
     def _validate_signal(self, signal: EntrySignal) -> None:
         if not _SYMBOL_RE.fullmatch(signal.symbol):
