@@ -1,0 +1,229 @@
+"""sensitivity — ORB 파라미터 민감도 그리드 실행 CLI.
+
+사용 예시:
+
+```
+uv run python scripts/sensitivity.py \
+  --csv-dir data/minute_csv \
+  --from 2023-01-01 --to 2025-12-31 \
+  --symbols 005930,000660,035420 \
+  --starting-capital 1000000 \
+  --output-markdown data/sensitivity_report.md \
+  --output-csv data/sensitivity_report.csv \
+  --sort-by total_return_pct
+```
+
+동작
+- `--csv-dir` 하위의 `{symbol}.csv` 를 `MinuteCsvBarLoader` 로 읽어 분봉 스트림
+  공급.
+- `--symbols` 미지정 시 `config/universe.yaml` 의 KOSPI 200 전체 사용.
+- 기본 그리드 (`default_grid()`) — OR 구간 2종 × 손절 4종 × 익절 4종 = 32 조합.
+  축을 코드에서 수정하고 싶으면 `default_grid()` 소스를 직접 편집 (YAML 외부화는
+  YAGNI — plan.md 기조).
+- 각 조합마다 `BacktestEngine` 을 새로 생성·실행. 결정론.
+
+제약
+- 외부 네트워크·KIS·pykis 접촉 없음 — 순수 CSV + 엔진.
+- plan.md PASS 기준 (2~3년 실데이터 MDD < -15%) 판정은 이 스크립트 범위 밖 —
+  운영자가 출력 테이블을 육안 검토해 운영 파라미터 교체 결정을 내린다.
+- 민감도 리포트는 sanity check 이지 과적합 허가가 아니다 — 최종 파라미터
+  교체는 Walk-forward 검증 (Phase 5) 후에만.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import date
+from pathlib import Path
+
+from loguru import logger
+
+from stock_agent.backtest import (
+    BacktestConfig,
+    default_grid,
+    render_markdown_table,
+    run_sensitivity,
+    write_csv,
+)
+from stock_agent.data import MinuteCsvBarLoader, MinuteCsvLoadError, load_kospi200_universe
+
+# exit code 규약: 2 = 입력·설정 오류 (재시도 무의미), 3 = I/O 오류 (재시도 가치 있음).
+_EXIT_INPUT_ERROR = 2
+_EXIT_IO_ERROR = 3
+
+_SORTABLE_KEYS = (
+    "total_return_pct",
+    "max_drawdown_pct",
+    "sharpe_ratio",
+    "win_rate",
+    "avg_pnl_ratio",
+    "trades_per_day",
+    "net_pnl_krw",
+    "trade_count",
+    "rejected_total",
+    "post_slippage_rejections",
+)
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="ORB 파라미터 민감도 그리드 실행",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--csv-dir",
+        type=Path,
+        required=True,
+        help="분봉 CSV 디렉토리 ({symbol}.csv 레이아웃).",
+    )
+    parser.add_argument(
+        "--from",
+        dest="start",
+        type=date.fromisoformat,
+        required=True,
+        help="구간 시작 (YYYY-MM-DD, 경계 포함).",
+    )
+    parser.add_argument(
+        "--to",
+        dest="end",
+        type=date.fromisoformat,
+        required=True,
+        help="구간 종료 (YYYY-MM-DD, 경계 포함).",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="",
+        help="쉼표 구분 종목 코드 (미지정 시 config/universe.yaml 전체 사용).",
+    )
+    parser.add_argument(
+        "--starting-capital",
+        type=int,
+        default=1_000_000,
+        help="시작 자본 (KRW).",
+    )
+    parser.add_argument(
+        "--output-markdown",
+        type=Path,
+        default=Path("data/sensitivity_report.md"),
+        help="Markdown 리포트 출력 경로.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=Path("data/sensitivity_report.csv"),
+        help="CSV 리포트 출력 경로.",
+    )
+    parser.add_argument(
+        "--sort-by",
+        type=str,
+        default="total_return_pct",
+        choices=_SORTABLE_KEYS,
+        help="Markdown 표 정렬 기준 메트릭.",
+    )
+    parser.add_argument(
+        "--ascending",
+        action="store_true",
+        help="Markdown 표를 오름차순으로 정렬 (기본 내림차순).",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_symbols(raw: str) -> tuple[str, ...]:
+    """`--symbols` 인자 해석 — 빈 값이면 유니버스 YAML 전체.
+
+    `raw` 에 쉼표만 들어오는 극단 케이스는 `raw.strip()` 이 falsy 로 평가되어
+    자동으로 유니버스 로드 분기로 빠진다 (별도 RuntimeError 불필요 — 현재
+    분기 구조상 도달 불가능한 방어 코드는 두지 않는다).
+    """
+    if raw.strip():
+        parts = tuple(s.strip() for s in raw.split(",") if s.strip())
+        return parts
+    universe = load_kospi200_universe()
+    if not universe.tickers:
+        raise RuntimeError(
+            "config/universe.yaml 이 비어있습니다 — --symbols 로 명시하거나 "
+            "유니버스 YAML 을 갱신하세요."
+        )
+    return universe.tickers
+
+
+def _run_pipeline(args: argparse.Namespace) -> None:
+    """실제 파이프라인 — 호출자가 예외 분기를 책임진다.
+
+    경계를 single-purpose 로 분리해 `main()` 의 wrapper 는 오직 예외 → exit
+    code 매핑에만 집중한다. 라이브러리 모듈의 `RuntimeError` fail-fast 기조를
+    그대로 전파.
+    """
+    symbols = _resolve_symbols(args.symbols)
+    loader = MinuteCsvBarLoader(args.csv_dir)
+    base_config = BacktestConfig(starting_capital_krw=args.starting_capital)
+    grid = default_grid()
+    logger.info(
+        "sensitivity.start from={s} to={e} symbols={n} combos={c}",
+        s=args.start,
+        e=args.end,
+        n=len(symbols),
+        c=grid.size,
+    )
+    rows = run_sensitivity(
+        loader=loader,
+        start=args.start,
+        end=args.end,
+        symbols=symbols,
+        base_config=base_config,
+        grid=grid,
+    )
+    args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    markdown = render_markdown_table(
+        rows,
+        sort_by=args.sort_by,
+        descending=not args.ascending,
+    )
+    args.output_markdown.write_text(markdown, encoding="utf-8")
+    write_csv(rows, args.output_csv)
+    logger.info(
+        "sensitivity.done rows={n} markdown={m} csv={c}",
+        n=len(rows),
+        m=args.output_markdown,
+        c=args.output_csv,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 엔트리포인트 — 예외 → exit code 매핑만 책임진다.
+
+    예외 분류 (프로젝트 가드레일 "generic except Exception 금지" 기조 준수 —
+    좁힌 세 타입으로만 잡고 나머지는 Python 기본 전파):
+
+    - `MinuteCsvLoadError` · `RuntimeError` → exit 2 (입력·설정 오류, 재시도
+      무의미). CSV 스키마 오류, 알 수 없는 prefix/필드, 범위 검증 위반 등.
+    - `OSError` → exit 3 (I/O 오류, 재시도 가치 있음). 디스크 풀·권한·경로
+      오류 등.
+    - 위 이외의 예외는 버그로 간주해 Python traceback 그대로 종료 (loguru 가
+      stderr 에 기록).
+    """
+    args = _parse_args(argv)
+
+    if args.start > args.end:
+        logger.error(f"--from({args.start}) 는 --to({args.end}) 이전이어야 합니다.")
+        return _EXIT_INPUT_ERROR
+
+    try:
+        _run_pipeline(args)
+    except MinuteCsvLoadError as e:
+        logger.error(f"CSV 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except RuntimeError as e:
+        logger.error(f"설정·검증 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except OSError as e:
+        logger.exception(f"I/O 오류 (재시도 가능): {e}")
+        return _EXIT_IO_ERROR
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

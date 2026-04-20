@@ -31,6 +31,12 @@ class BarLoader(Protocol):
     - `bar.symbol in symbols`.
     - 시간 단조증가 (동일 시각은 허용).
     - `(symbol, bar_time)` 중복 없음.
+    - **재호출 안전**: 동일 `(start, end, symbols)` 로 `stream` 을 여러 번
+      호출하면 매번 **새 Iterable** 을 반환해야 한다. 1회 소비 iterator
+      공유 금지 — 백테스트 루프가 동일 loader 를 조합·파라미터 민감도
+      그리드에서 여러 번 호출한다 (`backtest.sensitivity.run_sensitivity`
+      참조). 현재 구현(`InMemoryBarLoader`·`MinuteCsvBarLoader`) 은 이
+      계약을 준수한다.
 
     호출자 계약:
     - `start <= end` 이어야 함. 위반 시 구현은 `RuntimeError` 를 던진다.
