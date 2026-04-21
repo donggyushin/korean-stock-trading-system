@@ -10,14 +10,9 @@
   없이 운영자 개입을 강제.
 
 범위 제외 (의도적 defer)
-- 스케줄링 — `step(now)` 만 노출. APScheduler 진입점은 `main.py` (후속 PR).
-- 텔레그램 알림 — `monitor/notifier.py` (후속 PR).
-- SQLite 영속화 — `storage/db.py` (후속 PR).
-- 부분체결 잔량 취소·재발주 — `KisClient.cancel_order` 미구현. 시장가 주문이
-  통상 즉시 전량 체결되는 KIS 동작을 가정한다.
-- KIS 체결조회 API 통합으로 정확한 실체결가 회수 — `broker` 확장 별도 PR.
-  현재는 시그널 가격(분봉 close) ± 슬리피지 0.1% 로 추정 (백테스트 비용 모델
-  과 동일 가정).
+- 항목 정본은 모듈 CLAUDE.md "범위 제외 (의도적 defer)" 섹션 — 두 곳 동기화
+  부담을 피하기 위해 본 docstring 에서는 중복 나열하지 않는다. 핵심: 스케줄링·
+  알림·영속화·부분체결·체결조회 정확도 향상은 모두 후속 PR.
 
 에러 정책 (broker/strategy/risk 와 동일 기조)
 - `RuntimeError` 는 전파 — 입력 오류 (naive datetime, 세션 미시작 등).
@@ -37,10 +32,11 @@
 from __future__ import annotations
 
 import time as _time_module
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from loguru import logger
@@ -228,6 +224,11 @@ class ExecutorConfig:
         ):
             if val < 0:
                 raise RuntimeError(f"{name} 는 0 이상이어야 합니다 (got={val})")
+        if self.cash_buffer_pct >= 1:
+            # 1 이상이면 available_cash 가 0/음수로 떨어져 모든 진입이 거부됨 — 의미 없음.
+            raise RuntimeError(
+                f"cash_buffer_pct 는 1 미만이어야 합니다 (got={self.cash_buffer_pct})"
+            )
         if self.order_fill_timeout_s <= 0:
             raise RuntimeError(
                 f"order_fill_timeout_s 는 양수여야 합니다 (got={self.order_fill_timeout_s})"
@@ -252,10 +253,14 @@ class ReconcileReport:
 
     `mismatch_symbols` 가 비어있지 않으면 `Executor._halt = True` 가 설정되어
     이후 EntrySignal 은 자동 스킵된다 (ExitSignal 은 정상 처리).
+
+    `broker_holdings` / `risk_holdings` 는 `MappingProxyType` 으로 래핑된
+    읽기 전용 뷰다 — frozen dataclass 가 dict 의 내부 mutation 까지는 막지
+    못해 별도 보호. setitem 시도 시 `TypeError`.
     """
 
-    broker_holdings: dict[str, int]
-    risk_holdings: dict[str, int]
+    broker_holdings: Mapping[str, int]
+    risk_holdings: Mapping[str, int]
     mismatch_symbols: tuple[str, ...]
 
 
@@ -420,8 +425,8 @@ class Executor:
             )
             self._halt = True
         return ReconcileReport(
-            broker_holdings=broker_holdings,
-            risk_holdings=risk_holdings,
+            broker_holdings=MappingProxyType(broker_holdings),
+            risk_holdings=MappingProxyType(risk_holdings),
             mismatch_symbols=mismatch,
         )
 
@@ -462,7 +467,14 @@ class Executor:
 
         decision = self._risk_manager.evaluate_entry(signal, available_cash)
         if not decision.approved:
-            # RiskManager 가 이미 거부 사유 로그 — 추가 로그 생략.
+            # RiskManager 가 이미 사유 로그를 남기지만, executor 호출자가
+            # "왜 진입이 안 됐나" 를 executor 로그만 grep 해서도 답을 찾을 수
+            # 있도록 책임 경계를 명시한다.
+            logger.info(
+                "executor.entry.rejected_by_risk symbol={symbol} reason={reason}",
+                symbol=signal.symbol,
+                reason=decision.reason,
+            )
             return False
 
         ticket = self._with_backoff(
@@ -497,6 +509,17 @@ class Executor:
                     f"_handle_exit: 진입 기록 없는 청산 시그널 (symbol={signal.symbol}). "
                     "전략-Executor 동기화 위반 — record_entry 누락 가능성."
                 )
+            # fallback 진입 자체가 비정상 신호 — 정상 경로(_handle_entry → _open_lots) 로
+            # 들어왔다면 lot is None 이 될 수 없다. 외부에서 RiskManager 를 직접
+            # record_entry 한 흔적으로 보고 흔적을 남긴다 (silent fallback 방지).
+            logger.warning(
+                "executor.exit.lot_fallback symbol={symbol} entry_price={price} qty={qty} "
+                "— _open_lots miss, RiskManager.active_positions 에서 복원. "
+                "외부 record_entry 또는 Executor 우회 의심.",
+                symbol=signal.symbol,
+                price=risk_pos.entry_price,
+                qty=risk_pos.qty,
+            )
             lot = _OpenLot(entry_price=risk_pos.entry_price, qty=risk_pos.qty)
 
         ticket = self._with_backoff(

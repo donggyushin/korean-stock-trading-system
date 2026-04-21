@@ -77,21 +77,22 @@ reconcile() -> ReconcileReport
 is_halted (property)                       # _halt or risk_manager.is_halted
 ```
 
-### `ExecutorConfig` 기본값
+### `ExecutorConfig` 필드
 
-| 필드 | 기본값 | 설명 |
-|---|---|---|
-| `cash_buffer_pct` | `Decimal("0.005")` | `withdrawable` 의 0.5% 를 수수료/세금 버퍼로 차감해 RiskManager 에 전달 |
-| `order_fill_timeout_s` | `30.0` | 시장가 체결 대기 타임아웃(초). 초과 시 `ExecutorError` |
-| `order_poll_interval_s` | `0.5` | 미체결 폴링 주기(초) |
-| `slippage_rate` | `Decimal("0.001")` | 체결가 추정 슬리피지. 백테스트와 동일 |
-| `commission_rate` | `Decimal("0.00015")` | 매수·매도 대칭 0.015%. 백테스트와 동일 |
-| `sell_tax_rate` | `Decimal("0.0018")` | 매도 거래세 0.18%. 백테스트와 동일 |
-| `backoff_max_attempts` | `3` | KisClientError 재시도 최대. 총 시도 = `max_attempts + 1` |
-| `backoff_initial_s` | `0.1` | 백오프 초기 지연. 지수 증가 (0.1 → 0.2 → 0.4) |
+기본값은 **코드(`executor.py`) 가 정본**. 여기서는 필드의 의미만 설명한다 — 값을 두 곳에 적으면 rot 위험.
 
-`__post_init__` 검증 — 비율 음수 / timeout·interval·initial 0 이하 /
-max_attempts 0 이하 → `RuntimeError` (broker/strategy/risk 와 동일 기조).
+| 필드 | 의미 |
+|---|---|
+| `cash_buffer_pct` | `withdrawable` 에서 수수료/세금 버퍼로 차감할 비율 (`[0, 1)`) |
+| `order_fill_timeout_s` | 시장가 체결 대기 타임아웃(초). 초과 시 `ExecutorError` |
+| `order_poll_interval_s` | 미체결 폴링 주기(초) |
+| `slippage_rate` | 체결가 추정 슬리피지. **백테스트(`backtest/engine.py`)와 동일 가정** |
+| `commission_rate` | 매수·매도 대칭 수수료율. **백테스트와 동일 가정** |
+| `sell_tax_rate` | 매도 거래세율. **백테스트와 동일 가정** |
+| `backoff_max_attempts` | KisClientError 재시도 최대 횟수. 총 시도 = `max_attempts + 1` 회 |
+| `backoff_initial_s` | 백오프 초기 지연(초). 지수 증가 — `initial × 2^attempt` |
+
+`__post_init__` 검증 — 비율 음수 / `cash_buffer_pct ≥ 1` / timeout·interval·initial 0 이하 / max_attempts 0 이하 → `RuntimeError` (broker/strategy/risk 와 동일 기조).
 
 ### `StepReport` / `ReconcileReport`
 
@@ -99,8 +100,10 @@ max_attempts 0 이하 → `RuntimeError` (broker/strategy/risk 와 동일 기조
 
 ```python
 StepReport(processed_bars: int, orders_submitted: int, halted: bool, reconcile: ReconcileReport)
-ReconcileReport(broker_holdings: dict[str, int], risk_holdings: dict[str, int], mismatch_symbols: tuple[str, ...])
+ReconcileReport(broker_holdings: Mapping[str, int], risk_holdings: Mapping[str, int], mismatch_symbols: tuple[str, ...])
 ```
+
+`ReconcileReport.broker_holdings` / `risk_holdings` 는 `MappingProxyType` 으로 래핑된 읽기 전용 뷰 — `report.broker_holdings["AAA"] = 99` 같은 외부 mutation 시도는 `TypeError`.
 
 ## `step(now)` 흐름
 
@@ -222,11 +225,15 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
   또는 콜백 누적으로 호출 횟수·인자 검증.
 - 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root
   CLAUDE.md 하드 규칙, `.claude/hooks/tests-writer-guard.sh` fail-closed).
-- 관련 테스트 파일: `tests/test_executor.py` (63 케이스 — 공개 심볼 11종,
-  ExecutorConfig 검증 10종, 생성·세션 4종, step 가드 2종, EntrySignal 승인 3종,
-  EntrySignal 거부 1종, ExitSignal 승인 3종, ExitSignal 무결성 1종, force_close
-  3종, 체결 대기 3종, 드라이런 5종, reconcile 4종, halt 3종, 백오프 3종, 에러
-  좁힘 1종, 멀티 심볼 1종, idempotent 1종, Report 구조 4종).
+- 관련 테스트 파일: `tests/test_executor.py`. 카테고리: 공개 심볼 노출,
+  ExecutorConfig 검증, 생성·세션, step 가드, EntrySignal 승인·거부·로그,
+  ExitSignal 승인·무결성·fallback 로그, force_close, 체결 대기(_wait_fill),
+  DryRunOrderSubmitter, reconcile(일치·mismatch·critical 로그·ReconcileReport
+  immutability), halt 가시성·영속성·start_session 리셋, KisClientError 백오프,
+  에러 좁힘, 멀티 심볼, 분봉 idempotent, StepReport/ReconcileReport 구조,
+  net_pnl 정확값 회귀, end-to-end 정상 경로(`_open_lots` hit). 절대 케이스 수는
+  의도적으로 적지 않는다 — root CLAUDE.md "현재 상태" 의 총합 카운트만 정본으로
+  유지.
 
 ## 소비자 참고
 

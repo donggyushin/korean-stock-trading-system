@@ -1596,3 +1596,463 @@ class TestReportStructure:
         assert hasattr(report, "broker_holdings")
         assert hasattr(report, "risk_holdings")
         assert hasattr(report, "mismatch_symbols")
+
+
+# ===========================================================================
+# 19. ReconcileReport 외부 mutation 차단 (C1)
+# ===========================================================================
+
+
+class TestReconcileReportImmutability:
+    """ReconcileReport.broker_holdings / risk_holdings 외부 변이 차단."""
+
+    def test_reconcile_report_broker_holdings_mutation_차단(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """report.broker_holdings 에 setitem 시도 → TypeError (MappingProxyType 래핑 기대).
+
+        현재는 dict 그대로 노출돼 setitem 이 통과 — RED.
+        GREEN 후엔 MappingProxyType 으로 래핑돼 TypeError raise 기대.
+        """
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        report = exc.reconcile()
+
+        with pytest.raises(TypeError):
+            report.broker_holdings["999999"] = 99  # type: ignore[index]
+
+    def test_reconcile_report_risk_holdings_mutation_차단(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """report.risk_holdings 도 동일 — MappingProxyType 래핑 기대."""
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        report = exc.reconcile()
+
+        with pytest.raises(TypeError):
+            report.risk_holdings["999999"] = 99  # type: ignore[index]
+
+
+# ===========================================================================
+# 20. ExecutorConfig.cash_buffer_pct >= 1.0 거부 (I8)
+# ===========================================================================
+
+
+class TestExecutorConfigCashBuffer:
+    """cash_buffer_pct >= 1.0 이면 available_cash 가 0/음수 — RuntimeError 기대."""
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [Decimal("1.0"), Decimal("1.5"), Decimal("2.0")],
+        ids=["1.0", "1.5", "2.0"],
+    )
+    def test_cash_buffer_pct_1_이상_RuntimeError(self, bad_value: Decimal) -> None:
+        """cash_buffer_pct 는 [0, 1) 범위.
+
+        1 이상이면 available_cash 가 0/음수로 떨어져 의미 없음.
+        """
+        with pytest.raises(RuntimeError):
+            ExecutorConfig(cash_buffer_pct=bad_value)
+
+
+# ===========================================================================
+# 21. _handle_entry RiskManager 거부 시 INFO 로그 (I2)
+# ===========================================================================
+
+
+class TestEntryRejectedLog:
+    """RiskManager 거부 직후 executor 가 'executor.entry.rejected_by_risk' INFO 로그 남김."""
+
+    def test_entry_거부시_executor_info_로그_남김(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """RiskManager 거부 직후 executor 가 'executor.entry.rejected_by_risk'
+        INFO 로그 남김 — 책임 경계 명시.
+
+        현재 코드는 로그 0줄 — RED. GREEN 후엔 logger.info 1줄 추가 기대.
+        """
+        from loguru import logger
+
+        info_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if msg.record["level"].name == "INFO" and "executor.entry.rejected_by_risk" in str(msg):
+                info_messages.append(str(msg))
+
+        sink_id = logger.add(_sink, level="INFO")
+        try:
+            # 잔고 0원 → RiskManager insufficient_cash 또는 below_min_notional 거부
+            fake_balance_provider.set_balance(_empty_balance(withdrawable=0))
+            or_bars = [
+                _bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500) for h in range(0, 30)
+            ]
+            breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_000, high=50_000, low=49_900)
+            fake_bar_source.set_bars(_SYMBOL_A, or_bars + [breakout_bar])
+
+            exc = _make_executor(
+                strategy,
+                risk_manager,
+                fake_order_submitter,
+                fake_balance_provider,
+                fake_bar_source,
+            )
+            exc.start_session(_DATE, _STARTING_CAPITAL)
+            exc.step(_kst(9, 32))
+        finally:
+            logger.remove(sink_id)
+
+        assert len(info_messages) >= 1
+
+
+# ===========================================================================
+# 22. _handle_exit _open_lots fallback 시 WARNING 로그 (I3)
+# ===========================================================================
+
+
+class TestExitLotFallbackLog:
+    """_open_lots 미존재 + RiskManager.active_positions 존재 → fallback 시 WARNING 로그."""
+
+    def test_exit_lot_fallback시_warning_로그(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """_open_lots 미존재 + RiskManager.active_positions 존재 → fallback 진입.
+
+        fallback 시 'executor.exit.lot_fallback' WARNING 1건 기대 (silent fallback 방지).
+        """
+        from loguru import logger
+
+        warn_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if msg.record["level"].name == "WARNING" and "executor.exit.lot_fallback" in str(msg):
+                warn_messages.append(str(msg))
+
+        sink_id = logger.add(_sink, level="WARNING")
+        try:
+            exc = _make_executor(
+                strategy,
+                risk_manager,
+                fake_order_submitter,
+                fake_balance_provider,
+                fake_bar_source,
+            )
+            exc.start_session(_DATE, _STARTING_CAPITAL)
+            # OR 구간 + 돌파 bar 로 strategy 를 long 상태로 전이
+            for m in range(0, 30):
+                strategy.on_bar(_bar(_SYMBOL_A, 9, m, close=49_000, high=49_500, low=48_500))
+            strategy.on_bar(_bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000))
+            # Executor 를 우회해 RiskManager 에만 진입 기록 — _open_lots 는 비어있음
+            risk_manager.record_entry(_SYMBOL_A, Decimal("50050"), 10, _kst(9, 31))
+
+            # 손절 bar 공급 → ExitSignal → _open_lots 미존재 → fallback 분기 → WARNING 기대
+            entry_price = Decimal("50050")
+            stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+            stop_bar = _bar(
+                _SYMBOL_A,
+                9,
+                35,
+                close=int(stop_price) - 100,
+                high=int(stop_price) - 50,
+                low=int(stop_price) - 200,
+            )
+            fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+            exc.step(_kst(9, 36))
+        finally:
+            logger.remove(sink_id)
+
+        assert len(warn_messages) >= 1
+
+
+# ===========================================================================
+# 23. _compute_net_pnl 결정값 회귀 (C2)
+# ===========================================================================
+
+
+class TestNetPnlAccuracy:
+    """_compute_net_pnl 이 backtest.costs 와 1:1 동일한 산식을 사용하는지 회귀 검증."""
+
+    def test_net_pnl_정확값_손절_시나리오(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """직접 계산한 expected net_pnl 과 risk_manager.daily_realized_pnl_krw 정확 일치.
+
+        backtest.costs 의 buy_fill_price/sell_fill_price/buy_commission/sell_commission/sell_tax
+        를 같은 인자로 호출해 expected 산출 → record_exit 통지값과 정확값 비교.
+        """
+        from stock_agent.backtest.costs import (
+            buy_commission,
+            buy_fill_price,
+            sell_commission,
+            sell_fill_price,
+            sell_tax,
+        )
+
+        slippage = Decimal("0.001")
+        commission = Decimal("0.00015")
+        sell_tax_rate = Decimal("0.0018")
+
+        # 손절 시나리오: entry signal close=50_100, stop_loss=-1.5%
+        entry_ref = Decimal("50100")
+        qty = 10
+        entry_fill = buy_fill_price(entry_ref, slippage)
+        stop_price = entry_fill * (Decimal("1") - Decimal("0.015"))
+        # ExitSignal.price = stop_price (손절가)
+        exit_ref = stop_price
+        exit_fill = sell_fill_price(exit_ref, slippage)
+
+        buy_notional = entry_fill * qty
+        sell_notional = exit_fill * qty
+        expected_net = (
+            int(sell_notional)
+            - int(buy_notional)
+            - buy_commission(buy_notional, commission)
+            - sell_commission(sell_notional, commission)
+            - sell_tax(sell_notional, sell_tax_rate)
+        )
+
+        cfg = ExecutorConfig(
+            slippage_rate=slippage,
+            commission_rate=commission,
+            sell_tax_rate=sell_tax_rate,
+        )
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # OR 구간 + 돌파 bar (close=50_100)
+        or_bars = [
+            _bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500) for h in range(0, 30)
+        ]
+        breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, or_bars + [breakout_bar])
+        exc.step(_kst(9, 32))  # 진입 → record_entry, _open_lots 채움
+
+        assert len(risk_manager.active_positions) == 1
+
+        # RiskManager 가 실제로 승인한 qty 와 entry_fill_price 로 expected_net 재산출
+        actual_pos = risk_manager.active_positions[0]
+        actual_qty = actual_pos.qty
+        actual_entry_fill = actual_pos.entry_price
+        # ORBStrategy 의 stop_price = bar.close * (1 - stop_loss_pct) — entry_ref 기준
+        # ExitSignal.price = strategy 내부 stop_price (슬리피지 미적용 참고가)
+        strategy_stop_price = entry_ref * (Decimal("1") - Decimal("0.015"))
+        actual_exit_fill = sell_fill_price(strategy_stop_price, slippage)
+
+        actual_buy_notional = actual_entry_fill * actual_qty
+        actual_sell_notional = actual_exit_fill * actual_qty
+        expected_net = (
+            int(actual_sell_notional)
+            - int(actual_buy_notional)
+            - buy_commission(actual_buy_notional, commission)
+            - sell_commission(actual_sell_notional, commission)
+            - sell_tax(actual_sell_notional, sell_tax_rate)
+        )
+
+        # 손절 bar 공급: low <= strategy_stop_price
+        stop_int = int(strategy_stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+        exc.step(_kst(9, 36))  # 청산 → record_exit
+
+        assert risk_manager.daily_realized_pnl_krw == expected_net
+
+
+# ===========================================================================
+# 24. entry → exit 정상 경로 _open_lots hit 검증 (C3)
+# ===========================================================================
+
+
+class TestEntryToExitNormalPath:
+    """Executor 만 통한 진입·청산 — _open_lots 정상 hit 경로 명시 검증."""
+
+    def test_entry_to_exit_정상_경로_open_lots_hit(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """Executor 만 통한 진입·청산 — record_entry/record_exit 직접 호출 없이.
+
+        기존 ExitSignal 테스트는 외부 record_entry 직접 호출 → fallback 경로.
+        이 테스트는 _open_lots 정상 hit 경로를 명시 검증.
+
+        검증:
+        (1) record_entry 가 Executor 통해 호출됨 (slippage 적용가로 active_positions 등록)
+        (2) record_exit 호출 후 active_positions 비었음
+        (3) net_pnl 음수 (손절 시나리오)
+        (4) sell_calls 1건
+        (5) fallback 로그 ('executor.exit.lot_fallback') 미발생 — 정상 경로 증명
+        """
+        from loguru import logger
+
+        fallback_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if "executor.exit.lot_fallback" in str(msg):
+                fallback_messages.append(str(msg))
+
+        sink_id = logger.add(_sink, level="WARNING")
+        try:
+            exc = _make_executor(
+                strategy,
+                risk_manager,
+                fake_order_submitter,
+                fake_balance_provider,
+                fake_bar_source,
+            )
+            exc.start_session(_DATE, _STARTING_CAPITAL)
+
+            # OR 구간 + 돌파 bar (close=50_100)
+            or_bars = [
+                _bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500) for h in range(0, 30)
+            ]
+            breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
+            fake_bar_source.set_bars(_SYMBOL_A, or_bars + [breakout_bar])
+            exc.step(_kst(9, 32))
+
+            # (1) slippage 적용가로 진입 등록
+            assert len(risk_manager.active_positions) == 1
+            entry_pos = risk_manager.active_positions[0]
+            expected_entry_fill = Decimal("50100") * Decimal("1.001")
+            assert entry_pos.entry_price == pytest.approx(expected_entry_fill, abs=Decimal("1"))
+
+            # 손절 bar 공급
+            entry_fill = entry_pos.entry_price
+            stop_price = entry_fill * (Decimal("1") - Decimal("0.015"))
+            stop_int = int(stop_price)
+            stop_bar = _bar(
+                _SYMBOL_A,
+                9,
+                35,
+                close=stop_int - 100,
+                high=stop_int - 50,
+                low=stop_int - 200,
+            )
+            fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+            exc.step(_kst(9, 36))
+        finally:
+            logger.remove(sink_id)
+
+        # (2) active_positions 비워짐
+        assert len(risk_manager.active_positions) == 0
+        # (3) net_pnl 음수
+        assert risk_manager.daily_realized_pnl_krw < 0
+        # (4) sell_calls 1건
+        assert len(fake_order_submitter.sell_calls) == 1
+        # (5) fallback 로그 미발생 — 정상 경로 증명
+        assert len(fallback_messages) == 0
+
+
+# ===========================================================================
+# 25. halt 영속성 + start_session 재호출 리셋 (I7)
+# ===========================================================================
+
+
+class TestHaltPersistence:
+    """halt 자동 복구 금지 계약 + start_session 만이 halt 를 풀 수 있음."""
+
+    def test_halt_reconcile_회복후에도_유지(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """mismatch → halt → 잔고 일치 회복 → 다시 reconcile → halt 여전히 True.
+
+        "자동 복구 금지" 계약 회귀 보호.
+        """
+        fake_balance_provider.set_balance(_balance_with_holding(_SYMBOL_A, qty=10))
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        exc.reconcile()
+        assert exc.is_halted
+
+        # 잔고를 일치(빈 잔고)로 변경 후 다시 reconcile
+        fake_balance_provider.set_balance(_empty_balance())
+        exc.reconcile()
+        assert exc.is_halted  # 자동 복구 금지
+
+    def test_halt_start_session_재호출시_리셋(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """start_session 재호출만이 halt 를 풀 수 있다."""
+        fake_balance_provider.set_balance(_balance_with_holding(_SYMBOL_A, qty=10))
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        exc.reconcile()
+        assert exc.is_halted
+
+        fake_balance_provider.set_balance(_empty_balance())
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        assert not exc.is_halted
