@@ -493,7 +493,7 @@ class TestPrimaryKeyConflict:
         r = _make_recorder()
         r.record_entry(_make_entry_event(order_number="ORD-DUP2"))
         r.record_entry(_make_entry_event(order_number="ORD-DUP2"))
-        assert r._consecutive_failures == 1
+        assert r._consecutive_failures["record_entry"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -568,11 +568,11 @@ class TestSilentFailAndDedupe:
 
         for _ in range(3):
             r.record_entry(_make_entry_event())
-        assert r._consecutive_failures == 3
+        assert r._consecutive_failures["record_entry"] == 3
 
         # 성공 1회 — 카운터 리셋
         r.record_entry(_make_entry_event(order_number="ORD-SUCCESS"))
-        assert r._consecutive_failures == 0
+        assert r._consecutive_failures["record_entry"] == 0
 
     def test_critical_reemitted_after_reset_and_new_threshold(self, mocker: MockerFixture) -> None:
         """리셋 후 다시 threshold 에 도달하면 critical 이 다시 1회 방출된다."""
@@ -667,11 +667,11 @@ class TestRecordAfterClose:
         mock_logger.warning.assert_called()
 
     def test_counter_not_incremented_after_close(self, mocker: MockerFixture) -> None:
-        """close 후 record_* 는 _consecutive_failures 를 올리지 않는다."""
+        """close 후 record_* 는 _consecutive_failures["record_entry"] 를 올리지 않는다."""
         r = _make_recorder()
         r.close()
         r.record_entry(_make_entry_event())
-        assert r._consecutive_failures == 0
+        assert r._consecutive_failures["record_entry"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -804,4 +804,130 @@ class TestNaiveDatetimeWarning:
 
         r = _make_recorder()
         r.record_entry(event)
-        assert r._consecutive_failures == 1
+        assert r._consecutive_failures["record_entry"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 15. per-op 카운터 독립 (C4) + 비-sqlite3 예외 흡수 (I2) + ExitEvent ref_price (C5)
+# ---------------------------------------------------------------------------
+
+
+class TestPerOpCounterIndependence:
+    """C4 — op 별 카운터가 독립적으로 동작한다."""
+
+    def _make_partially_failing_conn(
+        self,
+        mocker: MockerFixture,
+        recorder: SqliteTradingRecorder,
+        *,
+        fail_op_sql_prefix: str,
+    ) -> MagicMock:
+        """`fail_op_sql_prefix` 로 시작하는 SQL 만 OperationalError 로 강제.
+
+        나머지는 원본 연결로 위임한다.
+        """
+        original_conn = recorder._conn
+        fake_conn = mocker.MagicMock()
+
+        def selective_execute(sql: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if sql.strip().startswith(fail_op_sql_prefix):
+                raise sqlite3.OperationalError("forced selective failure")
+            return original_conn.execute(sql, *args, **kwargs)
+
+        fake_conn.execute.side_effect = selective_execute
+        recorder._conn = fake_conn
+        return fake_conn
+
+    def test_daily_summary_실패가_entry_카운터를_오염시키지_않는다(
+        self, mocker: MockerFixture
+    ) -> None:
+        """record_daily_summary 3회 연속 실패 중 record_entry 성공 시 카운터 독립 유지."""
+        r = _make_recorder()
+        self._make_partially_failing_conn(
+            mocker, r, fail_op_sql_prefix="INSERT OR REPLACE INTO daily_pnl"
+        )
+        mocker.patch("stock_agent.storage.db.logger")
+
+        for _ in range(3):
+            r.record_daily_summary(_make_daily_summary())
+
+        # record_entry 는 orders INSERT 이므로 다른 SQL prefix → 성공
+        r.record_entry(_make_entry_event(order_number="ORD-CROSS-1"))
+
+        assert r._consecutive_failures["record_daily_summary"] == 3
+        assert r._consecutive_failures["record_entry"] == 0
+
+    def test_daily_summary_만_threshold_도달시_critical_방출(self, mocker: MockerFixture) -> None:
+        """threshold=3 에서 record_daily_summary 만 3회 실패 → critical 1회 방출."""
+        r = SqliteTradingRecorder(db_path=":memory:", consecutive_failure_threshold=3)
+        self._make_partially_failing_conn(
+            mocker, r, fail_op_sql_prefix="INSERT OR REPLACE INTO daily_pnl"
+        )
+        mock_logger = mocker.patch("stock_agent.storage.db.logger")
+
+        # record_entry 성공 (daily_summary threshold 달성에 영향 없어야 함)
+        r.record_entry(_make_entry_event(order_number="ORD-OK-CROSS"))
+
+        for _ in range(3):
+            r.record_daily_summary(_make_daily_summary())
+
+        mock_logger.critical.assert_called_once()
+        critical_msg: str = mock_logger.critical.call_args[0][0]
+        assert "record_daily_summary" in critical_msg
+
+
+class TestNonSqliteExceptionSilentFail:
+    """I2 — sqlite3 외부 예외도 silent fail 로 흡수된다."""
+
+    def test_type_error_도_전파하지_않음(self, mocker: MockerFixture) -> None:
+        """execute 에서 TypeError 가 발생해도 record_entry 가 예외를 전파하지 않는다."""
+        r = _make_recorder()
+        fake_conn = mocker.MagicMock()
+        fake_conn.execute.side_effect = TypeError("forced non-sqlite error")
+        r._conn = fake_conn
+        mocker.patch("stock_agent.storage.db.logger")
+
+        # 예외 전파 없음
+        r.record_entry(_make_entry_event())
+
+    def test_type_error_카운터_증가(self, mocker: MockerFixture) -> None:
+        """execute 에서 TypeError 발생 시 record_entry 카운터가 1 증가한다."""
+        r = _make_recorder()
+        fake_conn = mocker.MagicMock()
+        fake_conn.execute.side_effect = TypeError("forced non-sqlite error")
+        r._conn = fake_conn
+        mocker.patch("stock_agent.storage.db.logger")
+
+        r.record_entry(_make_entry_event())
+
+        assert r._consecutive_failures["record_entry"] == 1
+
+    def test_type_error_warning_방출(self, mocker: MockerFixture) -> None:
+        """execute 에서 TypeError 발생 시 logger.warning 이 1회 호출된다."""
+        r = _make_recorder()
+        fake_conn = mocker.MagicMock()
+        fake_conn.execute.side_effect = TypeError("forced non-sqlite error")
+        r._conn = fake_conn
+        mock_logger = mocker.patch("stock_agent.storage.db.logger")
+
+        r.record_entry(_make_entry_event())
+
+        mock_logger.warning.assert_called_once()
+
+
+class TestRecordExitRefPriceCopy:
+    """C5 — ExitEvent.ref_price 는 fill_price 복사 계약."""
+
+    def test_exit_ref_price_equals_fill_price(self) -> None:
+        """orders 테이블의 ref_price 와 fill_price 가 동일 값으로 저장된다."""
+        r = _make_recorder()
+        fill = Decimal("49350")
+        r.record_exit(_make_exit_event(fill_price=fill, order_number="ORD-EXIT-REF"))
+        conn = _get_conn(r)
+        row = conn.execute(
+            "SELECT ref_price, fill_price FROM orders WHERE order_number = ?",
+            ("ORD-EXIT-REF",),
+        ).fetchone()
+        assert row is not None, "ORD-EXIT-REF 행이 orders 에 없음"
+        assert row[0] == row[1], f"ref_price({row[0]}) != fill_price({row[1]})"
+        assert row[0] == str(fill)

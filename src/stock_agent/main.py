@@ -89,6 +89,14 @@ EXIT_IO_ERROR = 3
 
 KST = timezone(timedelta(hours=9))
 
+# 프로젝트 루트(main.py = .../<root>/src/stock_agent/main.py) 기반 절대경로.
+# 리뷰 C1: `Path("data/trading.db")` 상대경로는 프로세스 CWD 에 따라 원장
+# DB 파일이 갈라져 일부 세션 기록이 누락될 수 있어 실운영 진입점에서는 절대
+# 경로로 고정한다. 상대경로 기본값은 `SqliteTradingRecorder` 의 하위 호환성·
+# 테스트용으로만 유지한다.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+_TRADING_DB_PATH: Path = _PROJECT_ROOT / "data" / "trading.db"
+
 ClockFn = Callable[[], datetime]
 """KST aware datetime 을 반환하는 시계 함수. 테스트는 `lambda: _kst(9, 0)` 주입."""
 
@@ -204,24 +212,24 @@ def _default_notifier_factory(settings: Settings, dry_run: bool) -> Notifier:
 
 
 def _default_recorder_factory(settings: Settings, dry_run: bool) -> TradingRecorder:  # noqa: ARG001
-    """기본 recorder 팩토리 — `SqliteTradingRecorder(db_path='data/trading.db')` 조립.
+    """기본 recorder 팩토리 — `SqliteTradingRecorder(db_path=<프로젝트 루트>/data/trading.db)` 조립.
 
     `StorageError`·`RuntimeError`·`OSError` 등 초기화 실패 시 `NullTradingRecorder`
     폴백(영속화 부재가 세션 전체 실패보다 덜 위험 — 로그 sink 로 사후 재구성
     경로 보존, ADR-0013). `settings`·`dry_run` 은 현재 사용하지 않지만 `notifier`
     팩토리와 시그니처를 맞춰 장래 설정 주입 경로를 열어둔다.
+
+    폴백 catch 를 ADR-0013 결정 7 이 명시한 3종(`StorageError`/`RuntimeError`/
+    `OSError`)으로 좁힌다 — 과거 `except Exception` 블록은 `ImportError`·
+    `TypeError`·`AttributeError` 같은 프로그래밍 오류까지 `NullTradingRecorder`
+    폴백으로 삼켜 10영업일 내내 조용히 무영속화되는 경로를 만들 수 있어
+    제거한다(리뷰 C2).
     """
     try:
-        return SqliteTradingRecorder(db_path=Path("data/trading.db"))
+        return SqliteTradingRecorder(db_path=_TRADING_DB_PATH)
     except (StorageError, RuntimeError, OSError) as e:
         logger.warning(
             "main.recorder_factory 초기화 실패 — NullTradingRecorder 폴백: "
-            f"{e.__class__.__name__}: {e}"
-        )
-        return NullTradingRecorder()
-    except Exception as e:  # noqa: BLE001 — 예기치 못한 예외도 세션을 죽이지 않는다
-        logger.warning(
-            "main.recorder_factory 예기치 않은 실패 — NullTradingRecorder 폴백: "
             f"{e.__class__.__name__}: {e}"
         )
         return NullTradingRecorder()
@@ -463,12 +471,15 @@ def _on_step(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:
                 h=report.halted,
                 m=len(report.reconcile.mismatch_symbols),
             )
+            # I1: record 를 notify 앞으로. notifier 가 (설계상 silent fail 이지만
+            # 장래 확장 또는 외부 예외로) 전파하면 같은 이벤트의 DB 기록이 누락된다.
+            # `_on_daily_report` 는 이미 record 선행 — 콜백 전반을 한 방향으로 통일.
             for entry in report.entry_events:
-                runtime.notifier.notify_entry(entry)
                 runtime.recorder.record_entry(entry)
+                runtime.notifier.notify_entry(entry)
             for exit_ev in report.exit_events:
-                runtime.notifier.notify_exit(exit_ev)
                 runtime.recorder.record_exit(exit_ev)
+                runtime.notifier.notify_exit(exit_ev)
             if report.reconcile.mismatch_symbols:
                 runtime.notifier.notify_error(
                     ErrorEvent(
@@ -513,10 +524,27 @@ def _on_force_close(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:
                 o=report.orders_submitted,
                 h=report.halted,
             )
+            # I1: record 선행. _on_step 과 동일 순서로 통일.
             for exit_ev in report.exit_events:
-                runtime.notifier.notify_exit(exit_ev)
                 runtime.recorder.record_exit(exit_ev)
+                runtime.notifier.notify_exit(exit_ev)
         except Exception as e:  # noqa: BLE001 — ADR-0011 결정 5 (스케줄러 연속성)
+            # I3: `force_close_all` 이 `_process_signals` 중간에 예외를 던져도
+            # 그 시점까지 Executor 내부 `_sweep_exit_events` 에 누적된 부분
+            # 청산 이벤트는 유지된다. 이를 `last_sweep_exit_events` 로 읽어
+            # DB 기록 누락을 막는다 — `daily_pnl.realized_pnl_krw` 와 실 KIS
+            # 손익 괴리를 최소화.
+            try:
+                partial_exits = runtime.executor.last_sweep_exit_events
+            except Exception as snap_err:  # noqa: BLE001 — 스냅샷 접근 실패도 삼킨다
+                logger.warning(
+                    "main.force_close: 부분 exit_events 스냅샷 실패 (무시): "
+                    f"{snap_err.__class__.__name__}: {snap_err}"
+                )
+                partial_exits = ()
+            for exit_ev in partial_exits:
+                runtime.recorder.record_exit(exit_ev)
+                runtime.notifier.notify_exit(exit_ev)
             # 포지션 잔존 운영 리스크 — 텔레그램 + logger.critical 이중 경보.
             logger.critical(
                 f"main.force_close 실패 — 포지션 잔존 위험: {e.__class__.__name__}: {e}"

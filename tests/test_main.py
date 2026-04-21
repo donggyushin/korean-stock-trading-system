@@ -1749,8 +1749,11 @@ def test_default_recorder_factory_정상조립_SqliteTradingRecorder_반환(
     """F1 — SqliteTradingRecorder 정상 조립 시 인스턴스 반환.
 
     실 SQLite 접촉 없이 생성자 호출 여부와 db_path 인자를 sentinel 로 검증한다.
+    db_path 는 절대경로(_TRADING_DB_PATH)여야 한다 — CWD 의존성 제거 계약(리뷰 C1).
     """
     from unittest.mock import sentinel
+
+    from stock_agent.main import _TRADING_DB_PATH
 
     fake_settings = _make_fake_settings_for_recorder()
     mock_sqlite = mocker.patch(
@@ -1762,7 +1765,8 @@ def test_default_recorder_factory_정상조립_SqliteTradingRecorder_반환(
 
     mock_sqlite.assert_called_once()
     _, kwargs = mock_sqlite.call_args
-    assert kwargs.get("db_path") == Path("data/trading.db")
+    assert kwargs.get("db_path") == _TRADING_DB_PATH
+    assert kwargs["db_path"].is_absolute()
     assert result is sentinel.sqlite_instance
 
 
@@ -2095,3 +2099,169 @@ def test_graceful_shutdown_recorder_close_예외여도_silent_진행(mocker: Any
     mock_logger.warning.assert_called()
     # kis.close 도 정상 호출됨
     assert "kis.close" in call_order
+
+
+# ===========================================================================
+# 그룹 L — main() finally 경로 recorder.close (C7)
+# ===========================================================================
+
+
+def test_main_정상종료시_recorder_close_호출(mocker: Any) -> None:
+    """L1 — 정상 종료 경로에서 runtime.recorder.close() 가 finally 블록에서 호출된다."""
+    patches = _base_patches(mocker)
+    runtime = patches["build_runtime"].return_value
+
+    main([])
+
+    runtime.recorder.close.assert_called_once()
+
+
+def test_main_예외시에도_recorder_close_호출(mocker: Any) -> None:
+    """L2 — scheduler.start 가 예외를 던져도 finally 에서 recorder.close 가 호출된다."""
+    patches = _base_patches(mocker)
+    runtime = patches["build_runtime"].return_value
+    runtime.scheduler.start.side_effect = RuntimeError("crash")
+
+    with contextlib.suppress(Exception):
+        main([])
+
+    runtime.recorder.close.assert_called_once()
+
+
+# ===========================================================================
+# 그룹 M — _on_step 호출 순서 (I1): record_* → notify_*
+# ===========================================================================
+
+
+def test_on_step_record_entry_가_notify_entry_보다_먼저_호출된다(mocker: Any) -> None:
+    """M1 — entry/exit 각각 record → notify 순서 (I1 리뷰 계약)."""
+    call_order: list[str] = []
+
+    e1 = _make_entry_event("005930")
+    x1 = _make_exit_event("005930", reason="take_profit")
+    report = _make_step_report(entry_events=(e1,), exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.step.return_value = report
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_recorder.record_entry.side_effect = lambda _ev: call_order.append("record_entry")
+    fake_recorder.record_exit.side_effect = lambda _ev: call_order.append("record_exit")
+
+    fake_notifier = MagicMock(spec=Notifier)
+    fake_notifier.notify_entry.side_effect = lambda _ev: call_order.append("notify_entry")
+    fake_notifier.notify_exit.side_effect = lambda _ev: call_order.append("notify_exit")
+
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+        session_status=SessionStatus(started=True),
+    )
+
+    cb = _on_step(runtime, lambda: _kst(9, 5))
+    cb()
+
+    assert call_order == ["record_entry", "notify_entry", "record_exit", "notify_exit"]
+
+
+# ===========================================================================
+# 그룹 N — _on_force_close 호출 순서 및 예외 경로 스냅샷 (I1·I3)
+# ===========================================================================
+
+
+def test_on_force_close_정상경로_record_exit_가_notify_exit_보다_먼저(mocker: Any) -> None:
+    """N1 — force_close 정상 경로에서 record_exit → notify_exit 순서 (I1)."""
+    call_order: list[str] = []
+
+    x1 = _make_exit_event("005930", reason="force_close")
+    report = _make_step_report(exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.return_value = report
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_recorder.record_exit.side_effect = lambda _ev: call_order.append("record_exit")
+
+    fake_notifier = MagicMock(spec=Notifier)
+    fake_notifier.notify_exit.side_effect = lambda _ev: call_order.append("notify_exit")
+
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()
+
+    assert call_order == ["record_exit", "notify_exit"]
+
+
+def test_on_force_close_예외경로_last_sweep_exit_events_스냅샷으로_record_exit_호출(
+    mocker: Any,
+) -> None:
+    """N2 — force_close_all 예외 시 last_sweep_exit_events 스냅샷으로 기록 (I3)."""
+    x1 = _make_exit_event("005930", reason="force_close")
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.side_effect = RuntimeError("partial crash")
+    # last_sweep_exit_events 는 PropertyMock 으로 스냅샷 반환
+    type(fake_executor).last_sweep_exit_events = PropertyMock(return_value=(x1,))
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_notifier = MagicMock(spec=Notifier)
+    mock_logger = mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()  # raise 하면 안 됨
+
+    # 부분 스냅샷 x1 에 대해 record_exit + notify_exit 호출
+    fake_recorder.record_exit.assert_called_once_with(x1)
+    fake_notifier.notify_exit.assert_called_once_with(x1)
+    # 포지션 잔존 위험 — critical + notify_error
+    mock_logger.critical.assert_called_once()
+    fake_notifier.notify_error.assert_called_once()
+    error_call_kwargs = fake_notifier.notify_error.call_args[0][0]
+    assert error_call_kwargs.severity == "critical"
+
+
+def test_on_force_close_예외경로_스냅샷_접근_실패시_silent_warning(mocker: Any) -> None:
+    """N3 — last_sweep_exit_events 접근 자체가 예외를 던지면 warning + record_exit 미호출 (I3)."""
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.side_effect = RuntimeError("partial crash")
+    # 스냅샷 프로퍼티 접근 자체가 실패
+    type(fake_executor).last_sweep_exit_events = PropertyMock(
+        side_effect=RuntimeError("snapshot read error")
+    )
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_notifier = MagicMock(spec=Notifier)
+    mock_logger = mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()  # raise 하면 안 됨
+
+    # 스냅샷 실패 → warning
+    mock_logger.warning.assert_called()
+    # 스냅샷 실패 → record_exit 미호출
+    fake_recorder.record_exit.assert_not_called()
+    # critical + notify_error 는 여전히 호출됨
+    mock_logger.critical.assert_called_once()
+    fake_notifier.notify_error.assert_called_once()

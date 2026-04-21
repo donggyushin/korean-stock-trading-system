@@ -2522,6 +2522,18 @@ class TestEntryEventOrderNumberGuard:
                 order_number="ORD-TEST-001",
             )
 
+    def test_entry_event_fill_price_zero_RuntimeError(self) -> None:
+        """fill_price=0 → __post_init__ 가드에서 RuntimeError (DTO 설계 체크리스트 3항)."""
+        with pytest.raises(RuntimeError):
+            EntryEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("0"),
+                ref_price=Decimal("50000"),
+                timestamp=datetime(2026, 4, 21, 9, 32, tzinfo=KST),
+                order_number="ORD-TEST-001",
+            )
+
 
 class TestExitEventOrderNumberGuard:
     """ExitEvent.order_number 필드 추가 계약 — order_number 미구현 시 FAIL."""
@@ -2564,6 +2576,45 @@ class TestExitEventOrderNumberGuard:
         )
         assert ev.order_number == "ORD-TEST-002"
         assert ev.net_pnl_krw == -8_000  # 손실도 허용
+
+    def test_exit_event_timestamp_naive_RuntimeError(self) -> None:
+        """timestamp naive → __post_init__ 가드에서 RuntimeError."""
+        with pytest.raises(RuntimeError):
+            ExitEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("49350"),
+                reason="stop_loss",
+                net_pnl_krw=-8_000,
+                timestamp=datetime(2026, 4, 21, 9, 36),  # tzinfo 없음
+                order_number="ORD-TEST-002",
+            )
+
+    def test_exit_event_qty_zero_RuntimeError(self) -> None:
+        """qty=0 → __post_init__ 가드에서 RuntimeError."""
+        with pytest.raises(RuntimeError):
+            ExitEvent(
+                symbol="005930",
+                qty=0,
+                fill_price=Decimal("49350"),
+                reason="stop_loss",
+                net_pnl_krw=-8_000,
+                timestamp=datetime(2026, 4, 21, 9, 36, tzinfo=KST),
+                order_number="ORD-TEST-002",
+            )
+
+    def test_exit_event_fill_price_zero_RuntimeError(self) -> None:
+        """fill_price=0 → __post_init__ 가드에서 RuntimeError."""
+        with pytest.raises(RuntimeError):
+            ExitEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("0"),
+                reason="stop_loss",
+                net_pnl_krw=-8_000,
+                timestamp=datetime(2026, 4, 21, 9, 36, tzinfo=KST),
+                order_number="ORD-TEST-002",
+            )
 
 
 class TestHandleEntryOrderNumberInjection:
@@ -2719,3 +2770,108 @@ class TestHandleExitOrderNumberInjection:
 
         assert len(report_exit.exit_events) == 1
         assert report_exit.exit_events[0].order_number == fixed_sell_order_number
+
+
+# ===========================================================================
+# 30. Executor.last_sweep_entry_events / last_sweep_exit_events 스냅샷 계약
+# ===========================================================================
+
+
+class TestExecutorLastSweepEventsSnapshot:
+    """last_sweep_entry_events / last_sweep_exit_events 프로퍼티 불변성 테스트."""
+
+    def test_last_sweep_entry_events_초기값은_빈_tuple(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """세션 시작 직후(step 호출 전) 두 프로퍼티 모두 빈 tuple."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        assert exc.last_sweep_entry_events == ()
+        assert exc.last_sweep_exit_events == ()
+
+    def test_last_sweep_events_tuple_타입_반환(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """last_sweep_*_events 는 tuple 타입을 반환한다.
+
+        빈 tuple 은 Python 인터닝으로 동일 객체를 재사용할 수 있으므로
+        identity 대신 타입만 검증한다. 내부 리스트 노출 여부는
+        test_last_sweep_entry_events_mutation_불가 에서 별도 확인.
+        """
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        result_entry = exc.last_sweep_entry_events
+        result_exit = exc.last_sweep_exit_events
+
+        assert isinstance(result_entry, tuple)
+        assert isinstance(result_exit, tuple)
+
+    def test_last_sweep_exit_events_step_호출시_이전_sweep_이벤트는_리셋(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """step() 은 sweep 시작 시 _sweep_exit_events 를 [] 로 리셋한다.
+
+        첫 step 에서 exit 이벤트가 있어도 두 번째 step 은 빈 sweep 으로 시작된다.
+        """
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            clock=lambda: _kst(9, 32),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # 첫 step — 진입 bar 공급 (exit 없음, entry 없음도 무방)
+        fake_bar_source.set_bars(_SYMBOL_A, [])
+        exc.step(_kst(9, 32))
+
+        # 두 번째 step — 새 sweep 시작 → exit_events 리셋되어 () 이어야 함
+        fake_bar_source.set_bars(_SYMBOL_A, [])
+        exc.step(_kst(9, 33))
+
+        assert exc.last_sweep_exit_events == ()
+        assert exc.last_sweep_entry_events == ()
+
+    def test_last_sweep_entry_events_mutation_불가(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """last_sweep_entry_events 반환값(tuple)은 외부에서 mutation 이 불가능하다.
+
+        tuple 은 immutable 이므로 += 시 TypeError. 내부 리스트가 노출되지 않음을 확인.
+        """
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        snapshot = exc.last_sweep_entry_events
+        # tuple 은 in-place mutation 이 없으므로 append 시도 시 AttributeError
+        assert not hasattr(snapshot, "append"), "tuple 에 append 가 없어야 함"

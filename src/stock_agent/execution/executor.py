@@ -527,6 +527,29 @@ class Executor:
         """
         return self._last_reconcile
 
+    @property
+    def last_sweep_entry_events(self) -> tuple[EntryEvent, ...]:
+        """마지막 `step`/`force_close_all` sweep 동안 누적된 EntryEvent 스냅샷.
+
+        sweep 이 정상 종료되면 `StepReport.entry_events` 와 동일 내용. sweep 이
+        중간에 예외로 종료돼 `StepReport` 반환에 실패한 경우에도 누적된 부분
+        이벤트를 외부에서 읽기 위한 경로(`main._on_force_close` 의 예외 분기
+        에서 DB 기록 누락을 막기 위해 사용, ADR-0013 후속 보강).
+        """
+        return tuple(self._sweep_entry_events)
+
+    @property
+    def last_sweep_exit_events(self) -> tuple[ExitEvent, ...]:
+        """마지막 `step`/`force_close_all` sweep 동안 누적된 ExitEvent 스냅샷.
+
+        sweep 이 정상 종료되면 `StepReport.exit_events` 와 동일 내용. sweep 이
+        중간에 예외로 종료돼 `StepReport` 반환에 실패한 경우에도 누적된 부분
+        청산 이벤트를 외부에서 읽기 위한 경로 — 15:00 강제청산 중 특정 심볼의
+        청산이 실패하더라도 이미 체결된 청산의 `daily_pnl.realized_pnl_krw`
+        와 실 KIS 손익 괴리가 남지 않도록(리뷰 I3).
+        """
+        return tuple(self._sweep_exit_events)
+
     # ---- 시그널 처리 ---------------------------------------------------
 
     def _process_signals(self, signals: list[Signal], now: datetime) -> int:

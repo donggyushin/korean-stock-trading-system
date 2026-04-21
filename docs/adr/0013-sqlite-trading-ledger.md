@@ -47,7 +47,7 @@ Phase 3 PASS 기준(plan.md:198) 은 "모의투자 연속 10영업일 무중단 
 
 7. **`NullTradingRecorder` 폴백** — `_default_recorder_factory` 가 `SqliteTradingRecorder` 조립 실패(`StorageError`/`RuntimeError`/`OSError`) 시 `NullTradingRecorder` 주입 + `logger.warning`. "영속화 부재가 세션 전체 실패보다 덜 위험" 이라는 판단 — 알림 부재에 대한 ADR-0012 결정 7 과 동일 기조. 로그(loguru sink) 가 여전히 유지되므로 사후 재구성 경로는 완전히 닫히지 않는다.
 
-8. **`order_number` PK + EntryEvent/ExitEvent DTO 확장** — `OrderTicket.order_number` (KIS 주문번호, 드라이런은 `DRY-NNNN`) 를 `EntryEvent`·`ExitEvent` 에 필드로 추가. `@dataclass(frozen=True, slots=True)` + `__post_init__` 에서 빈 문자열·naive timestamp·음수 qty/price 거부. `_handle_entry`/`_handle_exit` 가 `ticket.order_number` 를 주입. 감사 추적·분쟁 조사 시 KIS 원본과 1:1 대조.
+8. **`order_number` PK + EntryEvent/ExitEvent DTO 확장** — `OrderTicket.order_number` (KIS 주문번호, 드라이런은 `DRY-NNNN`) 를 `EntryEvent`·`ExitEvent` 에 필드로 추가. `@dataclass(frozen=True, slots=True)` + `__post_init__` 에서 빈 문자열·naive timestamp·0 이하 qty/price 거부 (위반 시 `RuntimeError`, ADR-0003 기조). `_handle_entry`/`_handle_exit` 가 `ticket.order_number` 를 주입. 감사 추적·분쟁 조사 시 KIS 원본과 1:1 대조.
 
 9. **드라이런 구분 없음** — `SqliteTradingRecorder` 는 실전·드라이런 공통. `order_number` 가 `DRY-*` 프리픽스로 구분되므로 별도 DB 파일·테이블 분리 불필요. 후속 조회(`SELECT ... WHERE order_number LIKE 'DRY-%'`) 로 필터링.
 

@@ -19,18 +19,24 @@
 - `TradingRecorder` (Protocol, @runtime_checkable) — notifier 와 동일 기조의
   의존성 역전 경계. `Executor` 는 이 타입을 **모른다** — `main.py` 콜백이
   `StepReport.entry_events`·`exit_events` 를 순회하며 notifier 와 나란히 호출.
-- `SqliteTradingRecorder` — 단일 파일(기본 `data/trading.db`), WAL 저널,
-  autocommit + `BEGIN IMMEDIATE` 는 스키마 init 한정.
+- `SqliteTradingRecorder` — 단일 파일(기본 `data/trading.db` — 상대경로 기본값,
+  `main.py` 는 프로젝트 루트 기반 절대경로를 주입해 CWD 의존성을 제거), WAL
+  저널, autocommit + `BEGIN IMMEDIATE` 는 스키마 init 한정.
 - `NullTradingRecorder` — 생성자 실패 폴백 (notifier 의 `NullNotifier` 와 동일
   기조 — 부분 기능 손실 > 세션 전체 실패).
 - `StorageError` — 스키마 init 실패·치명적 초기화 실패 래퍼 (`__cause__` 보존).
 
 실패 정책 (notifier.py `_record_failure` 패턴 재사용)
-- `record_*` 메서드 내부의 `sqlite3.Error` 는 raise 하지 않고 silent (매매
-  루프 보호). 연속 실패 카운터 증가 + 매회 `logger.warning`. 연속 실패가
-  `consecutive_failure_threshold` (기본 5) 에 도달하면 `logger.critical` 1회
-  만 방출 (dedupe). 성공 1회 시 카운터·플래그 모두 리셋 → 다음 연속 실패가
-  다시 threshold 에 도달하면 critical 재방출.
+- `record_*` 메서드 내부의 `sqlite3.Error` **및 기타 `Exception`** 은 raise
+  하지 않고 silent (매매 루프 보호 — 계약의 명분을 DB 외부 예외까지 포괄).
+  단 `BaseException` (KeyboardInterrupt 등) 은 전파. 메서드별 **독립** 실패
+  카운터(`_consecutive_failures[op]`) 를 증가시키고 매회 `logger.warning`.
+  카운터가 `consecutive_failure_threshold` (기본 5) 에 도달하면 해당 메서드의
+  `_critical_emitted[op]` 가 False 일 때만 `logger.critical` 1회 방출(dedupe).
+  메서드별 성공 1회 시 그 메서드의 카운터·플래그만 리셋 → 다음 연속 실패가
+  다시 threshold 에 도달하면 critical 재방출. 공유 카운터는 빈도가 낮은
+  `record_daily_summary` 실패가 빈도가 높은 `record_entry` 성공에 묻혀 경보를
+  영영 못 띄우는 경로가 있어 분리한다(2026-04-22 리뷰 C4).
 - 생성자 내부의 스키마 init 실패는 `StorageError` 로 raise — 폴백
   (`NullTradingRecorder`) 선택은 호출자(main.py `_default_recorder_factory`)
   책임.
@@ -72,6 +78,15 @@ KST = timezone(timedelta(hours=9))
 _DEFAULT_DB_PATH = Path("data/trading.db")
 _SCHEMA_VERSION = 1
 _DEFAULT_FAILURE_THRESHOLD = 5
+
+_OP_RECORD_ENTRY = "record_entry"
+_OP_RECORD_EXIT = "record_exit"
+_OP_RECORD_DAILY_SUMMARY = "record_daily_summary"
+_TRACKED_OPS: tuple[str, ...] = (
+    _OP_RECORD_ENTRY,
+    _OP_RECORD_EXIT,
+    _OP_RECORD_DAILY_SUMMARY,
+)
 
 
 _CREATE_SCHEMA_VERSION_SQL = """
@@ -179,7 +194,9 @@ class SqliteTradingRecorder:
         Args:
             db_path: SQLite 파일 경로. `":memory:"` 도 허용 (테스트용).
                 파일 경로이면 부모 디렉토리를 자동 생성한다. 경로가 기존
-                디렉토리이면 `StorageError` 로 fail-fast.
+                디렉토리이면 `StorageError` 로 fail-fast. **상대경로 기본값은
+                현재 작업 디렉토리(CWD) 기준으로 해석되므로 운영 진입점
+                (`main.py`) 은 절대경로를 주입한다 — 리뷰 C1 기조.**
             consecutive_failure_threshold: 연속 실패 몇 번째에서 `logger.critical`
                 1회 경보를 낼지. 기본 5. 1 이상.
 
@@ -194,8 +211,8 @@ class SqliteTradingRecorder:
                 f"합니다 (got={consecutive_failure_threshold})."
             )
         self._closed = False
-        self._consecutive_failures = 0
-        self._critical_emitted = False
+        self._consecutive_failures: dict[str, int] = {op: 0 for op in _TRACKED_OPS}
+        self._critical_emitted: dict[str, bool] = {op: False for op in _TRACKED_OPS}
         self._threshold = consecutive_failure_threshold
         self._is_memory = isinstance(db_path, str) and db_path == ":memory:"
 
@@ -253,19 +270,23 @@ class SqliteTradingRecorder:
         self._conn.execute("PRAGMA foreign_keys = ON")
 
     def _init_schema(self) -> None:
-        """스키마 v1 을 IF NOT EXISTS 로 적용. `BEGIN IMMEDIATE` 로 원자성."""
+        """스키마 v1 을 IF NOT EXISTS 로 적용.
+
+        모든 CREATE/SELECT/INSERT 를 단일 `BEGIN IMMEDIATE` 내부에서 실행해
+        동시 프로세스 경합 상황에서 `schema_version` 만 먼저 생성되고 나머지
+        테이블은 미생성된 "부분 스키마" 상태가 남는 것을 막는다(리뷰 C3).
+        """
         cur = self._conn.cursor()
         try:
-            cur.execute(_CREATE_SCHEMA_VERSION_SQL)
-            row = cur.execute("SELECT MAX(version) FROM schema_version").fetchone()
-            current = row[0] if row and row[0] is not None else 0
-
             cur.execute("BEGIN IMMEDIATE")
             try:
+                cur.execute(_CREATE_SCHEMA_VERSION_SQL)
                 cur.execute(_CREATE_ORDERS_SQL)
                 cur.execute(_CREATE_DAILY_PNL_SQL)
                 cur.execute(_CREATE_ORDERS_INDEX_SESSION)
                 cur.execute(_CREATE_ORDERS_INDEX_SYMBOL)
+                row = cur.execute("SELECT MAX(version) FROM schema_version").fetchone()
+                current = row[0] if row and row[0] is not None else 0
                 if current < _SCHEMA_VERSION:
                     cur.execute(
                         "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
@@ -273,7 +294,8 @@ class SqliteTradingRecorder:
                     )
                 cur.execute("COMMIT")
             except Exception:
-                cur.execute("ROLLBACK")
+                with contextlib.suppress(sqlite3.Error):
+                    cur.execute("ROLLBACK")
                 raise
         finally:
             cur.close()
@@ -293,8 +315,9 @@ class SqliteTradingRecorder:
     def record_entry(self, event: EntryEvent) -> None:
         """EntryEvent 를 orders 테이블(buy) 에 INSERT.
 
-        close 후 호출은 warning + silent. `sqlite3.Error` 는 silent fail +
-        연속 실패 dedupe 경보.
+        close 후 호출은 warning + silent. `sqlite3.Error` 및 기타 `Exception`
+        은 silent fail + 연속 실패 dedupe 경보(I2: 매매 루프 보호 계약을
+        sqlite3 외부 예외까지 포괄).
         """
         if self._closed:
             logger.warning(
@@ -308,8 +331,8 @@ class SqliteTradingRecorder:
                 "storage.record_entry: naive timestamp 감지 — reject "
                 f"(order_number={event.order_number})"
             )
-            self._consecutive_failures += 1
-            self._maybe_emit_critical("record_entry_naive_ts")
+            self._consecutive_failures[_OP_RECORD_ENTRY] += 1
+            self._maybe_emit_critical(_OP_RECORD_ENTRY)
             return
         session_date = event.timestamp.date().isoformat()
         try:
@@ -328,9 +351,9 @@ class SqliteTradingRecorder:
                     event.timestamp.isoformat(),
                 ),
             )
-            self._on_success()
-        except sqlite3.Error as e:
-            self._on_failure("record_entry", e)
+            self._on_success(_OP_RECORD_ENTRY)
+        except Exception as e:  # noqa: BLE001 — I2: silent fail 계약 (매매 루프 보호)
+            self._on_failure(_OP_RECORD_ENTRY, e)
 
     def record_exit(self, event: ExitEvent) -> None:
         """ExitEvent 를 orders 테이블(sell) 에 INSERT. `ref_price` 는 `fill_price` 복사.
@@ -350,8 +373,8 @@ class SqliteTradingRecorder:
                 "storage.record_exit: naive timestamp 감지 — reject "
                 f"(order_number={event.order_number})"
             )
-            self._consecutive_failures += 1
-            self._maybe_emit_critical("record_exit_naive_ts")
+            self._consecutive_failures[_OP_RECORD_EXIT] += 1
+            self._maybe_emit_critical(_OP_RECORD_EXIT)
             return
         session_date = event.timestamp.date().isoformat()
         try:
@@ -372,9 +395,9 @@ class SqliteTradingRecorder:
                     event.timestamp.isoformat(),
                 ),
             )
-            self._on_success()
-        except sqlite3.Error as e:
-            self._on_failure("record_exit", e)
+            self._on_success(_OP_RECORD_EXIT)
+        except Exception as e:  # noqa: BLE001 — I2: silent fail 계약
+            self._on_failure(_OP_RECORD_EXIT, e)
 
     def record_daily_summary(self, summary: DailySummary) -> None:
         """DailySummary 를 daily_pnl 테이블에 session_date PK INSERT OR REPLACE.
@@ -408,9 +431,9 @@ class SqliteTradingRecorder:
                     recorded_at,
                 ),
             )
-            self._on_success()
-        except sqlite3.Error as e:
-            self._on_failure("record_daily_summary", e)
+            self._on_success(_OP_RECORD_DAILY_SUMMARY)
+        except Exception as e:  # noqa: BLE001 — I2: silent fail 계약
+            self._on_failure(_OP_RECORD_DAILY_SUMMARY, e)
 
     def close(self) -> None:
         """멱등 close. 실패 경로에서도 호출 가능."""
@@ -437,23 +460,23 @@ class SqliteTradingRecorder:
 
     # ---- 내부 상태 -----------------------------------------------------
 
-    def _on_success(self) -> None:
-        self._consecutive_failures = 0
-        self._critical_emitted = False
+    def _on_success(self, op: str) -> None:
+        self._consecutive_failures[op] = 0
+        self._critical_emitted[op] = False
 
     def _on_failure(self, op: str, err: Exception) -> None:
-        self._consecutive_failures += 1
+        self._consecutive_failures[op] += 1
         logger.warning(
             f"storage.{op} 실패 (silent): {err.__class__.__name__}: {err} "
-            f"consecutive={self._consecutive_failures}"
+            f"consecutive={self._consecutive_failures[op]}"
         )
         self._maybe_emit_critical(op)
 
     def _maybe_emit_critical(self, op: str) -> None:
-        if self._consecutive_failures >= self._threshold and not self._critical_emitted:
+        if self._consecutive_failures[op] >= self._threshold and not self._critical_emitted[op]:
             logger.critical(
                 f"storage.persistent_failure: {op} 연속 "
-                f"{self._consecutive_failures}회 실패 (threshold={self._threshold}). "
+                f"{self._consecutive_failures[op]}회 실패 (threshold={self._threshold}). "
                 "DB 파일 권한·디스크 공간·WAL 잠금 등 운영자 확인 필요."
             )
-            self._critical_emitted = True
+            self._critical_emitted[op] = True

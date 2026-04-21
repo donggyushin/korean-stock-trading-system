@@ -187,12 +187,20 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
 
 ## 소비자 참고
 
-- **`main.py`** 콜백 4종:
-  - `_on_step`: `notify_entry`/`notify_exit` 직후 `recorder.record_entry`/`record_exit` 호출.
-  - `_on_force_close`: `notify_exit` 직후 `record_exit` 호출.
-  - `_on_daily_report`: `record_daily_summary(summary)` → `notify_daily_summary(summary)` 순서 (기록 선행).
+- **`main.py`** 콜백 4종 — **전 경로 `record_*` → `notify_*` 순서로 통일**
+  (리뷰 I1, 2026-04-22). 이유: notifier 가 (silent fail 계약에도 불구하고
+  장래 확장·외부 예외로) 전파하면 같은 이벤트의 DB 기록이 누락될 수 있어,
+  `_on_daily_report` 의 기존 record 선행 기조를 콜백 전체로 확장.
+  - `_on_step`: `record_entry` → `notify_entry`, `record_exit` → `notify_exit`.
+  - `_on_force_close`: `record_exit` → `notify_exit`. 예외 분기에서는
+    `runtime.executor.last_sweep_exit_events` 스냅샷을 읽어 이미 체결된
+    부분 청산도 기록(리뷰 I3).
+  - `_on_daily_report`: `record_daily_summary(summary)` → `notify_daily_summary(summary)`.
   - `_on_session_start`: recorder 호출 없음.
 - **`Executor`** 는 recorder 를 모른다 — `main.py` 콜백이 유일한 호출 경로.
+  `last_sweep_entry_events` / `last_sweep_exit_events` 프로퍼티는 sweep 중
+  예외 발생 시 부분 결과를 외부에서 읽기 위한 스냅샷 경로이며 recorder 와는
+  단방향(main.py 콜백 → recorder).
 - `_graceful_shutdown` 과 `main()` `finally` 양쪽에서 `runtime.recorder.close()` 멱등 호출.
 
 ## 범위 제외 (의도적 defer)
