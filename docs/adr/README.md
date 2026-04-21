@@ -42,6 +42,7 @@ ADR 가 **불필요** 한 변경:
 | [0010](./0010-tdd-order-enforcement.md) | src-first TDD 순서 강제 (신규 `src/` 파일에 대한 PreToolUse 게이트) | 승인됨 | 2026-04-20 |
 | [0011](./0011-apscheduler-adoption-single-process.md) | APScheduler 채택 및 BlockingScheduler + 공휴일 수동 판정 정책 | 승인됨 | 2026-04-21 |
 | [0012](./0012-monitor-notifier-design.md) | monitor/notifier 모듈 설계 — Protocol 분리·StepReport 이벤트 확장·silent fail 정책 | 승인됨 | 2026-04-21 |
+| [0013](./0013-sqlite-trading-ledger.md) | storage/db.py 모듈 설계 — SQLite 원장·Protocol 분리·silent fail 정책·DB 파일 분리 | 승인됨 | 2026-04-22 |
 
 ## 관련 문서
 

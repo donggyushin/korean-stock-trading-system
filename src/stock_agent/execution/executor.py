@@ -270,7 +270,9 @@ class EntryEvent:
 
     `fill_price` 는 슬리피지 반영된 추정 체결가(`backtest.costs.buy_fill_price`
     와 동일 계산), `ref_price` 는 시그널 생성 당시 참고가. timestamp 는 `step`
-    에 주입된 `now` 인자로 KST aware datetime.
+    에 주입된 `now` 인자로 KST aware datetime. `order_number` 는 브로커가
+    반환한 주문번호(`OrderTicket.order_number`) 로, 감사 추적·storage 원장
+    PK 용도. 드라이런은 `DRY-NNNN` 형식.
     """
 
     symbol: str
@@ -278,16 +280,31 @@ class EntryEvent:
     fill_price: Decimal
     ref_price: Decimal
     timestamp: datetime
+    order_number: str
+
+    def __post_init__(self) -> None:
+        if not self.order_number:
+            raise RuntimeError("EntryEvent.order_number 는 비어있을 수 없습니다.")
+        if self.timestamp.tzinfo is None:
+            raise RuntimeError("EntryEvent.timestamp 는 tz-aware datetime 이어야 합니다.")
+        if self.qty <= 0:
+            raise RuntimeError(f"EntryEvent.qty 는 양수여야 합니다 (got={self.qty}).")
+        if self.fill_price <= 0:
+            raise RuntimeError(f"EntryEvent.fill_price 는 양수여야 합니다 (got={self.fill_price}).")
+        if self.ref_price <= 0:
+            raise RuntimeError(f"EntryEvent.ref_price 는 양수여야 합니다 (got={self.ref_price}).")
 
 
 @dataclass(frozen=True, slots=True)
 class ExitEvent:
     """체결 확정된 청산 이벤트 — notifier / storage 소비용.
 
-    `net_pnl_krw` 는 수수료·거래세 반영 순손익(`_compute_net_pnl` 결과와 동일).
-    `reason` 은 `"stop_loss" | "take_profit" | "force_close"` — `ExitReason`
-    재사용(strategy/base.py). 타입이 `ExitReason` 이므로 소비자(notifier 등)는
-    값 범위 가정을 정적 타입으로 보장받는다 (ADR-0012 후속 보강 2026-04-21).
+    `net_pnl_krw` 는 수수료·거래세 반영 순손익(`_compute_net_pnl` 결과와 동일,
+    손실은 음수). `reason` 은 `"stop_loss" | "take_profit" | "force_close"` —
+    `ExitReason` 재사용(strategy/base.py). 타입이 `ExitReason` 이므로 소비자
+    (notifier 등) 는 값 범위 가정을 정적 타입으로 보장받는다 (ADR-0012 후속
+    보강 2026-04-21). `order_number` 는 브로커 주문번호로 storage 원장 PK 및
+    감사 추적 용도 (ADR-0013).
     """
 
     symbol: str
@@ -296,6 +313,17 @@ class ExitEvent:
     reason: ExitReason
     net_pnl_krw: int
     timestamp: datetime
+    order_number: str
+
+    def __post_init__(self) -> None:
+        if not self.order_number:
+            raise RuntimeError("ExitEvent.order_number 는 비어있을 수 없습니다.")
+        if self.timestamp.tzinfo is None:
+            raise RuntimeError("ExitEvent.timestamp 는 tz-aware datetime 이어야 합니다.")
+        if self.qty <= 0:
+            raise RuntimeError(f"ExitEvent.qty 는 양수여야 합니다 (got={self.qty}).")
+        if self.fill_price <= 0:
+            raise RuntimeError(f"ExitEvent.fill_price 는 양수여야 합니다 (got={self.fill_price}).")
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +591,7 @@ class Executor:
                 fill_price=entry_fill_price,
                 ref_price=signal.price,
                 timestamp=now,
+                order_number=ticket.order_number,
             )
         )
         return True
@@ -622,6 +651,7 @@ class Executor:
                 reason=signal.reason,
                 net_pnl_krw=net_pnl,
                 timestamp=now,
+                order_number=ticket.order_number,
             )
         )
         return True

@@ -34,9 +34,11 @@ from stock_agent.execution import (
     BalanceProvider,
     BarSource,
     DryRunOrderSubmitter,
+    EntryEvent,
     Executor,
     ExecutorConfig,
     ExecutorError,
+    ExitEvent,
     LiveBalanceProvider,
     LiveOrderSubmitter,
     OrderSubmitter,
@@ -2451,3 +2453,269 @@ class TestLastReconcileMismatchPersistence:
         assert report.reconcile.mismatch_symbols == ()
         assert exc.last_reconcile is not None
         assert exc.last_reconcile.mismatch_symbols == ()
+
+
+# ===========================================================================
+# 27. EntryEvent / ExitEvent order_number 필드 가드 (RED — order_number 미구현)
+# ===========================================================================
+
+
+class TestEntryEventOrderNumberGuard:
+    """EntryEvent.order_number 필드 추가 계약 — order_number 미구현 시 FAIL."""
+
+    def test_entry_event_order_number_누락시_TypeError(self) -> None:
+        """order_number 인자 없이 EntryEvent 생성 → TypeError (필수 필드 누락)."""
+        with pytest.raises(TypeError, match="order_number"):
+            EntryEvent(  # type: ignore[call-arg]
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("50100"),
+                ref_price=Decimal("50000"),
+                timestamp=datetime(2026, 4, 21, 9, 32, tzinfo=KST),
+            )
+
+    def test_entry_event_order_number_빈문자열_RuntimeError(self) -> None:
+        """order_number="" → __post_init__ 가드에서 RuntimeError, 메시지에 'order_number' 포함."""
+        with pytest.raises(RuntimeError, match="order_number"):
+            EntryEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("50100"),
+                ref_price=Decimal("50000"),
+                timestamp=datetime(2026, 4, 21, 9, 32, tzinfo=KST),
+                order_number="",
+            )
+
+    def test_entry_event_order_number_정상값_생성(self) -> None:
+        """order_number 있는 경우 EntryEvent 정상 생성."""
+        ev = EntryEvent(
+            symbol="005930",
+            qty=10,
+            fill_price=Decimal("50100"),
+            ref_price=Decimal("50000"),
+            timestamp=datetime(2026, 4, 21, 9, 32, tzinfo=KST),
+            order_number="ORD-TEST-001",
+        )
+        assert ev.order_number == "ORD-TEST-001"
+
+    def test_entry_event_timestamp_naive_RuntimeError(self) -> None:
+        """timestamp naive → __post_init__ 가드에서 RuntimeError."""
+        with pytest.raises(RuntimeError):
+            EntryEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("50100"),
+                ref_price=Decimal("50000"),
+                timestamp=datetime(2026, 4, 21, 9, 32),  # tzinfo 없음
+                order_number="ORD-TEST-001",
+            )
+
+    def test_entry_event_qty_zero_RuntimeError(self) -> None:
+        """qty=0 → __post_init__ 가드에서 RuntimeError."""
+        with pytest.raises(RuntimeError):
+            EntryEvent(
+                symbol="005930",
+                qty=0,
+                fill_price=Decimal("50100"),
+                ref_price=Decimal("50000"),
+                timestamp=datetime(2026, 4, 21, 9, 32, tzinfo=KST),
+                order_number="ORD-TEST-001",
+            )
+
+
+class TestExitEventOrderNumberGuard:
+    """ExitEvent.order_number 필드 추가 계약 — order_number 미구현 시 FAIL."""
+
+    def test_exit_event_order_number_누락시_TypeError(self) -> None:
+        """order_number 인자 없이 ExitEvent 생성 → TypeError (필수 필드 누락)."""
+        with pytest.raises(TypeError, match="order_number"):
+            ExitEvent(  # type: ignore[call-arg]
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("49350"),
+                reason="stop_loss",
+                net_pnl_krw=-8_000,
+                timestamp=datetime(2026, 4, 21, 9, 36, tzinfo=KST),
+            )
+
+    def test_exit_event_order_number_빈문자열_RuntimeError(self) -> None:
+        """order_number="" → __post_init__ 가드에서 RuntimeError, 메시지에 'order_number' 포함."""
+        with pytest.raises(RuntimeError, match="order_number"):
+            ExitEvent(
+                symbol="005930",
+                qty=10,
+                fill_price=Decimal("49350"),
+                reason="stop_loss",
+                net_pnl_krw=-8_000,
+                timestamp=datetime(2026, 4, 21, 9, 36, tzinfo=KST),
+                order_number="",
+            )
+
+    def test_exit_event_order_number_정상값_생성(self) -> None:
+        """order_number 있는 경우 ExitEvent 정상 생성. net_pnl_krw 음수도 허용."""
+        ev = ExitEvent(
+            symbol="005930",
+            qty=10,
+            fill_price=Decimal("49350"),
+            reason="stop_loss",
+            net_pnl_krw=-8_000,
+            timestamp=datetime(2026, 4, 21, 9, 36, tzinfo=KST),
+            order_number="ORD-TEST-002",
+        )
+        assert ev.order_number == "ORD-TEST-002"
+        assert ev.net_pnl_krw == -8_000  # 손실도 허용
+
+
+class TestHandleEntryOrderNumberInjection:
+    """Executor._handle_entry 가 ticket.order_number 를 EntryEvent 에 주입하는지 검증."""
+
+    def test_handle_entry_EntryEvent_order_number이_ticket_order_number와_일치(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """submit_buy 반환 ticket.order_number 가 EntryEvent.order_number 에 주입."""
+        fixed_order_number = "KIS-12345"
+
+        class FixedOrderSubmitter:
+            """order_number 를 고정값으로 반환하는 더블."""
+
+            buy_calls: list[tuple[str, int]] = []
+            sell_calls: list[tuple[str, int]] = []
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=fixed_order_number,
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"SELL-{fixed_order_number}",
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                return []
+
+        fixed_submitter = FixedOrderSubmitter()
+        now = _kst(9, 32)
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fixed_submitter,  # type: ignore[arg-type]
+            fake_balance_provider,
+            fake_bar_source,
+            clock=lambda: now,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        or_bars = [
+            _bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500) for h in range(0, 30)
+        ]
+        breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, or_bars + [breakout_bar])
+
+        report = exc.step(now)
+
+        assert len(report.entry_events) == 1
+        assert report.entry_events[0].order_number == fixed_order_number
+
+
+class TestHandleExitOrderNumberInjection:
+    """Executor._handle_exit 가 ticket.order_number 를 ExitEvent 에 주입하는지 검증."""
+
+    def test_handle_exit_ExitEvent_order_number이_ticket_order_number와_일치(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """submit_sell 반환 ticket.order_number 가 ExitEvent.order_number 에 주입."""
+        fixed_sell_order_number = "SELL-99999"
+
+        class FixedOrderSubmitter2:
+            """매도 order_number 를 고정값으로 반환하는 더블."""
+
+            _counter = 0
+            buy_calls: list[tuple[str, int]] = []
+            sell_calls: list[tuple[str, int]] = []
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"BUY-{self._counter:04d}",
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=fixed_sell_order_number,
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                return []
+
+        fixed_submitter2 = FixedOrderSubmitter2()
+        now_entry = _kst(9, 32)
+        now_exit = _kst(9, 36)
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fixed_submitter2,  # type: ignore[arg-type]
+            fake_balance_provider,
+            fake_bar_source,
+            clock=lambda: now_entry,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # 진입
+        or_bars = [
+            _bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500) for h in range(0, 30)
+        ]
+        breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, or_bars + [breakout_bar])
+        exc.step(now_entry)
+        assert len(risk_manager.active_positions) == 1
+
+        # 손절 bar 공급
+        stop_price_ref = Decimal("50100") * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price_ref)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        report_exit = exc.step(now_exit)
+
+        assert len(report_exit.exit_events) == 1
+        assert report_exit.exit_events[0].order_number == fixed_sell_order_number
