@@ -74,7 +74,9 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 **Phase 3 두 번째 산출물 — main.py + APScheduler 통합 (코드·테스트 레벨) 완료** (2026-04-21). `src/stock_agent/main.py` 신설 — `BlockingScheduler` + 4종 cron job(09:00 session_start·매분 step·15:00 force_close·15:30 daily_report, 평일 한정) + `--dry-run` CLI 플래그(KIS 주문 접촉 0). pytest **681건 green**.
 
-**Phase 3 세 번째 산출물 — monitor/notifier.py (텔레그램 알림, 코드·테스트 레벨) 완료** (2026-04-21). `src/stock_agent/monitor/` 패키지 신설 — `Notifier` Protocol + `TelegramNotifier` + `NullNotifier` + `ErrorEvent`/`DailySummary` DTO. 진입·청산·에러·일일 요약 4종 텔레그램 알림. 전송 실패 silent fail + 연속 실패 경보. pytest **778건 green**. 의존성 추가 없음. 후속 산출물(`storage/db.py`) 미착수. **Phase 3 PASS 선언은 모의투자 환경 연속 10영업일 무중단 운영 후.**
+**Phase 3 세 번째 산출물 — monitor/notifier.py (텔레그램 알림, 코드·테스트 레벨) 완료** (2026-04-21). `src/stock_agent/monitor/` 패키지 신설 — `Notifier` Protocol + `TelegramNotifier` + `NullNotifier` + `ErrorEvent`/`DailySummary` DTO. 진입·청산·에러·일일 요약 4종 텔레그램 알림. 전송 실패 silent fail + 연속 실패 경보. pytest **778건 green**. 의존성 추가 없음.
+
+**Phase 3 네 번째 산출물 — storage/db.py (SQLite 원장, 코드·테스트 레벨) 완료** (2026-04-22). `src/stock_agent/storage/` 패키지 신설 — `TradingRecorder` Protocol + `SqliteTradingRecorder` + `NullTradingRecorder` + `StorageError`. 주문·체결·일일 PnL을 `data/trading.db`에 append-only 기록. 기록 실패 silent fail + 연속 실패 경보. 의존성 추가 없음(stdlib `sqlite3` 전용). **Phase 3 코드 산출물 전부 완료. Phase 3 PASS 선언은 모의투자 환경 연속 10영업일 무중단 운영 후.**
 
 **운영 주의**: KOSPI 200 구성종목은 `config/universe.yaml`에 수동 관리합니다. KRX KOSPI 200 정기변경(연 2회 — 매년 6월·12월의 선물·옵션 동시만기일 익영업일 기준)에 맞춰 운영자가 직접 갱신해야 합니다. 현재 KRX 정보데이터시스템 [11006] 기준 199/200 반영(2026-04-17 조회, 임시 가상 코드 1건 제외). 정식 티커 발급 후 다음 갱신에 추가 예정.
 
@@ -88,7 +90,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 ## 디렉토리 구조
 
-현재 존재하는 파일 (Phase 3 세 번째 산출물 완료 기준):
+현재 존재하는 파일 (Phase 3 네 번째 산출물 완료 기준):
 
 ```text
 stock-agent/
@@ -143,6 +145,10 @@ stock-agent/
 │   │   ├── __init__.py        # Notifier, TelegramNotifier, NullNotifier, ErrorEvent, DailySummary export
 │   │   ├── notifier.py        # 텔레그램 알림 — Notifier Protocol + 구현체
 │   │   └── CLAUDE.md          # 모듈 세부 문서
+│   ├── storage/
+│   │   ├── __init__.py        # TradingRecorder, SqliteTradingRecorder, NullTradingRecorder, StorageError export
+│   │   ├── db.py              # SQLite 원장 — 주문·체결·일일 PnL append-only 기록
+│   │   └── CLAUDE.md          # 모듈 세부 문서
 │   └── main.py                # 장중 실행 진입점 (BlockingScheduler + Executor 오케스트레이터)
 ├── tests/
 │   ├── test_config.py
@@ -157,14 +163,15 @@ stock-agent/
 │   ├── test_backtest_engine.py
 │   ├── test_executor.py       # 63 케이스
 │   ├── test_main.py           # 47 케이스 (+ 확장분 포함)
-│   └── test_notifier.py       # 71 케이스
+│   ├── test_notifier.py       # 71 케이스
+│   └── test_storage_db.py     # 49 케이스 (+ 3 skip)
 └── scripts/
     ├── healthcheck.py         # KIS 모의 잔고 조회 + 텔레그램 hello (실주문 없음)
     ├── backtest.py            # 단일 런 백테스트 CLI
     └── sensitivity.py         # 파라미터 민감도 32 조합 그리드
 ```
 
-`storage/` 등 미구현 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
+미착수 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
 
 ## 설치 및 실행
 

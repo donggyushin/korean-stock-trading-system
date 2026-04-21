@@ -74,6 +74,12 @@ from stock_agent.monitor import (
     TelegramNotifier,
 )
 from stock_agent.risk import RiskConfig, RiskManager
+from stock_agent.storage import (
+    NullTradingRecorder,
+    SqliteTradingRecorder,
+    StorageError,
+    TradingRecorder,
+)
 from stock_agent.strategy import ORBStrategy, StrategyConfig
 
 EXIT_OK = 0
@@ -82,6 +88,14 @@ EXIT_INPUT_ERROR = 2
 EXIT_IO_ERROR = 3
 
 KST = timezone(timedelta(hours=9))
+
+# 프로젝트 루트(main.py = .../<root>/src/stock_agent/main.py) 기반 절대경로.
+# 리뷰 C1: `Path("data/trading.db")` 상대경로는 프로세스 CWD 에 따라 원장
+# DB 파일이 갈라져 일부 세션 기록이 누락될 수 있어 실운영 진입점에서는 절대
+# 경로로 고정한다. 상대경로 기본값은 `SqliteTradingRecorder` 의 하위 호환성·
+# 테스트용으로만 유지한다.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+_TRADING_DB_PATH: Path = _PROJECT_ROOT / "data" / "trading.db"
 
 ClockFn = Callable[[], datetime]
 """KST aware datetime 을 반환하는 시계 함수. 테스트는 `lambda: _kst(9, 0)` 주입."""
@@ -108,7 +122,9 @@ class Runtime:
     조율한다. `build_runtime` 이 반환. `risk_manager` 는 `_on_daily_report` 가
     공개 경로로 접근하기 위한 참조(Executor private 의존 제거), `session_status`
     는 silent failure 루프 차단용 (C1). `notifier` 는 텔레그램 알림 라우팅 —
-    주입 실패 시 `NullNotifier` 로 폴백(알림 없이 세션 지속).
+    주입 실패 시 `NullNotifier` 로 폴백(알림 없이 세션 지속). `recorder` 는
+    SQLite 원장(ADR-0013) — 주입 실패 시 `NullTradingRecorder` 폴백(영속화
+    없이 세션 지속, 로그 sink 로 사후 재구성 경로 보존).
     """
 
     scheduler: BlockingScheduler
@@ -119,6 +135,7 @@ class Runtime:
     risk_manager: RiskManager
     session_status: SessionStatus
     notifier: Notifier
+    recorder: TradingRecorder
 
 
 # ---- CLI -----------------------------------------------------------------
@@ -194,6 +211,30 @@ def _default_notifier_factory(settings: Settings, dry_run: bool) -> Notifier:
         return NullNotifier()
 
 
+def _default_recorder_factory(settings: Settings, dry_run: bool) -> TradingRecorder:  # noqa: ARG001
+    """기본 recorder 팩토리 — `SqliteTradingRecorder(db_path=<프로젝트 루트>/data/trading.db)` 조립.
+
+    `StorageError`·`RuntimeError`·`OSError` 등 초기화 실패 시 `NullTradingRecorder`
+    폴백(영속화 부재가 세션 전체 실패보다 덜 위험 — 로그 sink 로 사후 재구성
+    경로 보존, ADR-0013). `settings`·`dry_run` 은 현재 사용하지 않지만 `notifier`
+    팩토리와 시그니처를 맞춰 장래 설정 주입 경로를 열어둔다.
+
+    폴백 catch 를 ADR-0013 결정 7 이 명시한 3종(`StorageError`/`RuntimeError`/
+    `OSError`)으로 좁힌다 — 과거 `except Exception` 블록은 `ImportError`·
+    `TypeError`·`AttributeError` 같은 프로그래밍 오류까지 `NullTradingRecorder`
+    폴백으로 삼켜 10영업일 내내 조용히 무영속화되는 경로를 만들 수 있어
+    제거한다(리뷰 C2).
+    """
+    try:
+        return SqliteTradingRecorder(db_path=_TRADING_DB_PATH)
+    except (StorageError, RuntimeError, OSError) as e:
+        logger.warning(
+            "main.recorder_factory 초기화 실패 — NullTradingRecorder 폴백: "
+            f"{e.__class__.__name__}: {e}"
+        )
+        return NullTradingRecorder()
+
+
 # ---- 런타임 조립 ---------------------------------------------------------
 
 
@@ -206,6 +247,7 @@ def build_runtime(
     scheduler_factory: Callable[[], BlockingScheduler] | None = None,
     universe_loader: Callable[[Path | None], KospiUniverse] | None = None,
     notifier_factory: Callable[[Settings, bool], Notifier] | None = None,
+    recorder_factory: Callable[[Settings, bool], TradingRecorder] | None = None,
     clock: ClockFn | None = None,
 ) -> Runtime:
     """전략·리스크·브로커·시세·Executor·스케줄러를 조립해 `Runtime` 반환.
@@ -264,6 +306,8 @@ def build_runtime(
     scheduler = build_scheduler()
     build_notifier = notifier_factory or _default_notifier_factory
     notifier = build_notifier(settings, args.dry_run)
+    build_recorder = recorder_factory or _default_recorder_factory
+    recorder = build_recorder(settings, args.dry_run)
     runtime = Runtime(
         scheduler=scheduler,
         executor=executor,
@@ -273,6 +317,7 @@ def build_runtime(
         risk_manager=risk_manager,
         session_status=SessionStatus(),
         notifier=notifier,
+        recorder=recorder,
     )
     _install_jobs(scheduler, runtime, args, clock=clock)
     return runtime
@@ -426,9 +471,14 @@ def _on_step(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:
                 h=report.halted,
                 m=len(report.reconcile.mismatch_symbols),
             )
+            # I1: record 를 notify 앞으로. notifier 가 (설계상 silent fail 이지만
+            # 장래 확장 또는 외부 예외로) 전파하면 같은 이벤트의 DB 기록이 누락된다.
+            # `_on_daily_report` 는 이미 record 선행 — 콜백 전반을 한 방향으로 통일.
             for entry in report.entry_events:
+                runtime.recorder.record_entry(entry)
                 runtime.notifier.notify_entry(entry)
             for exit_ev in report.exit_events:
+                runtime.recorder.record_exit(exit_ev)
                 runtime.notifier.notify_exit(exit_ev)
             if report.reconcile.mismatch_symbols:
                 runtime.notifier.notify_error(
@@ -474,9 +524,27 @@ def _on_force_close(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:
                 o=report.orders_submitted,
                 h=report.halted,
             )
+            # I1: record 선행. _on_step 과 동일 순서로 통일.
             for exit_ev in report.exit_events:
+                runtime.recorder.record_exit(exit_ev)
                 runtime.notifier.notify_exit(exit_ev)
         except Exception as e:  # noqa: BLE001 — ADR-0011 결정 5 (스케줄러 연속성)
+            # I3: `force_close_all` 이 `_process_signals` 중간에 예외를 던져도
+            # 그 시점까지 Executor 내부 `_sweep_exit_events` 에 누적된 부분
+            # 청산 이벤트는 유지된다. 이를 `last_sweep_exit_events` 로 읽어
+            # DB 기록 누락을 막는다 — `daily_pnl.realized_pnl_krw` 와 실 KIS
+            # 손익 괴리를 최소화.
+            try:
+                partial_exits = runtime.executor.last_sweep_exit_events
+            except Exception as snap_err:  # noqa: BLE001 — 스냅샷 접근 실패도 삼킨다
+                logger.warning(
+                    "main.force_close: 부분 exit_events 스냅샷 실패 (무시): "
+                    f"{snap_err.__class__.__name__}: {snap_err}"
+                )
+                partial_exits = ()
+            for exit_ev in partial_exits:
+                runtime.recorder.record_exit(exit_ev)
+                runtime.notifier.notify_exit(exit_ev)
             # 포지션 잔존 운영 리스크 — 텔레그램 + logger.critical 이중 경보.
             logger.critical(
                 f"main.force_close 실패 — 포지션 잔존 위험: {e.__class__.__name__}: {e}"
@@ -526,17 +594,19 @@ def _on_daily_report(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:
                 a=active,
                 h=halted,
             )
-            runtime.notifier.notify_daily_summary(
-                DailySummary(
-                    session_date=now.date(),
-                    starting_capital_krw=starting,
-                    realized_pnl_krw=pnl,
-                    realized_pnl_pct=pct,
-                    entries_today=entries,
-                    halted=halted,
-                    mismatch_symbols=mismatch,
-                )
+            summary = DailySummary(
+                session_date=now.date(),
+                starting_capital_krw=starting,
+                realized_pnl_krw=pnl,
+                realized_pnl_pct=pct,
+                entries_today=entries,
+                halted=halted,
+                mismatch_symbols=mismatch,
             )
+            # SQLite 원장 기록을 먼저 시도 — DB 기록 실패가 알림을 막지 않도록
+            # recorder 는 silent fail 정책을 유지한다 (ADR-0013).
+            runtime.recorder.record_daily_summary(summary)
+            runtime.notifier.notify_daily_summary(summary)
         except Exception as e:  # noqa: BLE001 — ADR-0011 결정 5 (스케줄러 연속성)
             logger.exception(f"main.daily_report 실패: {e.__class__.__name__}: {e}")
             runtime.notifier.notify_error(
@@ -607,6 +677,10 @@ def _graceful_shutdown(runtime: Runtime, signum: int, frame: Any) -> None:
         runtime.kis_client.close()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"kis_client.close 중 예외 (무시): {e!r}")
+    try:
+        runtime.recorder.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"recorder.close 중 예외 (무시): {e!r}")
 
 
 # ---- 진입점 --------------------------------------------------------------
@@ -688,6 +762,10 @@ def main(argv: list[str] | None = None) -> int:
             runtime.kis_client.close()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"kis_client.close 중 예외 (finally): {e!r}")
+        try:
+            runtime.recorder.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"recorder.close 중 예외 (finally): {e!r}")
 
     return exit_code
 

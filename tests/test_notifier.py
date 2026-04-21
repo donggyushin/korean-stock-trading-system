@@ -95,14 +95,16 @@ def _make_entry_event(
     qty: int = 10,
     fill_price: Decimal = Decimal("50000"),
     ref_price: Decimal = Decimal("49500"),
+    order_number: str = "ORD-ENTRY-001",
 ) -> EntryEvent:
-    """EntryEvent 더블."""
-    return EntryEvent(
+    """EntryEvent 더블 — order_number 포함 (EntryEvent.order_number 추가 계약)."""
+    return EntryEvent(  # type: ignore[call-arg]
         symbol=symbol,
         qty=qty,
         fill_price=fill_price,
         ref_price=ref_price,
         timestamp=_FIXED_DT,
+        order_number=order_number,
     )
 
 
@@ -113,15 +115,17 @@ def _make_exit_event(
     fill_price: Decimal = Decimal("51500"),
     reason: ExitReason = "take_profit",
     net_pnl_krw: int = 14_000,
+    order_number: str = "ORD-EXIT-001",
 ) -> ExitEvent:
-    """ExitEvent 더블."""
-    return ExitEvent(
+    """ExitEvent 더블 — order_number 포함 (ExitEvent.order_number 추가 계약)."""
+    return ExitEvent(  # type: ignore[call-arg]
         symbol=symbol,
         qty=qty,
         fill_price=fill_price,
         reason=reason,
         net_pnl_krw=net_pnl_krw,
         timestamp=_FIXED_DT,
+        order_number=order_number,
     )
 
 
