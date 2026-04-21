@@ -61,6 +61,7 @@ from stock_agent.monitor import (
     NullNotifier,
 )
 from stock_agent.risk import RiskManager
+from stock_agent.strategy import ExitReason
 
 # ---------------------------------------------------------------------------
 # 공통 상수 / 헬퍼
@@ -153,7 +154,7 @@ def _make_entry_event(symbol: str = "005930") -> EntryEvent:
     )
 
 
-def _make_exit_event(symbol: str = "005930", reason: str = "take_profit") -> ExitEvent:
+def _make_exit_event(symbol: str = "005930", reason: ExitReason = "take_profit") -> ExitEvent:
     """ExitEvent 더블 — Decimal 가격, KST aware datetime."""
     from decimal import Decimal
 

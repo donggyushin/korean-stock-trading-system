@@ -31,6 +31,7 @@ from stock_agent.monitor import (
     NullNotifier,
     TelegramNotifier,
 )
+from stock_agent.strategy import ExitReason
 
 # ---------------------------------------------------------------------------
 # 상수 / 헬퍼
@@ -107,7 +108,7 @@ def _make_exit_event(
     symbol: str = _SYMBOL,
     qty: int = 10,
     fill_price: int = 51_500,
-    reason: str = "take_profit",
+    reason: ExitReason = "take_profit",
     net_pnl_krw: int = 14_000,
 ) -> ExitEvent:
     """ExitEvent 더블 — execution 구현 후 실 타입으로 교체."""
@@ -389,7 +390,7 @@ class TestNotifyExit:
         ["stop_loss", "take_profit", "force_close"],
         ids=["stop_loss", "take_profit", "force_close"],
     )
-    def test_text_contains_reason(self, reason: str) -> None:
+    def test_text_contains_reason(self, reason: ExitReason) -> None:
         bot = _make_bot_mock()
         n = _make_notifier(bot=bot)
         n.notify_exit(_make_exit_event(reason=reason))
