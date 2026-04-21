@@ -156,7 +156,7 @@ stock-agent/
 - [x] `execution/executor.py`: 신호 → 주문 → 체결 추적 → 상태 동기화 루프 — 완료 2026-04-21. Protocol 분리(`OrderSubmitter`/`BalanceProvider`/`BarSource`) + `DryRunOrderSubmitter` 주입으로 KIS 접촉 0 드라이런 + 재동기화 halt + `KisClientError` 지수 백오프 + `backtest/costs.py` 비용 산식 재사용. 단위 테스트 63건 green (총 605건). 의존성 추가 없음.
 - [x] `main.py`: APScheduler로 9:00 시작, 장중 루프, 15:00 청산, 15:30 리포트 — 완료 2026-04-21. `BlockingScheduler(timezone='Asia/Seoul')` + 4종 cron job(09:00 session_start·매분 step·15:00 force_close·15:30 daily_report, 평일 한정). `--dry-run` CLI 플래그로 `DryRunOrderSubmitter` 주입 → KIS 주문 접촉 0. SIGINT/SIGTERM graceful shutdown. 단위 테스트 47건 green (총 652건). `apscheduler 3.11.2` 의존성 추가. 9:30 OR 확정 별도 훅 불필요 — `ORBStrategy.on_bar` 가 분봉 경계에서 자동 처리. 공휴일 자동 판정 미도입 — 운영자 수동 처리 (ADR-0011).
 - [x] `monitor/notifier.py`: 진입/청산/에러/일일 요약 텔레그램 알림 — 완료 2026-04-21. `Notifier` Protocol 분리(`Executor` 는 notifier 모름) + `StepReport` 이벤트 확장(`entry_events`/`exit_events`) + 전송 실패 silent fail + 연속 실패 dedupe 경보 + 드라이런 실전송 `[DRY-RUN]` 프리픽스. ADR-0012.
-- SQLite에 모든 주문/체결/PnL 기록
+- [x] `storage/db.py`: SQLite에 모든 주문/체결/PnL 기록 — 완료 2026-04-22. `TradingRecorder` Protocol + `SqliteTradingRecorder` + `NullTradingRecorder` + `StorageError`. 스키마 v1(orders/daily_pnl/schema_version). silent fail + 연속 실패 dedupe 경보. `EntryEvent`·`ExitEvent` 에 `order_number: str` 추가. 의존성 추가 없음.
 - **드라이런 모드**: `--dry-run` 플래그로 주문 API 호출 없이 로그만 (최종 검증용) — `main.py` 에서 구현 완료.
 - **산출물**: **모의투자 환경에서 최소 2주 무사고 운영** (에러 0건 · 알림 정상 · PnL 기록 정확)
 
@@ -241,6 +241,7 @@ python scripts/healthcheck.py
 | KIS paper 도메인(`openapivts`) 시세 API(`/quotations/*`) 미제공 → python-kis 고레벨 시세 API paper 환경에서 사용 불가 | 모의투자 자동 실행(Phase 3) 에서 실시간 체결가 수신 불가 | 시세 전용 실전 APP_KEY 발급, 실전 도메인(`openapi`) 직접 호출 (`RealtimeDataStore`). Phase 3 착수 전 실전 앱 발급·IP 화이트리스트 등록 필수. |
 | 실전 키 IP 화이트리스트 이탈 (공인 IP 변경, ISP 동적 IP 할당 등) | 시세 단절 → `RealtimeDataStore` 전체 장애 | `healthcheck.py` 에서 `EGW00123` 계열 오류 감지 시 힌트 로그("KIS Developers 포털 → 앱 관리 → 허용 IP 갱신") 출력. 장기적으로 VPS 이전 시 고정 IP 확보 (Phase 5). |
 | 자체 백테스트 루프의 시뮬레이션 정확도 검증 부재 | 비용 계산 오류가 백테스트 PnL 을 왜곡 → 실전 괴리 | 후속 PR 에서 KIS 실데이터로 회귀 비교. 현 PR 은 단위 테스트(costs 18 + metrics 22)로 슬리피지·수수료·거래세 적용 정확도를 명시 assert. |
+| `data/trading.db` 미백업 | 디스크 장애·실수 삭제 시 체결 원장 소실 | `data/` 는 `.gitignore` 로 제외. 운영자가 주기적으로 외부 스토리지에 백업 필요. Phase 5 클라우드 이전 시 관리형 DB 또는 자동 백업 도입 검토. |
 
 ---
 
@@ -293,4 +294,8 @@ pytest **245 → 324 → 384 → 464 → 477 → 539 → 542건 green** (기존 
 
 [x] `src/stock_agent/monitor/` 패키지 신설. `Notifier` Protocol + `TelegramNotifier` + `NullNotifier` + `ErrorEvent`/`DailySummary` DTO. 핵심 결정(ADR-0012): Protocol 의존성 역전 유지(Executor 는 notifier 모름), `StepReport.entry_events`/`exit_events` 확장(기본값 `()` backward compat), 전송 실패 silent fail + 연속 실패 dedupe 경보(`consecutive_failure_threshold` 기본 5), 드라이런도 실전송 + `[DRY-RUN]` 프리픽스, plain text 한국어 포맷. `Executor.last_reconcile: ReconcileReport | None` 프로퍼티 신설. pytest **681 → 780건 green** (notifier 71건 신규 + executor/main 확장분). 의존성 추가 없음.
 
-미완료: `storage/db.py` (SQLite 체결 기록). **Phase 3 PASS 선언은 모의투자 환경 연속 10영업일 무중단 + 0 unhandled error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신 후.**
+### Phase 3 네 번째 산출물 — storage/db.py (2026-04-22)
+
+[x] `src/stock_agent/storage/` 패키지 신설. `TradingRecorder` Protocol(`@runtime_checkable`) + `SqliteTradingRecorder` + `NullTradingRecorder` + `StorageError`. 단일 파일 DB `data/trading.db`(historical `data/stock_agent.db` 와 별개). 스키마 v1: `orders`/`daily_pnl`/`schema_version` 3 테이블 + 2 인덱스. PRAGMA: WAL(파일 전용)/NORMAL/foreign_keys ON. autocommit + 스키마 init 한정 `BEGIN IMMEDIATE`. 실패 정책: `record_*` silent fail + 연속 실패 dedupe 경보(`monitor/notifier.py` 패턴 재사용), 생성자 실패만 `StorageError` raise → `NullTradingRecorder` 폴백(`_default_recorder_factory`). `EntryEvent`·`ExitEvent` 에 `order_number: str` 필드 추가. `main.py` 확장: `Runtime.recorder`, `_default_recorder_factory`, 콜백 4종에 `recorder.record_*` 삽입, `_graceful_shutdown`/`finally` 멱등 `close()`. 의존성 추가 없음(stdlib `sqlite3`). ADR-0013.
+
+**Phase 3 코드 산출물 전부 완료. PASS 선언은 모의투자 환경 연속 10영업일 무중단 + 0 unhandled error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신 후.**
