@@ -24,6 +24,11 @@ stock-agent 의 오케스트레이션 경계 모듈. `ORBStrategy` (시그널) +
 `EntryEvent`·`ExitEvent` DTO 신설 + `execution/__init__` 재노출,
 `Executor.last_reconcile: ReconcileReport | None` 프로퍼티 신설.
 
+**Phase 3 네 번째 산출물(`storage/db.py`) 완료(2026-04-22)에 따른 확장**:
+`EntryEvent`·`ExitEvent` 에 `order_number: str` 필드 추가 (`__post_init__` 가드:
+빈 문자열·naive timestamp·qty≤0·price≤0 → `RuntimeError`).
+`_handle_entry`/`_handle_exit` 가 `ticket.order_number` 를 주입.
+
 Phase 3 PASS 선언은 모의투자 환경에서 **연속 10영업일 무중단 + 0 unhandled
 error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 본 PR 은 그
 조건 중 단 하나도 자동으로 충족하지 않는다 — 이번 PR 의 산출은 단위 테스트로
@@ -35,7 +40,7 @@ error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 
 |---|---|---|
 | APScheduler 스케줄링 | `main.py` | `Executor.step(now)` 만 노출 — 호출 주기는 외부 책임 |
 | ~~텔레그램 알림~~ | ~~`monitor/notifier.py`~~ | **완료 2026-04-21** — [monitor/CLAUDE.md](../monitor/CLAUDE.md) 참조 |
-| SQLite 영속화 | `storage/db.py` | 체결·주문·일일 PnL |
+| ~~SQLite 영속화~~ | ~~`storage/db.py`~~ | **완료 2026-04-22** — [storage/CLAUDE.md](../storage/CLAUDE.md) 참조 |
 | KIS 체결조회 API | `broker/` 확장 | 실체결가 정확도 향상 (현재 슬리피지 0.1% 가정) |
 | 부분체결 잔량 처리 | `broker/cancel_order` 등 | 시장가 즉시 전량 체결 가정 |
 | `config/strategy.yaml` 로더 | `main.py` 진입 시 | 현재 코드 상수 + 생성자 주입 |
@@ -132,8 +137,8 @@ tuple 로 고정된다 — `main.py` 콜백이 소비해 `runtime.notifier.notif
 
 | DTO | 핵심 필드 |
 |---|---|
-| `EntryEvent` | `symbol: str`, `qty: int`, `fill_price: Decimal`, `ref_price: Decimal`, `timestamp: datetime` |
-| `ExitEvent` | `symbol: str`, `qty: int`, `fill_price: Decimal`, `reason: ExitReason`, `net_pnl_krw: int`, `timestamp: datetime` |
+| `EntryEvent` | `symbol: str`, `qty: int`, `fill_price: Decimal`, `ref_price: Decimal`, `order_number: str`, `timestamp: datetime` |
+| `ExitEvent` | `symbol: str`, `qty: int`, `fill_price: Decimal`, `reason: ExitReason`, `net_pnl_krw: int`, `order_number: str`, `timestamp: datetime` |
 
 소비자: `monitor/notifier.py` 의 `TelegramNotifier.notify_entry` / `notify_exit`.
 
@@ -286,8 +291,9 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
   `Executor` 반환 `StepReport.entry_events` / `exit_events` 와
   `Executor.last_reconcile` 를 소비해 텔레그램 알림.
   → [src/stock_agent/monitor/CLAUDE.md](../monitor/CLAUDE.md) 참조.
-- **`storage/db.py`** (Phase 3 네 번째 산출물, 미착수): `RiskManager` 의 체결
-  통지 및 `Executor` 의 PnL 계산 결과를 SQLite 에 영속화.
+- **`storage/db.py`** (Phase 3 네 번째 산출물, **완료 2026-04-22**): `EntryEvent`·`ExitEvent`·`DailySummary`
+  를 SQLite(`data/trading.db`)에 영속화. `main.py` 콜백이 notifier 와 나란히 호출.
+  → [src/stock_agent/storage/CLAUDE.md](../storage/CLAUDE.md) 참조.
 - **드라이런 검증**: `DryRunOrderSubmitter` 를 주입하면 `Executor` 는 KIS 에
   단 한 번도 접촉하지 않는다 (paper 모드 healthcheck 와 별개의 안전 벨트).
 
@@ -295,7 +301,6 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
 
 - **APScheduler 도입** — `step(now)` 만 노출. 외부 스케줄러 책임.
 - **텔레그램 알림** — `monitor/notifier.py` (후속 PR).
-- **SQLite 영속화** — `storage/db.py` (후속 PR).
 - **부분체결 잔량 취소·재발주** — `KisClient.cancel_order` 미구현. 시장가 주문
   통상 즉시 전량 체결되는 KIS 동작 가정. 후속 PR.
 - **KIS 체결조회 API 통합** — 실체결가 정확도 향상. broker 확장 별도 PR.

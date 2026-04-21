@@ -44,6 +44,7 @@ from stock_agent.main import (
     _build_order_submitter,
     _configure_logging,
     _default_notifier_factory,
+    _default_recorder_factory,
     _graceful_shutdown,
     _install_jobs,
     _on_daily_report,
@@ -61,6 +62,11 @@ from stock_agent.monitor import (
     NullNotifier,
 )
 from stock_agent.risk import RiskManager
+from stock_agent.storage import (
+    NullTradingRecorder,
+    StorageError,
+    TradingRecorder,
+)
 from stock_agent.strategy import ExitReason
 
 # ---------------------------------------------------------------------------
@@ -94,11 +100,14 @@ def _make_runtime(
     risk_manager: MagicMock | None = None,
     session_status: SessionStatus | None = None,
     notifier: MagicMock | None = None,
+    recorder: MagicMock | None = None,
 ) -> Runtime:
     """Runtime 더블 조립 헬퍼.
 
     `notifier` 는 `MagicMock(spec=Notifier)` 기본값 — 실 TelegramNotifier
     접촉 0. 개별 테스트에서 별도 MagicMock 을 주입하면 호출 횟수·인자 검증 가능.
+    `recorder` 는 `MagicMock(spec=TradingRecorder)` 기본값 — 실 SqliteTradingRecorder
+    접촉 0. SQLite 파일 I/O 없이 호출 횟수·인자 검증 가능.
     """
     _kis = kis_client or MagicMock(spec=KisClient)
     _rt = realtime_store or MagicMock()
@@ -108,6 +117,7 @@ def _make_runtime(
     _rm = risk_manager or MagicMock(spec=RiskManager)
     _ss = session_status or SessionStatus()
     _notifier = notifier or MagicMock(spec=Notifier)
+    _recorder = recorder or MagicMock(spec=TradingRecorder)
     return Runtime(
         scheduler=_sc,
         executor=_ex,
@@ -117,6 +127,7 @@ def _make_runtime(
         risk_manager=_rm,
         session_status=_ss,
         notifier=_notifier,
+        recorder=_recorder,
     )
 
 
@@ -141,7 +152,10 @@ def _make_step_report(
     )
 
 
-def _make_entry_event(symbol: str = "005930") -> EntryEvent:
+def _make_entry_event(
+    symbol: str = "005930",
+    order_number: str = "ORD-ENTRY-001",
+) -> EntryEvent:
     """EntryEvent 더블 — Decimal 가격, KST aware datetime."""
     from decimal import Decimal
 
@@ -151,10 +165,15 @@ def _make_entry_event(symbol: str = "005930") -> EntryEvent:
         fill_price=Decimal("70000"),
         ref_price=Decimal("69930"),
         timestamp=_kst(9, 31),
+        order_number=order_number,
     )
 
 
-def _make_exit_event(symbol: str = "005930", reason: ExitReason = "take_profit") -> ExitEvent:
+def _make_exit_event(
+    symbol: str = "005930",
+    reason: ExitReason = "take_profit",
+    order_number: str = "ORD-EXIT-001",
+) -> ExitEvent:
     """ExitEvent 더블 — Decimal 가격, KST aware datetime."""
     from decimal import Decimal
 
@@ -165,6 +184,7 @@ def _make_exit_event(symbol: str = "005930", reason: ExitReason = "take_profit")
         reason=reason,
         net_pnl_krw=20_000,
         timestamp=_kst(10, 15),
+        order_number=order_number,
     )
 
 
@@ -309,10 +329,11 @@ def test_build_runtime_dry_run_False_시_LiveOrderSubmitter_주입(
 def test_build_runtime_Runtime_필드_반환(
     _mock_universe: KospiUniverse, _fake_settings: MagicMock
 ) -> None:
-    """기존 5개 필드 + risk_manager, session_status, notifier = 8개 검증. (I1)"""
+    """기존 5개 필드 + risk_manager, session_status, notifier, recorder = 9개 검증. (I1)"""
     fake_rt = MagicMock()
     args = _parse_args([])
     fake_notifier = MagicMock(spec=Notifier)
+    fake_recorder = MagicMock(spec=TradingRecorder)
 
     runtime = build_runtime(
         args,
@@ -322,6 +343,7 @@ def test_build_runtime_Runtime_필드_반환(
         scheduler_factory=MagicMock,
         universe_loader=lambda p: _mock_universe,
         notifier_factory=lambda s, d: fake_notifier,
+        recorder_factory=lambda s, d: fake_recorder,
     )
 
     assert isinstance(runtime, Runtime)
@@ -336,12 +358,13 @@ def test_build_runtime_Runtime_필드_반환(
     assert runtime.session_status.started is False
     assert runtime.session_status.fail_logged is False
     assert runtime.notifier is fake_notifier
+    assert runtime.recorder is fake_recorder
 
 
-def test_build_runtime_Runtime_필드_8개_반환(
+def test_build_runtime_Runtime_필드_9개_반환(
     _mock_universe: KospiUniverse, _fake_settings: MagicMock
 ) -> None:
-    """Runtime 이 8개 필드를 갖는지 명시 검증 (notifier 추가). (I1)"""
+    """Runtime 이 9개 필드를 갖는지 명시 검증 (recorder 추가). (I1)"""
     fake_rt = MagicMock()
     args = _parse_args([])
 
@@ -353,13 +376,15 @@ def test_build_runtime_Runtime_필드_8개_반환(
         scheduler_factory=MagicMock,
         universe_loader=lambda p: _mock_universe,
         notifier_factory=lambda s, d: MagicMock(spec=Notifier),
+        recorder_factory=lambda s, d: MagicMock(spec=TradingRecorder),
     )
 
     field_names = {f.name for f in dataclasses.fields(runtime)}
     assert "risk_manager" in field_names, "Runtime 에 risk_manager 필드가 없다"
     assert "session_status" in field_names, "Runtime 에 session_status 필드가 없다"
     assert "notifier" in field_names, "Runtime 에 notifier 필드가 없다"
-    assert len(field_names) == 8, f"Runtime 필드 수가 8이 아님: {field_names}"
+    assert "recorder" in field_names, "Runtime 에 recorder 필드가 없다"
+    assert len(field_names) == 9, f"Runtime 필드 수가 9이 아님: {field_names}"
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1001,7 @@ def _base_patches(mocker: Any) -> dict[str, MagicMock]:
     fake_rm = MagicMock(spec=RiskManager)
     fake_ss = SessionStatus()
     fake_notifier = MagicMock(spec=Notifier)
+    fake_recorder = MagicMock(spec=TradingRecorder)
 
     fake_runtime = Runtime(
         scheduler=fake_scheduler,
@@ -986,6 +1012,7 @@ def _base_patches(mocker: Any) -> dict[str, MagicMock]:
         risk_manager=fake_rm,
         session_status=fake_ss,
         notifier=fake_notifier,
+        recorder=fake_recorder,
     )
     patches["build_runtime"].return_value = fake_runtime
 
@@ -1700,3 +1727,541 @@ def test_on_daily_report_mismatch_symbols_from_last_reconcile(mocker: Any) -> No
 
     summary_none: DailySummary = fake_notifier2.notify_daily_summary.call_args[0][0]
     assert summary_none.mismatch_symbols == ()
+
+
+# ===========================================================================
+# 그룹 F — _default_recorder_factory
+# ===========================================================================
+
+
+def _make_fake_settings_for_recorder() -> MagicMock:
+    """_default_recorder_factory 에서 접근하는 settings 더블.
+
+    recorder factory 는 현재 settings 필드에 직접 접근하지 않지만
+    notifier factory 와 동일 기조로 MagicMock 을 사용한다.
+    """
+    return MagicMock()
+
+
+def test_default_recorder_factory_정상조립_SqliteTradingRecorder_반환(
+    mocker: Any,
+) -> None:
+    """F1 — SqliteTradingRecorder 정상 조립 시 인스턴스 반환.
+
+    실 SQLite 접촉 없이 생성자 호출 여부와 db_path 인자를 sentinel 로 검증한다.
+    db_path 는 절대경로(_TRADING_DB_PATH)여야 한다 — CWD 의존성 제거 계약(리뷰 C1).
+    """
+    from unittest.mock import sentinel
+
+    from stock_agent.main import _TRADING_DB_PATH
+
+    fake_settings = _make_fake_settings_for_recorder()
+    mock_sqlite = mocker.patch(
+        "stock_agent.main.SqliteTradingRecorder",
+        return_value=sentinel.sqlite_instance,
+    )
+
+    result = _default_recorder_factory(fake_settings, dry_run=False)
+
+    mock_sqlite.assert_called_once()
+    _, kwargs = mock_sqlite.call_args
+    assert kwargs.get("db_path") == _TRADING_DB_PATH
+    assert kwargs["db_path"].is_absolute()
+    assert result is sentinel.sqlite_instance
+
+
+def test_default_recorder_factory_StorageError_시_NullTradingRecorder_폴백(
+    mocker: Any,
+) -> None:
+    """F2 — SqliteTradingRecorder 생성자가 StorageError 를 던지면 NullTradingRecorder 반환.
+
+    logger.warning 도 1회 호출됨.
+    """
+    fake_settings = _make_fake_settings_for_recorder()
+    mocker.patch(
+        "stock_agent.main.SqliteTradingRecorder",
+        side_effect=StorageError("DB 초기화 실패"),
+    )
+    mock_logger = mocker.patch("stock_agent.main.logger")
+
+    result = _default_recorder_factory(fake_settings, dry_run=False)
+
+    assert isinstance(result, NullTradingRecorder)
+    mock_logger.warning.assert_called_once()
+    warning_msg = str(mock_logger.warning.call_args)
+    assert "NullTradingRecorder" in warning_msg or "recorder_factory" in warning_msg
+
+
+def test_default_recorder_factory_RuntimeError_시_NullTradingRecorder_폴백(
+    mocker: Any,
+) -> None:
+    """F3 — 일반 RuntimeError 에서도 NullTradingRecorder 폴백."""
+    fake_settings = _make_fake_settings_for_recorder()
+    mocker.patch(
+        "stock_agent.main.SqliteTradingRecorder",
+        side_effect=RuntimeError("예상치 못한 오류"),
+    )
+    mocker.patch("stock_agent.main.logger")
+
+    result = _default_recorder_factory(fake_settings, dry_run=False)
+
+    assert isinstance(result, NullTradingRecorder)
+
+
+def test_default_recorder_factory_OSError_시_NullTradingRecorder_폴백(
+    mocker: Any,
+) -> None:
+    """F4 — OSError(디스크·권한 등) 에서도 NullTradingRecorder 폴백."""
+    fake_settings = _make_fake_settings_for_recorder()
+    mocker.patch(
+        "stock_agent.main.SqliteTradingRecorder",
+        side_effect=OSError("디스크 쓰기 불가"),
+    )
+    mocker.patch("stock_agent.main.logger")
+
+    result = _default_recorder_factory(fake_settings, dry_run=False)
+
+    assert isinstance(result, NullTradingRecorder)
+
+
+# ===========================================================================
+# 그룹 G — build_runtime recorder 주입
+# ===========================================================================
+
+
+def test_build_runtime_recorder_factory_주입_시_runtime_recorder_에_반영(
+    _mock_universe: KospiUniverse, _fake_settings: MagicMock
+) -> None:
+    """G1 — recorder_factory 주입 시 해당 팩토리 반환값이 runtime.recorder 로 들어감."""
+    fake_rt = MagicMock()
+    fake_recorder = MagicMock(spec=TradingRecorder)
+
+    runtime = build_runtime(
+        _parse_args([]),
+        _fake_settings,
+        kis_client_factory=lambda s: MagicMock(spec=KisClient),
+        realtime_store_factory=lambda s: fake_rt,
+        scheduler_factory=MagicMock,
+        universe_loader=lambda p: _mock_universe,
+        notifier_factory=lambda s, d: MagicMock(spec=Notifier),
+        recorder_factory=lambda s, d: fake_recorder,
+    )
+
+    assert runtime.recorder is fake_recorder
+
+
+def test_build_runtime_recorder_factory_None_시_default_recorder_factory_호출(
+    _mock_universe: KospiUniverse, _fake_settings: MagicMock, mocker: Any
+) -> None:
+    """G2 — recorder_factory=None 미지정 시 _default_recorder_factory 가 호출됨.
+
+    팩토리 호출 인자 (settings, dry_run) 를 mock 으로 검증한다.
+    """
+    fake_rt = MagicMock()
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mock_default_factory = mocker.patch(
+        "stock_agent.main._default_recorder_factory",
+        return_value=fake_recorder,
+    )
+    args = _parse_args(["--dry-run"])
+
+    runtime = build_runtime(
+        args,
+        _fake_settings,
+        kis_client_factory=lambda s: MagicMock(spec=KisClient),
+        realtime_store_factory=lambda s: fake_rt,
+        scheduler_factory=MagicMock,
+        universe_loader=lambda p: _mock_universe,
+        notifier_factory=lambda s, d: MagicMock(spec=Notifier),
+        # recorder_factory 미지정 → _default_recorder_factory 사용
+    )
+
+    mock_default_factory.assert_called_once_with(_fake_settings, True)
+    assert runtime.recorder is fake_recorder
+
+
+# ===========================================================================
+# 그룹 H — _on_step recorder 포워딩
+# ===========================================================================
+
+
+def test_on_step_entry_events_record_entry_포워딩(mocker: Any) -> None:
+    """H1 — entry_events 2건 → recorder.record_entry 2회 호출, 인자는 각 EntryEvent."""
+    e1 = _make_entry_event("005930")
+    e2 = _make_entry_event("000660")
+    report = _make_step_report(entry_events=(e1, e2), exit_events=())
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.step.return_value = report
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        session_status=SessionStatus(started=True),
+    )
+    clock = lambda: _kst(9, 5)  # noqa: E731
+
+    cb = _on_step(runtime, clock)
+    cb()
+
+    assert fake_recorder.record_entry.call_count == 2
+    assert fake_recorder.record_entry.call_args_list[0][0][0] is e1
+    assert fake_recorder.record_entry.call_args_list[1][0][0] is e2
+
+
+def test_on_step_exit_events_record_exit_포워딩(mocker: Any) -> None:
+    """H2 — exit_events 1건 → recorder.record_exit 1회 호출, 인자는 ExitEvent."""
+    x1 = _make_exit_event("005930", reason="stop_loss")
+    report = _make_step_report(entry_events=(), exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.step.return_value = report
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        session_status=SessionStatus(started=True),
+    )
+    clock = lambda: _kst(9, 5)  # noqa: E731
+
+    cb = _on_step(runtime, clock)
+    cb()
+
+    assert fake_recorder.record_exit.call_count == 1
+    assert fake_recorder.record_exit.call_args_list[0][0][0] is x1
+
+
+def test_on_step_예외시_recorder_미호출(mocker: Any) -> None:
+    """H3 — executor.step 예외 발생 시 recorder.record_entry/record_exit 미호출.
+
+    예외 경로에서는 notifier.notify_error 만 호출되고 recorder 는 호출되지 않는다.
+    """
+    from stock_agent.execution import ExecutorError
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.step.side_effect = ExecutorError("step 내부 오류")
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        session_status=SessionStatus(started=True),
+    )
+    clock = lambda: _kst(9, 5)  # noqa: E731
+
+    cb = _on_step(runtime, clock)
+    cb()
+
+    fake_recorder.record_entry.assert_not_called()
+    fake_recorder.record_exit.assert_not_called()
+
+
+# ===========================================================================
+# 그룹 I — _on_force_close recorder 포워딩
+# ===========================================================================
+
+
+def test_on_force_close_exit_events_record_exit_포워딩(mocker: Any) -> None:
+    """I1 — force_close_all 반환 exit_events 1건 → recorder.record_exit 1회 호출."""
+    x1 = _make_exit_event("005930", reason="force_close")
+    report = _make_step_report(exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.return_value = report
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(executor=fake_executor, recorder=fake_recorder)
+    clock = lambda: _kst(15, 0)  # noqa: E731
+
+    cb = _on_force_close(runtime, clock)
+    cb()
+
+    assert fake_recorder.record_exit.call_count == 1
+    assert fake_recorder.record_exit.call_args_list[0][0][0] is x1
+
+
+# ===========================================================================
+# 그룹 J — _on_daily_report recorder 포워딩
+# ===========================================================================
+
+
+def test_on_daily_report_record_daily_summary_1회_호출(mocker: Any) -> None:
+    """J1 — 정상 경로에서 recorder.record_daily_summary 1회 호출, 인자는 DailySummary."""
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.is_halted = False
+    fake_executor.last_reconcile = None
+
+    fake_rm = MagicMock(spec=RiskManager)
+    fake_rm.daily_realized_pnl_krw = 5_000
+    fake_rm.entries_today = 1
+    fake_rm.active_positions = ()
+    fake_rm.starting_capital_krw = 1_000_000
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        risk_manager=fake_rm,
+        recorder=fake_recorder,
+    )
+    now = _kst(15, 30)
+    clock = lambda: now  # noqa: E731
+
+    cb = _on_daily_report(runtime, clock)
+    cb()
+
+    fake_recorder.record_daily_summary.assert_called_once()
+    summary: DailySummary = fake_recorder.record_daily_summary.call_args[0][0]
+    assert summary.session_date == now.date()
+    assert summary.realized_pnl_krw == 5_000
+    assert summary.entries_today == 1
+
+
+def test_on_daily_report_recorder_와_notifier_모두_호출됨(mocker: Any) -> None:
+    """J2 — recorder.record_daily_summary 와 notifier.notify_daily_summary 모두 1회 호출.
+
+    둘 중 하나가 실패해도 다른 쪽이 차단되지 않도록, 호출 여부만 검증.
+    순서 강제 테스트는 과적합 방지로 생략.
+    """
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.is_halted = False
+    fake_executor.last_reconcile = None
+
+    fake_rm = MagicMock(spec=RiskManager)
+    fake_rm.daily_realized_pnl_krw = 0
+    fake_rm.entries_today = 0
+    fake_rm.active_positions = ()
+    fake_rm.starting_capital_krw = 1_000_000
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_notifier = MagicMock(spec=Notifier)
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        risk_manager=fake_rm,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+    clock = lambda: _kst(15, 30)  # noqa: E731
+
+    cb = _on_daily_report(runtime, clock)
+    cb()
+
+    fake_recorder.record_daily_summary.assert_called_once()
+    fake_notifier.notify_daily_summary.assert_called_once()
+
+
+# ===========================================================================
+# 그룹 K — _graceful_shutdown recorder.close 호출
+# ===========================================================================
+
+
+def test_graceful_shutdown_recorder_close_호출됨() -> None:
+    """K1 — _graceful_shutdown 시 runtime.recorder.close() 가 호출된다.
+
+    notifier 관련 _graceful_shutdown 테스트는 없지만 recorder 는 닫아야 하는
+    리소스(SQLite 연결) 이므로 명시 검증한다.
+    """
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    runtime = _make_runtime(recorder=fake_recorder)
+
+    _graceful_shutdown(runtime, SIGTERM, None)
+
+    fake_recorder.close.assert_called_once()
+
+
+def test_graceful_shutdown_recorder_close_예외여도_silent_진행(mocker: Any) -> None:
+    """K2 — recorder.close 가 예외를 던져도 graceful shutdown 은 warning + silent 진행.
+
+    kis_client.close 도 정상 호출됨을 확인 (recorder 실패가 후속 단계를 막지 않음).
+    """
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_recorder.close.side_effect = RuntimeError("DB close 실패")
+
+    fake_kis = MagicMock(spec=KisClient)
+    call_order: list[str] = []
+    fake_kis.close.side_effect = lambda: call_order.append("kis.close")
+
+    mock_logger = mocker.patch("stock_agent.main.logger")
+    runtime = _make_runtime(recorder=fake_recorder, kis_client=fake_kis)
+
+    _graceful_shutdown(runtime, SIGTERM, None)  # raise 하면 안 됨
+
+    # recorder.close 예외가 경보되어야 함
+    mock_logger.warning.assert_called()
+    # kis.close 도 정상 호출됨
+    assert "kis.close" in call_order
+
+
+# ===========================================================================
+# 그룹 L — main() finally 경로 recorder.close (C7)
+# ===========================================================================
+
+
+def test_main_정상종료시_recorder_close_호출(mocker: Any) -> None:
+    """L1 — 정상 종료 경로에서 runtime.recorder.close() 가 finally 블록에서 호출된다."""
+    patches = _base_patches(mocker)
+    runtime = patches["build_runtime"].return_value
+
+    main([])
+
+    runtime.recorder.close.assert_called_once()
+
+
+def test_main_예외시에도_recorder_close_호출(mocker: Any) -> None:
+    """L2 — scheduler.start 가 예외를 던져도 finally 에서 recorder.close 가 호출된다."""
+    patches = _base_patches(mocker)
+    runtime = patches["build_runtime"].return_value
+    runtime.scheduler.start.side_effect = RuntimeError("crash")
+
+    with contextlib.suppress(Exception):
+        main([])
+
+    runtime.recorder.close.assert_called_once()
+
+
+# ===========================================================================
+# 그룹 M — _on_step 호출 순서 (I1): record_* → notify_*
+# ===========================================================================
+
+
+def test_on_step_record_entry_가_notify_entry_보다_먼저_호출된다(mocker: Any) -> None:
+    """M1 — entry/exit 각각 record → notify 순서 (I1 리뷰 계약)."""
+    call_order: list[str] = []
+
+    e1 = _make_entry_event("005930")
+    x1 = _make_exit_event("005930", reason="take_profit")
+    report = _make_step_report(entry_events=(e1,), exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.step.return_value = report
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_recorder.record_entry.side_effect = lambda _ev: call_order.append("record_entry")
+    fake_recorder.record_exit.side_effect = lambda _ev: call_order.append("record_exit")
+
+    fake_notifier = MagicMock(spec=Notifier)
+    fake_notifier.notify_entry.side_effect = lambda _ev: call_order.append("notify_entry")
+    fake_notifier.notify_exit.side_effect = lambda _ev: call_order.append("notify_exit")
+
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+        session_status=SessionStatus(started=True),
+    )
+
+    cb = _on_step(runtime, lambda: _kst(9, 5))
+    cb()
+
+    assert call_order == ["record_entry", "notify_entry", "record_exit", "notify_exit"]
+
+
+# ===========================================================================
+# 그룹 N — _on_force_close 호출 순서 및 예외 경로 스냅샷 (I1·I3)
+# ===========================================================================
+
+
+def test_on_force_close_정상경로_record_exit_가_notify_exit_보다_먼저(mocker: Any) -> None:
+    """N1 — force_close 정상 경로에서 record_exit → notify_exit 순서 (I1)."""
+    call_order: list[str] = []
+
+    x1 = _make_exit_event("005930", reason="force_close")
+    report = _make_step_report(exit_events=(x1,))
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.return_value = report
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_recorder.record_exit.side_effect = lambda _ev: call_order.append("record_exit")
+
+    fake_notifier = MagicMock(spec=Notifier)
+    fake_notifier.notify_exit.side_effect = lambda _ev: call_order.append("notify_exit")
+
+    mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()
+
+    assert call_order == ["record_exit", "notify_exit"]
+
+
+def test_on_force_close_예외경로_last_sweep_exit_events_스냅샷으로_record_exit_호출(
+    mocker: Any,
+) -> None:
+    """N2 — force_close_all 예외 시 last_sweep_exit_events 스냅샷으로 기록 (I3)."""
+    x1 = _make_exit_event("005930", reason="force_close")
+
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.side_effect = RuntimeError("partial crash")
+    # last_sweep_exit_events 는 PropertyMock 으로 스냅샷 반환
+    type(fake_executor).last_sweep_exit_events = PropertyMock(return_value=(x1,))
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_notifier = MagicMock(spec=Notifier)
+    mock_logger = mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()  # raise 하면 안 됨
+
+    # 부분 스냅샷 x1 에 대해 record_exit + notify_exit 호출
+    fake_recorder.record_exit.assert_called_once_with(x1)
+    fake_notifier.notify_exit.assert_called_once_with(x1)
+    # 포지션 잔존 위험 — critical + notify_error
+    mock_logger.critical.assert_called_once()
+    fake_notifier.notify_error.assert_called_once()
+    error_call_kwargs = fake_notifier.notify_error.call_args[0][0]
+    assert error_call_kwargs.severity == "critical"
+
+
+def test_on_force_close_예외경로_스냅샷_접근_실패시_silent_warning(mocker: Any) -> None:
+    """N3 — last_sweep_exit_events 접근 자체가 예외를 던지면 warning + record_exit 미호출 (I3)."""
+    fake_executor = MagicMock(spec=Executor)
+    fake_executor.force_close_all.side_effect = RuntimeError("partial crash")
+    # 스냅샷 프로퍼티 접근 자체가 실패
+    type(fake_executor).last_sweep_exit_events = PropertyMock(
+        side_effect=RuntimeError("snapshot read error")
+    )
+
+    fake_recorder = MagicMock(spec=TradingRecorder)
+    fake_notifier = MagicMock(spec=Notifier)
+    mock_logger = mocker.patch("stock_agent.main.logger")
+
+    runtime = _make_runtime(
+        executor=fake_executor,
+        recorder=fake_recorder,
+        notifier=fake_notifier,
+    )
+
+    cb = _on_force_close(runtime, lambda: _kst(15, 0))
+    cb()  # raise 하면 안 됨
+
+    # 스냅샷 실패 → warning
+    mock_logger.warning.assert_called()
+    # 스냅샷 실패 → record_exit 미호출
+    fake_recorder.record_exit.assert_not_called()
+    # critical + notify_error 는 여전히 호출됨
+    mock_logger.critical.assert_called_once()
+    fake_notifier.notify_error.assert_called_once()
