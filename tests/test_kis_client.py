@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -1100,3 +1101,105 @@ class TestCancelOrder:
 
         # cancel 은 첫 호출에서만 1회 호출됐어야 한다
         entry.cancel.assert_called_once()
+
+    def test_매칭_실패시_로그_레벨이_WARNING이다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+        _loguru_messages: list[dict[str, Any]],
+    ) -> None:
+        """매칭 실패 시 broker.cancel.not_pending 메시지가 WARNING 레벨로 방출된다.
+
+        silent-failure-hunter C2: 운영 로그 grep 가시성 확보를 위해
+        info → warning 으로 승격된 것을 회귀 방지.
+        """
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        other_entry = self._make_pending_entry(mocker, "ORD-OTHER-999")
+        fake_kis.account.return_value.pending_orders.return_value = [other_entry]
+
+        kc.cancel_order("ORD-NOT-FOUND-999")
+
+        # WARNING 레벨이면서 not_pending 또는 order_number 가 포함된 로그가 있어야 한다
+        warning_msgs = [
+            m
+            for m in _loguru_messages
+            if m["level"] == "WARNING"
+            and ("not_pending" in m["message"] or "ORD-NOT-FOUND-999" in m["message"])
+        ]
+        assert len(warning_msgs) >= 1, (
+            f"broker.cancel.not_pending 은 WARNING 레벨이어야 한다 "
+            f"(got levels={[m['level'] for m in _loguru_messages]})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 신규 테스트 20: PendingOrder.__post_init__ 가드 4종 — PR #39 리뷰 반영
+# ---------------------------------------------------------------------------
+
+
+class TestPendingOrderPostInitGuards:
+    """PendingOrder.__post_init__ 가드 4종 회귀 방지 (PR #39 silent-failure-hunter).
+
+    qty_ordered ≤ 0, qty_filled < 0, qty_remaining < 0,
+    qty_filled + qty_remaining != qty_ordered 각각이
+    RuntimeError 를 발생시키는지 검증.
+    """
+
+    _BASE = dict(
+        order_number="PO-GUARD",
+        symbol="005930",
+        side="buy",
+        price=70_000,
+        submitted_at=datetime(2026, 4, 21, 9, 30, tzinfo=timezone(timedelta(hours=9))),
+    )
+
+    def _make(self, **overrides: Any) -> PendingOrder:
+        return PendingOrder(**{**self._BASE, **overrides})  # type: ignore[arg-type]
+
+    def test_정상_생성_가드_통과(self) -> None:
+        """qty_ordered=10, qty_filled=3, qty_remaining=7 → 정상 생성."""
+        po = self._make(qty_ordered=10, qty_filled=3, qty_remaining=7)
+        assert po.qty_ordered == 10
+        assert po.qty_filled == 3
+        assert po.qty_remaining == 7
+
+    def test_qty_ordered_0이면_RuntimeError(self) -> None:
+        """qty_ordered=0 → RuntimeError (양수 위반)."""
+        with pytest.raises(RuntimeError, match="qty_ordered"):
+            self._make(qty_ordered=0, qty_filled=0, qty_remaining=0)
+
+    def test_qty_ordered_음수이면_RuntimeError(self) -> None:
+        """qty_ordered=-1 → RuntimeError."""
+        with pytest.raises(RuntimeError, match="qty_ordered"):
+            self._make(qty_ordered=-1, qty_filled=0, qty_remaining=0)
+
+    def test_qty_filled_음수이면_RuntimeError(self) -> None:
+        """qty_filled=-1 → RuntimeError (0 이상 위반)."""
+        with pytest.raises(RuntimeError, match="qty_filled"):
+            self._make(qty_ordered=10, qty_filled=-1, qty_remaining=11)
+
+    def test_qty_remaining_음수이면_RuntimeError(self) -> None:
+        """qty_remaining=-1 → RuntimeError (0 이상 위반)."""
+        with pytest.raises(RuntimeError, match="qty_remaining"):
+            self._make(qty_ordered=10, qty_filled=11, qty_remaining=-1)
+
+    def test_sum_불일치이면_RuntimeError(self) -> None:
+        """qty_filled(3) + qty_remaining(5) != qty_ordered(10) → RuntimeError."""
+        with pytest.raises(RuntimeError, match="qty_ordered"):
+            self._make(qty_ordered=10, qty_filled=3, qty_remaining=5)
+
+    def test_전량_미체결은_정상(self) -> None:
+        """qty_filled=0, qty_remaining=10, qty_ordered=10 → 미체결 전량, 정상."""
+        po = self._make(qty_ordered=10, qty_filled=0, qty_remaining=10)
+        assert po.qty_filled == 0
+        assert po.qty_remaining == 10
+
+    def test_전량_체결은_정상(self) -> None:
+        """qty_filled=10, qty_remaining=0, qty_ordered=10 → 전량 체결, 정상."""
+        po = self._make(qty_ordered=10, qty_filled=10, qty_remaining=0)
+        assert po.qty_filled == 10
+        assert po.qty_remaining == 0

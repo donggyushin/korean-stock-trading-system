@@ -189,11 +189,13 @@ last_reconcile: ReconcileReport | None   # property, read-only
 3. `risk_manager.evaluate_entry(signal, available_cash)` — 거부면 종료
    (RiskManager 가 이미 사유 로그).
 4. 승인이면 `_with_backoff(submit_buy)` → `OrderTicket`.
-5. `_wait_fill(ticket)` — 시장가 즉시 체결 가정, timeout → `ExecutorError`.
+5. `outcome = _resolve_fill(ticket)` — 타임아웃 시 `cancel_order` 호출 + 부분/0 체결
+   수습 (ADR-0014). `status == "none"` → 즉시 skip, `return False` (RiskManager 미기록).
 6. `entry_fill_price = buy_fill_price(signal.price, slippage_rate)` —
    `backtest.costs.buy_fill_price` 재사용.
-7. `risk_manager.record_entry(symbol, entry_fill_price, qty, now)` +
-   `_open_lots[symbol] = _OpenLot(entry_fill_price, qty)`.
+7. `risk_manager.record_entry(symbol, entry_fill_price, outcome.filled_qty, now)` +
+   `_open_lots[symbol] = _OpenLot(entry_fill_price, outcome.filled_qty)`. `status ==
+   "partial"` 이면 warning 로그 (잔량 취소 완료, 체결분만 기록).
 
 ## ExitSignal 처리
 
@@ -201,7 +203,9 @@ last_reconcile: ReconcileReport | None   # property, read-only
    외부에서 직접 `record_entry` 한 경우(테스트·수동 시나리오) 호환. 둘 다 없으면
    `ExecutorError` (전략-Executor 동기화 위반).
 2. `_with_backoff(submit_sell)` → `OrderTicket`.
-3. `_wait_fill(ticket)`.
+3. `outcome = _resolve_fill(ticket)` — `status != "full"` 이면 `self._halt = True`
+   선제 설정 + `ExecutorError` 승격 (ADR-0014 — 브로커 잔고가 일부만 감소한 상태로
+   남아 다음 `reconcile()` 가 mismatch 감지까지 기다리지 않고 즉시 halt).
 4. `exit_fill_price = sell_fill_price(signal.price, slippage_rate)`.
 5. PnL 계산 — 백테스트 엔진과 동일 산식 (`buy_commission` + `sell_commission`
    + `sell_tax` 모두 `backtest.costs` 재사용):
@@ -290,7 +294,7 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
   CLAUDE.md 하드 규칙, `.claude/hooks/tests-writer-guard.sh` fail-closed).
 - 관련 테스트 파일: `tests/test_executor.py`. 카테고리: 공개 심볼 노출,
   ExecutorConfig 검증, 생성·세션, step 가드, EntrySignal 승인·거부·로그,
-  ExitSignal 승인·무결성·fallback 로그, force_close, 체결 대기(_wait_fill),
+  ExitSignal 승인·무결성·fallback 로그, force_close, 체결 확정(_resolve_fill),
   DryRunOrderSubmitter, reconcile(일치·mismatch·critical 로그·ReconcileReport
   immutability), halt 가시성·영속성·start_session 리셋, KisClientError 백오프,
   에러 좁힘, 멀티 심볼, 분봉 idempotent, StepReport/ReconcileReport 구조,

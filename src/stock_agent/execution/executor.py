@@ -12,7 +12,8 @@
 범위 제외 (의도적 defer)
 - 항목 정본은 모듈 CLAUDE.md "범위 제외 (의도적 defer)" 섹션 — 두 곳 동기화
   부담을 피하기 위해 본 docstring 에서는 중복 나열하지 않는다. 핵심: 스케줄링·
-  알림·영속화·부분체결·체결조회 정확도 향상은 모두 후속 PR.
+  알림·영속화·부분체결 정책은 완료(ADR-0011/0012/0013/0014). 실체결단가 회수·
+  주문 정정·호가 단위 라운딩·멀티프로세스 확장은 후속 PR.
 
 에러 정책 (broker/strategy/risk 와 동일 기조)
 - `RuntimeError` 는 전파 — 입력 오류 (naive datetime, 세션 미시작 등).
@@ -143,8 +144,10 @@ class DryRunOrderSubmitter:
 
     `submit_buy`/`submit_sell` 는 `order_number=DRY-NNNN` 형태의 가짜
     `OrderTicket` 을 반환하고, `get_pending_orders` 는 항상 빈 리스트를
-    돌려 `_wait_fill` 이 즉시 통과하게 한다. RiskManager 와의 시그널·체결
-    동기화는 그대로 유지되므로 모의투자 사전 검증·시뮬레이션 회귀에 사용한다.
+    돌려 `_resolve_fill` 이 즉시 `status="full"` 로 확정되게 한다 (ADR-0014).
+    RiskManager 와의 시그널·체결 동기화는 그대로 유지되므로 모의투자 사전
+    검증·시뮬레이션 회귀에 사용한다. 부분체결 경로는 드라이런에서 커버되지
+    않음 — 별도 유닛 테스트(`TestExecutorPartialFillEntry` 등) 가 전담.
     """
 
     def __init__(self) -> None:
@@ -207,7 +210,9 @@ class ExecutorConfig:
     """`withdrawable` 의 0.5% 를 수수료/세금 버퍼로 보수 차감해 RiskManager 에 전달."""
 
     order_fill_timeout_s: float = 30.0
-    """시장가 체결 대기 타임아웃(초). 초과 시 `ExecutorError`."""
+    """시장가 체결 대기 타임아웃(초). 초과 시 `cancel_order` 호출 후
+    `_FillOutcome(status=partial|none)` 반환 (ADR-0014). 타임아웃 자체로
+    `ExecutorError` 를 raise 하지 않는다."""
 
     order_poll_interval_s: float = 0.5
     """미체결 폴링 주기(초)."""
@@ -280,11 +285,13 @@ class ReconcileReport:
 class EntryEvent:
     """체결 확정된 진입 이벤트 — notifier / storage 소비용.
 
-    `fill_price` 는 슬리피지 반영된 추정 체결가(`backtest.costs.buy_fill_price`
-    와 동일 계산), `ref_price` 는 시그널 생성 당시 참고가. timestamp 는 `step`
-    에 주입된 `now` 인자로 KST aware datetime. `order_number` 는 브로커가
-    반환한 주문번호(`OrderTicket.order_number`) 로, 감사 추적·storage 원장
-    PK 용도. 드라이런은 `DRY-NNNN` 형식.
+    `qty` 는 **실체결 수량**(ADR-0014) — 시그널·RiskManager 요청 수량(`decision.qty`)
+    과 다를 수 있다. 부분체결 시 체결된 수량만 기록되고 잔량은 `cancel_order`
+    로 취소됨. `fill_price` 는 슬리피지 반영된 추정 체결가(`backtest.costs.
+    buy_fill_price` 와 동일 계산), `ref_price` 는 시그널 생성 당시 참고가.
+    timestamp 는 `step` 에 주입된 `now` 인자로 KST aware datetime. `order_number`
+    는 브로커가 반환한 주문번호(`OrderTicket.order_number`) 로, 감사 추적·
+    storage 원장 PK 용도. 드라이런은 `DRY-NNNN` 형식.
     """
 
     symbol: str
@@ -311,12 +318,15 @@ class EntryEvent:
 class ExitEvent:
     """체결 확정된 청산 이벤트 — notifier / storage 소비용.
 
-    `net_pnl_krw` 는 수수료·거래세 반영 순손익(`_compute_net_pnl` 결과와 동일,
-    손실은 음수). `reason` 은 `"stop_loss" | "take_profit" | "force_close"` —
-    `ExitReason` 재사용(strategy/base.py). 타입이 `ExitReason` 이므로 소비자
-    (notifier 등) 는 값 범위 가정을 정적 타입으로 보장받는다 (ADR-0012 후속
-    보강 2026-04-21). `order_number` 는 브로커 주문번호로 storage 원장 PK 및
-    감사 추적 용도 (ADR-0013).
+    `qty` 는 **전량 체결된 청산 수량**(ADR-0014) — 청산 부분체결은 `_handle_exit`
+    에서 `ExecutorError` 로 승격되므로 이 이벤트가 발행되는 시점에는 항상
+    `status == "full"` 인 lot.qty 와 동일하다. `net_pnl_krw` 는 수수료·거래세
+    반영 순손익(`_compute_net_pnl` 결과와 동일, 손실은 음수). `reason` 은
+    `"stop_loss" | "take_profit" | "force_close"` — `ExitReason` 재사용
+    (strategy/base.py). 타입이 `ExitReason` 이므로 소비자(notifier 등) 는 값
+    범위 가정을 정적 타입으로 보장받는다 (ADR-0012 후속 보강 2026-04-21).
+    `order_number` 는 브로커 주문번호로 storage 원장 PK 및 감사 추적 용도
+    (ADR-0013).
     """
 
     symbol: str
@@ -368,17 +378,35 @@ class _OpenLot:
 class _FillOutcome:
     """`_resolve_fill` 결과 — 체결 확정 상태 + 실체결 수량 (ADR-0014).
 
-    - `status == "full"` → ticket.qty 전량 체결 (pending 에서 사라짐).
-    - `status == "partial"` → 일부만 체결되고 타임아웃, 잔량은 취소됨.
-    - `status == "none"` → 타임아웃까지 한 주도 체결되지 않음, 잔량 취소됨.
+    - `status == "full"` → pending 에서 사라졌거나, 타임아웃 관측 시점
+      `filled_qty >= ticket.qty` (초과 체결은 실무상 발생하지 않지만 가드 목적
+      으로 >= 로 허용).
+    - `status == "partial"` → 타임아웃까지 일부만 체결 (`0 < filled_qty <
+      ticket.qty`), 잔량은 `cancel_order` 로 취소됨.
+    - `status == "none"` → 타임아웃까지 한 주도 체결되지 않음 (`filled_qty
+      == 0`), 잔량 취소됨.
 
-    `filled_qty == ticket.qty` iff `status == "full"`.
-    `0 < filled_qty < ticket.qty` iff `status == "partial"`.
-    `filled_qty == 0` iff `status == "none"`.
+    자기정합성: `status == "none" ↔ filled_qty == 0`, `status == "partial" →
+    filled_qty > 0`. `__post_init__` 이 위반 시 `RuntimeError`.
     """
 
     filled_qty: int
     status: Literal["full", "partial", "none"]
+
+    def __post_init__(self) -> None:
+        if self.filled_qty < 0:
+            raise RuntimeError(
+                f"_FillOutcome.filled_qty 는 0 이상이어야 합니다 (got={self.filled_qty})"
+            )
+        if self.status == "none" and self.filled_qty != 0:
+            raise RuntimeError(
+                f"_FillOutcome: status='none' 은 filled_qty==0 이어야 합니다 "
+                f"(got filled_qty={self.filled_qty})"
+            )
+        if self.status == "partial" and self.filled_qty == 0:
+            raise RuntimeError(
+                "_FillOutcome: status='partial' 은 filled_qty>0 이어야 합니다 (got 0)"
+            )
 
 
 # ---- Executor ------------------------------------------------------------
@@ -710,8 +738,19 @@ class Executor:
             # 청산 부분/0 체결 → 브로커 잔고가 일부만 감소하거나 그대로 남아
             # RiskManager.active_positions 와 mismatch 발생. RiskManager.record_exit
             # 은 qty 분할을 지원하지 않으므로 원장 정합을 깨지 않도록 운영자
-            # 개입 경로로 승격한다. 잔량 취소는 `_resolve_fill` 내부에서 시도됨
-            # — 다음 `reconcile()` 이 잔고 실상과 비교해 자동 halt 를 트리거.
+            # 개입 경로로 승격한다. 잔량 취소는 `_resolve_fill` 내부에서 시도됨.
+            # 다음 `reconcile()` 을 기다리지 않고 **현시점에 `_halt = True` 선제**
+            # — 같은 sweep 내 후속 시그널이 `_open_lots.qty` 로 재매도를 시도해
+            # 잔고보다 큰 수량을 주문하는 경로를 차단 (silent-failure-hunter C1).
+            self._halt = True
+            logger.critical(
+                "executor.exit.partial_halt symbol={symbol} order_number={n} "
+                "filled_qty={f} requested={q} — 즉시 halt, 운영자 개입 필요",
+                symbol=signal.symbol,
+                n=ticket.order_number,
+                f=outcome.filled_qty,
+                q=lot.qty,
+            )
             raise ExecutorError(
                 f"_handle_exit: 청산 주문이 전량 체결되지 않음 "
                 f"(symbol={signal.symbol}, order_number={ticket.order_number}, "
@@ -790,12 +829,16 @@ class Executor:
         try:
             self._with_backoff(lambda: self._order_submitter.cancel_order(ticket.order_number))
         except ExecutorError:
-            # 취소 백오프 한계 초과. 잔량 상태는 다음 reconcile 이 실상과 비교.
-            # 여기서 상위로 전파하면 step 이 중단 — 정책상 잔량 취소 실패는
-            # 이미 체결된 부분 집계를 유지하고 진행.
+            # 취소 백오프 한계 초과. 브로커에 잔량이 살아있는 상태에서 비동기
+            # 추가 체결이 일어나면 잔고와 `_open_lots.qty` 가 어긋난다. 다음
+            # `reconcile()` 이 감지할 때까지의 간극을 최소화하기 위해 **현시점에
+            # `_halt = True` 선제** 설정 — 이번 sweep 의 이후 EntrySignal 처리도
+            # 즉시 차단. 이미 체결된 부분 집계는 유지하고 호출 측으로 _FillOutcome
+            # 반환 (silent-failure-hunter I1).
+            self._halt = True
             logger.critical(
                 "executor.resolve_fill.cancel_failed order_number={n} filled={f} — "
-                "다음 reconcile 이 실상 대조",
+                "halt 선제 설정, 다음 reconcile 이 실상 대조",
                 n=ticket.order_number,
                 f=filled_qty,
             )

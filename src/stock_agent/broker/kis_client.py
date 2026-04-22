@@ -85,7 +85,15 @@ class PendingOrder:
 
     `qty_filled` 는 체결된 수량, `qty_remaining` 은 남은 미체결 수량.
     PyKis 정식 필드(`executed_quantity`, `pending_quantity`) 를 우선 매핑하고,
-    없을 때만 `qty_remaining` attribute fallback 을 사용한다. ADR-0014.
+    없을 때만 `qty_remaining` attribute fallback 을 사용한다 (ADR-0014).
+
+    불변식 (`__post_init__` 검증):
+    - `qty_ordered > 0`
+    - `qty_filled >= 0`, `qty_remaining >= 0`
+    - `qty_filled + qty_remaining == qty_ordered`
+
+    위반 시 `RuntimeError` — `_to_pending_order` 매핑 버그를 조기에 차단해
+    `_resolve_fill` 판정의 silent 오동작 방지.
     """
 
     order_number: str
@@ -96,6 +104,26 @@ class PendingOrder:
     qty_remaining: int
     price: int | None
     submitted_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.qty_ordered <= 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_ordered 는 양수여야 합니다 (got={self.qty_ordered})"
+            )
+        if self.qty_filled < 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_filled 는 0 이상이어야 합니다 (got={self.qty_filled})"
+            )
+        if self.qty_remaining < 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_remaining 는 0 이상이어야 합니다 (got={self.qty_remaining})"
+            )
+        if self.qty_filled + self.qty_remaining != self.qty_ordered:
+            raise RuntimeError(
+                f"PendingOrder: qty_filled({self.qty_filled}) + qty_remaining"
+                f"({self.qty_remaining}) != qty_ordered({self.qty_ordered}) — "
+                "필드 매핑 불일치"
+            )
 
 
 class KisClient:
@@ -289,8 +317,13 @@ class KisClient:
                         )
                     cancel_method()
                     return
-            logger.info(
-                "broker.cancel.not_pending order_number={n} — 이미 체결 또는 취소됨 (no-op)",
+            # 매칭 실패 경로 — "이미 체결 또는 취소됨" (멱등 의도) 과
+            # "애초에 존재하지 않는 주문번호" 를 구분할 수 없다. 후자는
+            # 호출 측 버그이므로 warning 으로 승격해 운영 로그 grep 가시성
+            # 확보 (silent-failure-hunter C2).
+            logger.warning(
+                "broker.cancel.not_pending order_number={n} — "
+                "이미 체결 또는 취소됨(멱등) 또는 존재하지 않는 주문번호",
                 n=order_number,
             )
 
