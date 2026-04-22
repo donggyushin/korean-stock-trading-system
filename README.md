@@ -245,6 +245,7 @@ uv run python scripts/healthcheck.py
 ## 참고 문서
 
 - [`plan.md`](./plan.md) — 전체 설계서(Context, 전략 상세, 리스크 한도, 로드맵, Verification 기준, 비용·위험 분석)
+- [`docs/operations-playbook.md`](./docs/operations-playbook.md) — 모의투자 운영 플레이북 (장 전 체크리스트·장중 이상 대응·Kill switch·일일 마감 체크)
 
 ## 책임 고지 (Disclaimer)
 
