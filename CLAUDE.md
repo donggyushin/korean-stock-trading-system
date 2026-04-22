@@ -248,7 +248,7 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
   - `src/stock_agent/backtest/sensitivity.py` + `scripts/sensitivity.py` — 완료 2026-04-20. `ParameterAxis`·`SensitivityGrid`·`SensitivityRow`·`run_sensitivity`·`render_markdown_table`·`write_csv`·`default_grid` 공개 (backtest `__init__` 재노출). 기본 그리드 `or_end` 2종 × `stop_loss_pct` 4종 × `take_profit_pct` 4종 = 32 조합, 현재 운영 기본값 포함. 파라미터 이름 공간 `strategy.*`·`risk.*`·`engine.*`. CLI: `uv run python scripts/sensitivity.py --csv-dir ... --from ... --to ...`. 외부 네트워크·KIS 접촉 없음, 의존성 추가 0. 민감도 리포트는 sanity check 용도이며 walk-forward 검증을 대체하지 않는다. PR #12 리뷰 반영: `SensitivityRow.params` 를 `tuple[tuple[str, Any], ...]` 로 변경해 frozen 계약 회복, `metrics: BacktestMetrics` 중첩으로 엔진 진화 자동 추종, `params_dict()` 편의 메서드 추가. `scripts/sensitivity.py` exit code 규약: 2 입력·설정 오류, 3 I/O 오류. `BarLoader` Protocol 재호출 안전성 계약 명시. 모듈 세부는 [src/stock_agent/backtest/CLAUDE.md](./src/stock_agent/backtest/CLAUDE.md) 참조.
   - `scripts/backtest.py` — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown·메트릭 CSV·체결 CSV 3종 산출. `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols`(default 유니버스 전체), `--starting-capital`(default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: 낙폭 절대값 15% 미만일 때 PASS (`mdd > Decimal("-0.15")` 이면 PASS — 경계 -15% 정확값은 FAIL). **exit code 에는 반영 안 함** — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상, `2` `MinuteCsvLoadError`/`UniverseLoadError`/`RuntimeError`, `3` `OSError` (`scripts/sensitivity.py`는 `UniverseLoadError` 분기 미포함 — 별도 PR 이슈). 외부 네트워크·KIS 접촉 0, 의존성 추가 0. 테스트: `tests/test_backtest_cli.py` 65건.
   - pytest **245 → 324 → 384 → 464 → 477 → 539 → 542건 green** (기존 539 + verdict 경계값 보강 2건 + UniverseLoadError 회귀 1건). 회귀 없음. 의존성 추가 없음.
-  - 미완료: 2~3년 실데이터 수집(운영자 외부 작업 — KIS 서버 1년 제약으로 별도 데이터 소스 필요, Issue #5), 낙폭 절대값 15% 미만 확인 (MDD > -15%). Phase 2 전체 PASS 선언은 이후.
+  - 미완료: 1년치 KIS 분봉 백필 + `uv run python scripts/backtest.py --loader=kis ...` 실행 후 낙폭 절대값 15% 미만 확인 (MDD > -15%, 240 영업일 이상, 다중 종목). Phase 2 PASS 기준 기간 2~3년 → 1년 완화 (ADR-0017, Issue #36 close 예정). Phase 2 전체 PASS 선언은 이후.
 
 - **Phase 2 일곱 번째 산출물 — KIS 과거 분봉 API 어댑터 (ADR-0016) 코드·테스트 레벨 완료 (2026-04-22)**
   - `src/stock_agent/data/kis_minute_bars.py` 신설 — `KisMinuteBarLoader` + `KisMinuteBarLoadError`. `BarLoader` Protocol 준수. `data/__init__.py` 에 두 심볼 공개.
@@ -256,7 +256,7 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
   - 캐시: `data/minute_bars.db` 별도 파일. 스키마 v1 — `minute_bars(symbol, bar_time, open, high, low, close, volume, PRIMARY KEY(symbol, bar_time))` + `schema_version`. `data/stock_agent.db`·`data/trading.db` 와 생명주기 독립.
   - 페이지네이션: 120건 역방향 커서 + 1분 감소, 종료 조건 `len(rows) < 120` 또는 `min_time <= "090000"`.
   - 레이트 리밋 재시도: `EGW00201` → `sleep(61.0)` 후 최대 3회 재시도.
-  - **중요 제약**: **KIS 서버 최대 1년 분봉 보관**. 2~3년 백테스트 PASS 기준은 본 어댑터로 충족 불가 — Phase 2 PASS 검증은 CSV 경로(`minute_csv.py`)로 수행. 2~3년 데이터는 Issue #5 후속으로 별도 데이터 소스 분리 평가.
+  - **제약 및 완화**: KIS 서버 최대 1년 분봉 보관. Phase 2 PASS 기준이 1년 표본으로 완화됨(ADR-0017) — `--loader=kis` 경로로 즉시 실행 가능. walk-forward·다년 표본은 Phase 5 유예.
   - CLI: `scripts/backtest.py` + `scripts/sensitivity.py` 에 `--loader={csv,kis}` 옵션 추가 (default `"csv"`). `--csv-dir` 는 `--loader=csv` 시만 필수.
   - 결정 (ADR-0016): 캐시 별도 파일 분리·`kis.fetch()` 로우레벨 직접 호출·후속 PR 에서 백필 스크립트.
   - pytest `tests/test_kis_minute_bar_loader.py` 39건 신규. 회귀 0건. 의존성 추가 없음.
@@ -317,7 +317,7 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
   - (2026-04-22) Issue #41 — `_on_session_start` NullTradingRecorder 폴백 가시성 보강: 콜백 진입부에서 `isinstance(runtime.recorder, NullTradingRecorder)` 검사 → `logger.critical` + `notify_error(stage="session_start.recorder_null", severity="critical")` 1회 방출. ADR-0013 결정 7의 가시성 보강이며 결정 번복·스택 교체 아님 — 별도 ADR 없음. pytest **1068 passed, 4 skipped**.
 
 - **다음 작업**
-  - **Phase 2 잔여**: KIS 과거 분봉 API 어댑터 — **완료 (2026-04-22, ADR-0016)**. 단 KIS 서버 최대 1년 보관 제약으로 2~3년 데이터는 별도 소스 필요(Issue #5 후속 평가). 2~3년 실데이터 수집(운영자 외부 작업, 리포지토리 미포함) · `uv run python scripts/backtest.py --csv-dir ... --from 2023-01-01 --to 2025-12-31` 실행 후 낙폭 절대값 15% 미만 확인 (MDD > -15%) 은 미완. PASS 라벨이 출력돼도 즉시 실전 전환 아님 — Phase 3 모의투자 2주 무사고 운영이 전제.
+  - **Phase 2 잔여**: KIS 과거 분봉 API 어댑터 — **완료 (2026-04-22, ADR-0016)**. PASS 기준 기간 2~3년 → 1년 완화 (ADR-0017, Issue #36 close 예정). 잔여 작업: 1년치 KIS 분봉 백필 + `uv run python scripts/backtest.py --loader=kis --from <1년 전> --to <오늘>` 실행 후 낙폭 절대값 15% 미만 확인 (MDD > -15%, 240 영업일 이상, 다중 종목). PASS 라벨이 출력돼도 즉시 실전 전환 아님 — Phase 3 모의투자 10영업일 무중단 운영이 최종 게이트.
   - **Phase 3 착수 전 필수 — 통과 완료 (2026-04-21)**: 운영자 `.env` 실전 키 3종(`KIS_LIVE_APP_KEY`, `KIS_LIVE_APP_SECRET`, `KIS_LIVE_ACCOUNT_NO`) 기입 + KIS Developers 포털 IP 화이트리스트 등록 + `uv run python scripts/healthcheck.py` 4종(삼성전자 현재가 포함) 통과 확인 (**평일 장중 09:00~15:30 KST 실행 필수** — 4번 `check_realtime_price`는 장외 실행 시 2초 타임아웃 후 실패 가능; 나머지 3종은 시간대 무관). **2026-04-21 평일 장중 4종 그린, WebSocket 체결 수신 OK.**
   - **Phase 3 후속 PR**: `execution/executor.py` 완료 (2026-04-21) · `main.py` 완료 (2026-04-21) · `monitor/notifier.py` 완료 (2026-04-21) · I1/I2 후속 정리 완료 (2026-04-22) · `storage/db.py` 완료 (2026-04-22) · 세션 재기동 복원 경로 완료 (2026-04-22, Issue #33) · broker 체결조회 + 부분체결 정책 완료 (2026-04-22, ADR-0015). Phase 3 코드 산출물 전부 완료 — 이후 **모의투자 연속 10영업일 무중단 운영** 대기.
 

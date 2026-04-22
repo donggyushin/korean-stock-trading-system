@@ -46,6 +46,7 @@ ADR 가 **불필요** 한 변경:
 | [0014](./0014-runtime-state-recovery.md) | 세션 중간 재기동 시 오픈 포지션·RiskManager 상태 DB 복원 경로 | 승인됨 | 2026-04-22 |
 | [0015](./0015-partial-fill-policy.md) | 체결조회 API 통합 + 부분체결 정책 — 잔량 취소 + 체결 수량만 원장 기록 | 승인됨 | 2026-04-22 |
 | [0016](./0016-kis-minute-bar-cache.md) | KIS 과거 분봉 어댑터 — `data/minute_bars.db` 별도 파일 + `kis.fetch()` 로우레벨 호출 | 승인됨 | 2026-04-22 |
+| [0017](./0017-phase2-pass-1year.md) | Phase 2 PASS 판정 기간 완화 — 2~3 년 → 1 년 (MDD > -15% 유지) | 승인됨 | 2026-04-22 |
 
 ## 관련 문서
 
