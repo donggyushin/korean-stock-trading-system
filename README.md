@@ -211,7 +211,7 @@ uv run python scripts/healthcheck.py   # 통과 확인
 이후 `claude-squad` 로 새 worktree 를 만들 때 `.env` 를 다시 복사할 필요 없다.
 worktree 단위로 다른 값이 필요하면(예: paper/live 전환) repo 루트에 `.env` 를 따로 작성한다.
 
-민감정보 취급 원칙: `.env` 파일(두 경로 모두)은 절대 커밋하지 않는다. 커밋·PR 전 diff 에 키 문자열이 섞여들지 않았는지 확인한다.
+민감정보 취급 원칙: `.env` 파일(두 경로 모두)은 절대 커밋하지 않는다. `~/.config/stocker/.env` 는 저장소 밖 경로라 구조적으로 커밋 대상이 아니고, repo 루트 `.env` 는 `.gitignore` 의 `.env` 라인으로 차단된다(이 라인을 실수로 지우지 않아야 한다). 커밋·PR 전 diff 에 키 문자열이 섞여들지 않았는지 확인한다.
 
 ### 환경 설정
 
