@@ -101,7 +101,7 @@ def _make_runtime(
     risk_manager: MagicMock | None = None,
     session_status: SessionStatus | None = None,
     notifier: MagicMock | None = None,
-    recorder: MagicMock | None = None,
+    recorder: MagicMock | TradingRecorder | None = None,
 ) -> Runtime:
     """Runtime 더블 조립 헬퍼.
 
