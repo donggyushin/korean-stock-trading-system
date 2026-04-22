@@ -1217,12 +1217,9 @@ class TestCacheTodayAlwaysRefetches:
         bars = list(loader.stream(_TODAY, _TODAY, (_SYMBOL,)))
         loader.close()
 
-        assert len(bars) >= 1, "bar 가 1건 이상 반환돼야 한다"
+        assert len(bars) >= 1
         # DB 선삽입값(71200)이 아니라 API 응답값(70100)이어야 함 — DB 읽기 skip 증명
-        assert bars[0].close == Decimal("70100"), (
-            f"오늘 자 bar 는 DB 읽기를 skip 하고 API 기반값(70100)을 반환해야 한다 "
-            f"(실제 반환값={bars[0].close})"
-        )
+        assert bars[0].close == Decimal("70100")
 
 
 # ===========================================================================
@@ -1444,16 +1441,11 @@ class TestMalformedPageWarning:
         loader.close()
 
         errors = [m for m in _loguru_errors if m["level"] == "ERROR"]
-        assert len(errors) == 1, (
-            f"rows ≥1 이고 page_bars 비면 logger.error 를 정확히 1회 방출해야 한다 "
-            f"(실제 {len(errors)}회, messages={[m['message'] for m in errors]})"
-        )
+        assert len(errors) == 1
         # 에러 메시지에 symbol 과 날짜 정보가 포함돼야 한다
         msg = errors[0]["message"]
-        assert _SYMBOL in msg, f"에러 메시지에 symbol={_SYMBOL!r} 포함 필수 (실제: {msg!r})"
-        assert _YESTERDAY.strftime("%Y%m%d") in msg or str(_YESTERDAY) in msg, (
-            f"에러 메시지에 날짜={_YESTERDAY} 정보 포함 필수 (실제: {msg!r})"
-        )
+        assert _SYMBOL in msg
+        assert _YESTERDAY.strftime("%Y%m%d") in msg or str(_YESTERDAY) in msg
 
     def test_rows_0건_정상_공휴일_logger_error_없음(
         self,
@@ -1483,10 +1475,7 @@ class TestMalformedPageWarning:
         loader.close()
 
         errors = [m for m in _loguru_errors if m["level"] == "ERROR"]
-        assert len(errors) == 0, (
-            f"rows=0 (빈 응답) 은 logger.error 를 방출하면 안 됨 "
-            f"(실제 {len(errors)}회, messages={[m['message'] for m in errors]})"
-        )
+        assert len(errors) == 0
 
     def test_2페이지_모두_malformed_logger_error_1회만_dedupe(
         self,
@@ -1526,10 +1515,7 @@ class TestMalformedPageWarning:
         loader.close()
 
         errors = [m for m in _loguru_errors if m["level"] == "ERROR"]
-        assert len(errors) == 1, (
-            f"동일 (symbol, day) 에 대해 _fetch_day 내 logger.error 는 1회만 방출해야 한다 "
-            f"(dedupe, 실제 {len(errors)}회, messages={[m['message'] for m in errors]})"
-        )
+        assert len(errors) == 1
 
 
 # ===========================================================================

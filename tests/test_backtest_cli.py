@@ -320,42 +320,32 @@ class TestVerdictLabel:
     def test_표본_240_미만_PASS_참고용_표본_240_미만(self):
         """daily_equity_len=239 → caveat '표본 240 미만' 포함."""
         result = _verdict_label(Decimal("-0.10"), daily_equity_len=239, symbol_count=3)
-        assert result == "PASS (참고용 — 표본 240 미만)", (
-            f"표본 239일 때 caveat 포함 라벨 기대, 실제={result!r}"
-        )
+        assert result == "PASS (참고용 — 표본 240 미만)"
 
     def test_단일_종목_PASS_참고용_단일_종목(self):
         """symbol_count=1 → caveat '단일 종목' 포함."""
         result = _verdict_label(Decimal("-0.10"), daily_equity_len=240, symbol_count=1)
-        assert result == "PASS (참고용 — 단일 종목)", (
-            f"단일 종목일 때 caveat 포함 라벨 기대, 실제={result!r}"
-        )
+        assert result == "PASS (참고용 — 단일 종목)"
 
     def test_표본_240_미만_AND_단일_종목_두_caveat_모두_포함(self):
         """daily_equity_len=100, symbol_count=1 → caveat 2개 모두 포함, 순서 고정."""
         result = _verdict_label(Decimal("-0.10"), daily_equity_len=100, symbol_count=1)
-        assert result == "PASS (참고용 — 표본 240 미만, 단일 종목)", (
-            f"두 caveat 모두 포함, 순서='표본 240 미만' → '단일 종목' 기대, 실제={result!r}"
-        )
+        assert result == "PASS (참고용 — 표본 240 미만, 단일 종목)"
 
     def test_표본_240_이상_다중_종목_caveat_없음(self):
         """daily_equity_len=240, symbol_count=3 → caveat 없음 → 'PASS'."""
         result = _verdict_label(Decimal("-0.10"), daily_equity_len=240, symbol_count=3)
-        assert result == "PASS", (
-            f"표본 충분 + 다중 종목이면 caveat 없는 'PASS' 기대, 실제={result!r}"
-        )
+        assert result == "PASS"
 
     def test_FAIL_이면_caveat_붙지_않음(self):
         """mdd <= -0.15 이면 daily_equity_len/symbol_count 관계없이 'FAIL'."""
         result = _verdict_label(Decimal("-0.20"), daily_equity_len=100, symbol_count=1)
-        assert result == "FAIL", f"FAIL 판정에는 caveat 를 붙이지 않아야 함, 실제={result!r}"
+        assert result == "FAIL"
 
     def test_backward_compat_인자_없으면_PASS(self):
         """기존 _verdict_label(mdd) 단독 호출 — backward compat 확인."""
         result = _verdict_label(Decimal("-0.10"))
-        assert result == "PASS", (
-            f"기존 단독 호출은 backward compat 으로 'PASS' 반환, 실제={result!r}"
-        )
+        assert result == "PASS"
 
 
 # ---------------------------------------------------------------------------
