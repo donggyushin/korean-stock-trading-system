@@ -21,6 +21,7 @@ import pytest
 from stock_agent.broker import (
     BalanceSnapshot,
     Holding,
+    KisClient,
     KisClientError,
     OrderTicket,
     PendingOrder,
@@ -151,6 +152,7 @@ class FakeOrderSubmitter:
         self._poll_count: int = 0
         self.buy_calls: list[tuple[str, int]] = []
         self.sell_calls: list[tuple[str, int]] = []
+        self.cancel_calls: list[str] = []
         self._counter = 0
 
     def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
@@ -187,12 +189,16 @@ class FakeOrderSubmitter:
                     symbol=_SYMBOL_A,
                     side="buy",
                     qty_ordered=10,
+                    qty_filled=0,
                     qty_remaining=10,
                     price=None,
                     submitted_at=_kst(9, 30),
                 )
             ]
         return []
+
+    def cancel_order(self, order_number: str) -> None:
+        self.cancel_calls.append(order_number)
 
 
 class FakeBalanceProvider:
@@ -911,7 +917,7 @@ class TestForceCloseAll:
 # ===========================================================================
 
 
-class TestWaitFill:
+class TestResolveFill:
     """get_pending_orders 시나리오별 체결 대기 동작."""
 
     def test_즉시_체결_sleep_미호출(
@@ -972,15 +978,19 @@ class TestWaitFill:
         exc.step(_kst(9, 32))
         assert len(sleep_calls) == 2
 
-    def test_timeout_ExecutorError(
+    def test_timeout_cancel_order_위임(
         self,
         strategy: ORBStrategy,
         risk_manager: RiskManager,
         fake_balance_provider: FakeBalanceProvider,
         fake_bar_source: FakeBarSource,
     ) -> None:
-        """clock 이 deadline 을 초과하면 ExecutorError."""
-        # clock 이 처음 호출 시 deadline 이 이미 지난 시각 반환
+        """ADR-0015: 타임아웃 시 ExecutorError 를 raise 하지 않고
+        cancel_order(order_number) 를 호출한 뒤 step 을 정상 완료한다.
+
+        이전 계약(ExecutorError raise) → 새 계약(cancel_order 위임) 회귀 방지.
+        """
+        # clock 이 처음 호출 시 deadline 이 이미 지난 시각 반환 (zero fill 유도)
         tick = [_kst(9, 30), _kst(9, 30, 31)]  # initial + after 30s timeout
 
         def advancing_clock() -> datetime:
@@ -988,7 +998,8 @@ class TestWaitFill:
                 return tick.pop(0)
             return tick[0]
 
-        submitter = FakeOrderSubmitter(fill_after=999)  # 절대 체결 안 됨
+        # FakeOrderSubmitterWithPartialFill(partial_fill_qty=0) — zero fill 시뮬레이션
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=0)
         cfg = ExecutorConfig(order_fill_timeout_s=30.0, order_poll_interval_s=0.001)
 
         exc = _make_executor(
@@ -1008,8 +1019,14 @@ class TestWaitFill:
         breakout = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
         fake_bar_source.set_bars(_SYMBOL_A, [breakout])
 
-        with pytest.raises(ExecutorError, match="타임아웃"):
-            exc.step(_kst(9, 32))
+        # ADR-0015: ExecutorError 를 raise 하지 않고 step 이 정상 반환되어야 한다
+        report = exc.step(_kst(9, 32))
+        assert report is not None, "타임아웃 후에도 StepReport 를 반환해야 한다"
+
+        # cancel_order 가 제출된 order_number 로 정확히 1회 호출되어야 한다
+        msg = f"타임아웃 시 cancel_order 가 1회 호출되어야 한다 (got {submitter.cancel_calls})"
+        assert len(submitter.cancel_calls) == 1, msg
+        assert submitter.cancel_calls[0] == submitter._last_order_number
 
 
 # ===========================================================================
@@ -2875,6 +2892,1463 @@ class TestExecutorLastSweepEventsSnapshot:
         snapshot = exc.last_sweep_entry_events
         # tuple 은 in-place mutation 이 없으므로 append 시도 시 AttributeError
         assert not hasattr(snapshot, "append"), "tuple 에 append 가 없어야 함"
+
+
+# ===========================================================================
+# ADR-0015: 부분체결 정책 (RED — cancel_order Protocol + _resolve_fill 미구현)
+# ===========================================================================
+# 아래 테스트들은 ADR-0015 결정 3~6 을 검증한다.
+# src 구현 전이라 모두 실패(RED) 상태여야 한다.
+#
+# 실패 예상:
+#   - FakeOrderSubmitter 에 cancel_order / partial_fill_qty 미구현
+#     → AttributeError 또는 TypeError
+#   - OrderSubmitter Protocol 에 cancel_order 미선언
+#     → hasattr 단언 FAIL
+#   - LiveOrderSubmitter / DryRunOrderSubmitter 에 cancel_order 미구현
+#     → AttributeError
+#   - Executor._wait_fill 이 여전히 타임아웃 시 ExecutorError raise
+#     → 부분체결 시나리오에서 pytest.raises(ExecutorError) 가 통과 대신
+#       assert EntryEvent.qty == filled_qty 가 FAIL
+# ===========================================================================
+
+
+class FakeOrderSubmitterWithPartialFill:
+    """ADR-0015 부분체결 시뮬레이션 더블.
+
+    ``partial_fill_qty`` 설정 시 ``get_pending_orders()`` 가 타임아웃 전까지
+    ``qty_filled=partial_fill_qty`` 인 PendingOrder 를 반환한다.
+    ``cancel_order(order_number)`` 호출 시 해당 번호를 ``_cancelled_numbers`` 에
+    추가해 이후 ``get_pending_orders()`` 에서 제외한다.
+
+    기존 ``FakeOrderSubmitter`` 를 확장하지 않고 별도 클래스로 정의한다 —
+    기존 픽스처의 동작을 변경하지 않기 위함.
+    """
+
+    def __init__(self, *, partial_fill_qty: int | None = None) -> None:
+        self._partial_fill_qty = partial_fill_qty
+        self._counter = 0
+        self._last_order_number: str | None = None
+        self._last_qty: int = 0
+        self._cancelled_numbers: set[str] = set()
+        self.buy_calls: list[tuple[str, int]] = []
+        self.sell_calls: list[tuple[str, int]] = []
+        # cancel_order 가 호출된 order_number 목록 (검증용)
+        self.cancel_calls: list[str] = []
+
+    def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+        self._counter += 1
+        self.buy_calls.append((symbol, qty))
+        self._last_qty = qty
+        self._last_order_number = f"ORD-BUY-{self._counter:04d}"
+        return OrderTicket(
+            order_number=self._last_order_number,
+            symbol=symbol,
+            side="buy",
+            qty=qty,
+            price=None,
+            submitted_at=_kst(9, 30),
+        )
+
+    def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+        self._counter += 1
+        self.sell_calls.append((symbol, qty))
+        self._last_qty = qty
+        self._last_order_number = f"ORD-SELL-{self._counter:04d}"
+        return OrderTicket(
+            order_number=self._last_order_number,
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            price=None,
+            submitted_at=_kst(9, 30),
+        )
+
+    def get_pending_orders(self) -> list[PendingOrder]:
+        """취소된 주문은 제외. 미취소 주문은 partial_fill_qty 기반으로 반환."""
+        if self._last_order_number is None:
+            return []
+        if self._last_order_number in self._cancelled_numbers:
+            return []
+        if self._partial_fill_qty is None:
+            # partial 없음 → 항상 전량 미체결 상태 (fill_after=999 처럼)
+            return [
+                PendingOrder(
+                    order_number=self._last_order_number,
+                    symbol=_SYMBOL_A,
+                    side="buy",
+                    qty_ordered=self._last_qty,
+                    qty_filled=0,
+                    qty_remaining=self._last_qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+            ]
+        # partial_fill_qty 설정 시: 부분체결 상태 반환
+        filled = self._partial_fill_qty
+        remaining = self._last_qty - filled
+        return [
+            PendingOrder(
+                order_number=self._last_order_number,
+                symbol=_SYMBOL_A,
+                side="buy",
+                qty_ordered=self._last_qty,
+                qty_filled=filled,
+                qty_remaining=remaining,
+                price=None,
+                submitted_at=_kst(9, 30),
+            )
+        ]
+
+    def cancel_order(self, order_number: str) -> None:
+        """ADR-0015 결정 3 — OrderSubmitter Protocol 필수 메서드.
+
+        cancel_calls 에 기록 + _cancelled_numbers 에 추가 (멱등).
+        """
+        self.cancel_calls.append(order_number)
+        self._cancelled_numbers.add(order_number)
+
+
+def _setup_orb_entry_bars(
+    strategy: ORBStrategy,
+    fake_bar_source: FakeBarSource,
+    symbol: str = _SYMBOL_A,
+    or_close: int = 49_000,
+    breakout_close: int = 50_100,
+) -> None:
+    """OR 구간 분봉 + 돌파 분봉을 strategy 에 먹이고 bar_source 에 세팅."""
+    for h in range(0, 30):
+        strategy.on_bar(_bar(symbol, 9, h, close=or_close, high=or_close + 500, low=or_close - 500))
+    breakout_bar = _bar(
+        symbol, 9, 31, close=breakout_close, high=breakout_close, low=breakout_close - 100
+    )
+    fake_bar_source.set_bars(symbol, [breakout_bar])
+
+
+def _make_timeout_clock(initial: datetime, after_timeout: datetime) -> list[datetime]:
+    """_wait_fill 타임아웃 유도용 시계 상태 리스트.
+
+    deadline 계산(첫 호출) → 즉시 deadline 초과(두 번째 호출) 시퀀스.
+    """
+    return [initial, after_timeout]
+
+
+class TestOrderSubmitterCancelOrderProtocol:
+    """ADR-0015 결정 3 — OrderSubmitter Protocol 에 cancel_order 메서드 추가.
+
+    현재 Protocol 에 cancel_order 가 없으므로 hasattr 단언이 FAIL 한다.
+    """
+
+    def test_live_order_submitter_cancel_order_KisClient_위임(self) -> None:
+        """LiveOrderSubmitter.cancel_order(order_number) 호출 시
+        KisClient.cancel_order(order_number) 가 동일 인자로 1회 호출된다.
+
+        RED: LiveOrderSubmitter 에 cancel_order 메서드 미구현 → AttributeError.
+        """
+        mock_kis = MagicMock(spec=KisClient)
+        submitter = LiveOrderSubmitter(mock_kis)
+
+        # cancel_order 메서드가 없으면 여기서 AttributeError
+        submitter.cancel_order("ORD-0001")
+
+        mock_kis.cancel_order.assert_called_once_with("ORD-0001")
+
+    def test_dry_run_order_submitter_cancel_order_예외없이_통과(self) -> None:
+        """DryRunOrderSubmitter.cancel_order 는 예외 없이 통과한다 (no-op + info 로그).
+
+        RED: DryRunOrderSubmitter 에 cancel_order 미구현 → AttributeError.
+        """
+        dry = DryRunOrderSubmitter()
+        # 예외 없이 통과해야 한다
+        dry.cancel_order("DRY-0001")
+
+    def test_dry_run_cancel_order_로그_남김(self) -> None:
+        """DryRunOrderSubmitter.cancel_order 는 loguru INFO 로그를 남긴다.
+
+        RED: cancel_order 미구현 시 로그 캡처 자체가 실패.
+        """
+        from loguru import logger
+
+        info_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if msg.record["level"].name == "INFO":
+                info_messages.append(str(msg))
+
+        sink_id = logger.add(_sink, level="INFO")
+        try:
+            dry = DryRunOrderSubmitter()
+            dry.cancel_order("DRY-0001")
+        finally:
+            logger.remove(sink_id)
+
+        # DryRun cancel 은 info 로그를 남겨야 한다
+        assert len(info_messages) >= 1
+
+    def test_live_order_submitter_빈_order_number_KisClient_그대로_위임(self) -> None:
+        """빈 order_number 는 LiveOrderSubmitter 가 검증하지 않고 KisClient 로 위임한다.
+
+        Validation 은 KisClient 책임 — 이중 가드 X.
+        RED: LiveOrderSubmitter.cancel_order 미구현 → AttributeError.
+        """
+        mock_kis = MagicMock(spec=KisClient)
+        submitter = LiveOrderSubmitter(mock_kis)
+
+        submitter.cancel_order("")  # 빈 문자열 그대로 위임
+        mock_kis.cancel_order.assert_called_once_with("")
+
+    def test_order_submitter_protocol_cancel_order_메서드_존재(self) -> None:
+        """FakeOrderSubmitterWithPartialFill 이 cancel_order 를 구현한다.
+
+        Protocol 구조 검증 — hasattr 로 세 클래스 모두 확인.
+        RED: LiveOrderSubmitter / DryRunOrderSubmitter 미구현 시 FAIL.
+        """
+        assert hasattr(LiveOrderSubmitter(MagicMock(spec=KisClient)), "cancel_order")
+        assert hasattr(DryRunOrderSubmitter(), "cancel_order")
+        assert hasattr(FakeOrderSubmitterWithPartialFill(), "cancel_order")
+
+
+class TestExecutorPartialFillEntry:
+    """ADR-0015 결정 4~5 — 진입 부분체결 시 취소 후 체결 수량만 기록.
+
+    현재 _wait_fill 이 타임아웃 시 ExecutorError 를 raise 하므로
+    부분체결 시나리오에서 EntryEvent.qty == filled_qty 단언이 FAIL 한다.
+    """
+
+    def _partial_entry_setup(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+        *,
+        partial_fill_qty: int = 15,
+        withdrawable: int = 10_000_000,
+    ) -> tuple[Executor, FakeOrderSubmitterWithPartialFill]:
+        """부분체결 시뮬레이션 Executor 세팅 헬퍼.
+
+        decision.qty 계산:
+          target_notional = withdrawable × 20% = 10_000_000 × 0.20 = 2_000_000
+          ref_price = 50_100 (breakout_close 기본값)
+          decision.qty = floor(2_000_000 / 50_100) = 39
+          partial_fill_qty=15 < 39 → status="partial" 판정 보장.
+
+        partial_fill_qty 를 decision.qty 보다 작게 유지해야 partial 로그가 남는다.
+        withdrawable=10_000_000 / breakout_close=50_100 기준 decision.qty ≈ 39.
+        """
+        # 잔고를 충분히 크게 주입해 decision.qty 가 partial_fill_qty 보다 크게 만든다
+        fake_balance_provider.set_balance(_empty_balance(withdrawable=withdrawable))
+
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=partial_fill_qty)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        # 타임아웃 유도: 첫 clock → deadline 계산, 두 번째 clock → deadline 초과
+        tick = [_kst(9, 30), _kst(9, 30, 1)]  # 1초 후 → 0.05s timeout 초과
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, withdrawable)
+        _setup_orb_entry_bars(strategy, fake_bar_source)
+        return exc, submitter
+
+    def test_부분체결_EntryEvent_qty는_filled_qty(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """타임아웃 도달 + qty_filled=15 → EntryEvent.qty == 15.
+
+        RED: 현재 _wait_fill 이 ExecutorError raise → report 에 entry_events 없음.
+        decision.qty ≈ 39 (withdrawable=10_000_000, ref_price≈50_100, risk_pct=20%).
+        partial_fill_qty=15 < 39 → status="partial" 판정 보장.
+        """
+        exc, submitter = self._partial_entry_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source, partial_fill_qty=15
+        )
+
+        report = exc.step(_kst(9, 32))
+
+        assert len(report.entry_events) == 1, "부분체결도 EntryEvent 1개여야 한다"
+        ev = report.entry_events[0]
+        assert ev.qty == 15, f"체결 수량은 filled_qty=15 이어야 한다 (got {ev.qty})"
+
+    def test_부분체결_RiskManager_active_positions_filled_qty로_기록(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """RiskManager.active_positions[0].qty == filled_qty.
+
+        RED: ExecutorError 로 인해 record_entry 미호출 → active_positions 비어있음.
+        """
+        exc, _ = self._partial_entry_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source, partial_fill_qty=15
+        )
+        exc.step(_kst(9, 32))
+
+        assert len(risk_manager.active_positions) == 1
+        assert risk_manager.active_positions[0].qty == 15
+
+    def test_부분체결_cancel_order_1회_호출(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """타임아웃 → cancel_order(order_number) 정확히 1회 호출.
+
+        RED: _wait_fill 에 cancel_order 호출 로직 없음 → cancel_calls 비어있음.
+        """
+        exc, submitter = self._partial_entry_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source, partial_fill_qty=15
+        )
+        exc.step(_kst(9, 32))
+
+        msg = f"cancel_order 가 정확히 1회 호출되어야 한다 (got {submitter.cancel_calls})"
+        assert len(submitter.cancel_calls) == 1, msg
+        # 취소된 번호가 실제 제출한 주문번호와 일치해야 한다
+        assert submitter.cancel_calls[0] == submitter._last_order_number
+
+    def test_부분체결_orders_submitted_카운트됨(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """부분이라도 submit_buy 는 1회 — orders_submitted == 1.
+
+        RED: ExecutorError 로 인해 step 이 실패하면 report 자체가 없어 단언 불가.
+        """
+        exc, _ = self._partial_entry_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source, partial_fill_qty=15
+        )
+        report = exc.step(_kst(9, 32))
+
+        assert report.orders_submitted == 1
+
+    def test_부분체결_warning_로그_포함(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """부분체결 시 WARNING 로그에 'partial' 또는 '부분체결' 포함.
+
+        RED: ExecutorError raise 로 인해 해당 로그가 남겨지지 않음.
+        """
+        from loguru import logger
+
+        warn_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if msg.record["level"].name == "WARNING":
+                text = str(msg)
+                if "partial" in text or "부분체결" in text:
+                    warn_messages.append(text)
+
+        sink_id = logger.add(_sink, level="WARNING")
+        try:
+            exc, _ = self._partial_entry_setup(
+                strategy, risk_manager, fake_balance_provider, fake_bar_source, partial_fill_qty=15
+            )
+            exc.step(_kst(9, 32))
+        finally:
+            logger.remove(sink_id)
+
+        assert len(warn_messages) >= 1, "부분체결 사실을 WARNING 로그로 남겨야 한다"
+
+
+class TestExecutorZeroFillEntry:
+    """ADR-0015 결정 5 — 진입 zero fill 시 기록 없이 return False.
+
+    ExecutorError 를 발생시키지 않아야 한다.
+    현재 _wait_fill 이 타임아웃 시 ExecutorError 를 raise 하므로 전부 FAIL.
+    """
+
+    def _zero_fill_setup(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> tuple[Executor, FakeOrderSubmitterWithPartialFill]:
+        """zero fill 시뮬레이션 — partial_fill_qty=0."""
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=0)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        _setup_orb_entry_bars(strategy, fake_bar_source)
+        return exc, submitter
+
+    def test_zero_fill_ExecutorError_미발생(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """zero fill 시 ExecutorError 를 raise 하지 않는다.
+
+        RED: 현재 _wait_fill 이 타임아웃 시 ExecutorError raise → FAIL.
+        """
+        exc, _ = self._zero_fill_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source
+        )
+        # ExecutorError 가 발생하면 이 단언이 FAIL 한다
+        report = exc.step(_kst(9, 32))
+        assert report is not None
+
+    def test_zero_fill_entry_events_비어있음(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """zero fill → StepReport.entry_events == ().
+
+        RED: ExecutorError 로 인해 report 자체가 없어 단언 불가.
+        """
+        exc, _ = self._zero_fill_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source
+        )
+        report = exc.step(_kst(9, 32))
+
+        assert report.entry_events == ()
+
+    def test_zero_fill_active_positions_비어있음(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """zero fill → record_entry 미호출 → active_positions 비어있음.
+
+        RED: ExecutorError 로 중단되면 active_positions 단언 자체 도달 불가.
+        """
+        exc, _ = self._zero_fill_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source
+        )
+        exc.step(_kst(9, 32))
+
+        assert risk_manager.active_positions == ()
+
+    def test_zero_fill_cancel_order_호출됨(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """zero fill 시에도 cancel_order 가 1회 호출된다.
+
+        RED: cancel_order 로직 미구현 → cancel_calls 비어있음.
+        """
+        exc, submitter = self._zero_fill_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source
+        )
+        exc.step(_kst(9, 32))
+
+        assert len(submitter.cancel_calls) == 1
+
+    def test_zero_fill_orders_submitted_0(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """zero fill → 실질적인 주문 체결 없음 → orders_submitted == 0.
+
+        RED: ExecutorError 로 report 가 없거나, 현재 count 로직이 submit 기준이라 1 반환.
+        """
+        exc, _ = self._zero_fill_setup(
+            strategy, risk_manager, fake_balance_provider, fake_bar_source
+        )
+        report = exc.step(_kst(9, 32))
+
+        assert report.orders_submitted == 0
+
+
+class TestExecutorPartialFillExit:
+    """ADR-0015 결정 6 — 청산 부분체결 시 ExecutorError 승격.
+
+    취소는 raise 전에 시도되어야 한다.
+    현재 _wait_fill 이 타임아웃 시에도 ExecutorError 를 raise 하므로
+    cancel_order 호출 여부 검증이 FAIL 한다.
+    """
+
+    def _enter_position_via_executor(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_bar_source: FakeBarSource,
+        exc: Executor,
+        *,
+        entry_price: Decimal = Decimal("50050"),
+        qty: int = 10,
+    ) -> None:
+        """Executor 우회 진입 세팅 — 청산 테스트용."""
+        for h in range(0, 30):
+            strategy.on_bar(_bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500))
+        strategy.on_bar(_bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000))
+        risk_manager.record_entry(_SYMBOL_A, entry_price, qty, _kst(9, 31))
+
+    def test_청산_부분체결_ExecutorError_raise(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 주문이 부분체결(3주만)되면 ExecutorError 를 raise 한다.
+
+        RED: 현재 _wait_fill 타임아웃 → ExecutorError 는 동일하게 raise 되지만
+             cancel_order 호출 단언이 FAIL 한다.
+        """
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=3)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        self._enter_position_via_executor(strategy, risk_manager, fake_bar_source, exc)
+
+        # 손절 bar 공급 — ExitSignal 유발
+        entry_price = Decimal("50050")
+        stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+    def test_청산_부분체결_cancel_order_호출후_raise(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 부분체결 → cancel_order 호출 후 ExecutorError raise.
+
+        cancel_calls 에 매도 주문번호가 포함되어야 한다.
+        RED: 현재 _wait_fill 에 cancel_order 로직 없음 → cancel_calls 비어있음.
+        """
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=3)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        self._enter_position_via_executor(strategy, risk_manager, fake_bar_source, exc)
+
+        entry_price = Decimal("50050")
+        stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        # ExecutorError raise 전에 cancel_order 가 호출되어야 한다
+        msg = "청산 부분체결 시 cancel_order 가 raise 전에 호출되어야 한다"
+        assert len(submitter.cancel_calls) >= 1, msg
+
+    def test_청산_부분체결_record_exit_미호출(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 부분체결 → ExecutorError raise → record_exit 미호출 → 포지션 유지.
+
+        RED: 현재 동작도 동일하게 ExecutorError raise 되지만 cancel_order 가 없어서
+             cancel_calls 단언이 FAIL 한다. 여기서는 포지션 잔존만 확인.
+        """
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=3)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        self._enter_position_via_executor(strategy, risk_manager, fake_bar_source, exc)
+
+        entry_price = Decimal("50050")
+        stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        # ExecutorError 발생 후 포지션은 여전히 남아있어야 한다 (record_exit 미호출)
+        assert len(risk_manager.active_positions) == 1
+
+
+class TestExecutorZeroFillExit:
+    """ADR-0015 결정 6 — 청산 zero fill 도 ExecutorError 승격."""
+
+    def test_청산_zero_fill_ExecutorError_raise(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 주문이 한 주도 체결되지 않으면 ExecutorError 를 raise 한다.
+
+        RED: 현재 타임아웃 ExecutorError 와 동일 경로이나 cancel_order 가 없어 FAIL.
+        """
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=0)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        for h in range(0, 30):
+            strategy.on_bar(_bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500))
+        strategy.on_bar(_bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000))
+        risk_manager.record_entry(_SYMBOL_A, Decimal("50050"), 10, _kst(9, 31))
+
+        entry_price = Decimal("50050")
+        stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+    def test_청산_zero_fill_cancel_order_호출됨(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 zero fill 시에도 cancel_order 가 호출된다.
+
+        RED: cancel_order 로직 미구현 → cancel_calls 비어있음.
+        """
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=0)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        for h in range(0, 30):
+            strategy.on_bar(_bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500))
+        strategy.on_bar(_bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000))
+        risk_manager.record_entry(_SYMBOL_A, Decimal("50050"), 10, _kst(9, 31))
+
+        entry_price = Decimal("50050")
+        stop_price = entry_price * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        assert len(submitter.cancel_calls) >= 1
+
+
+class TestExecutorFullFillStillWorks:
+    """ADR-0015 회귀 방지 — 전량 체결 경로가 부분체결 가드 도입 후에도 정상 동작."""
+
+    def test_full_fill_EntryEvent_qty_결정qty와_일치(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """FakeOrderSubmitter(fill_after=0) — 즉시 전량 체결.
+
+        EntryEvent.qty == decision.qty (cancel_calls 비어있어야 함).
+        GREEN 인 경우 기존 경로 회귀 없음 확인.
+        RED 인 경우: 부분체결 가드 도입 중 기존 경로가 깨진 것.
+        """
+        _ = FakeOrderSubmitterWithPartialFill(partial_fill_qty=None)
+        # partial_fill_qty=None 이면 get_pending_orders 가 항상 미체결 반환 —
+        # 대신 즉시 체결을 위해 직접 _last_order_number 를 없애는 방식 사용 불가.
+        # 따라서 여기서는 기존 FakeOrderSubmitter(fill_after=0) 를 사용한다.
+        submitter_full = FakeOrderSubmitter(fill_after=0)
+        # cancel_calls 속성을 추가해야 함 — FakeOrderSubmitter 에 미구현 시 FAIL
+        # 이 테스트는 기존 FakeOrderSubmitter 에 cancel_order 가 없어도
+        # full fill 경로에서는 cancel_order 가 호출되지 않음을 확인한다.
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter_full,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        _setup_orb_entry_bars(strategy, fake_bar_source)
+
+        report = exc.step(_kst(9, 32))
+
+        assert len(report.entry_events) == 1
+        ev = report.entry_events[0]
+        # 전량 체결이므로 qty 는 decision.qty (RiskManager 가 승인한 수량) 와 일치
+        assert ev.qty == risk_manager.active_positions[0].qty
+        # 전량 체결 경로에서는 cancel_order 가 호출되지 않아야 한다
+        # (FakeOrderSubmitter 에 cancel_calls 가 없으면 AttributeError → FAIL 도 RED)
+        assert not hasattr(submitter_full, "cancel_calls") or submitter_full.cancel_calls == []
+
+
+# ===========================================================================
+# PR #39 리뷰 반영 회귀 방지 테스트
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# A. _FillOutcome.__post_init__ 가드 3종 (refactor-invariant)
+# ---------------------------------------------------------------------------
+
+
+class TestFillOutcomePostInitGuards:
+    """_FillOutcome.__post_init__ 자기정합성 가드 3종 회귀 방지.
+
+    filled_qty < 0, status=='none' but filled_qty != 0,
+    status=='partial' but filled_qty == 0 각각이 RuntimeError 를 발생시킨다.
+    정상 조합(full/N, partial/k>0, none/0)은 통과한다.
+    """
+
+    # _FillOutcome 은 executor 내부 private DTO. 테스트에서는 직접 import 한다.
+    from stock_agent.execution.executor import _FillOutcome  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "filled_qty,status,raises",
+        [
+            # 정상 케이스 — RuntimeError 없음
+            (10, "full", False),
+            (5, "partial", False),
+            (0, "none", False),
+            # 비정상 케이스
+            (-1, "none", True),  # filled_qty < 0
+            (1, "none", True),  # status='none' but filled_qty != 0
+            (0, "partial", True),  # status='partial' but filled_qty == 0
+        ],
+        ids=[
+            "full_10_정상",
+            "partial_5_정상",
+            "none_0_정상",
+            "filled_qty_음수",
+            "none_status_but_filled_nonzero",
+            "partial_status_but_filled_zero",
+        ],
+    )
+    def test_fill_outcome_가드(self, filled_qty: int, status: str, raises: bool) -> None:
+        from stock_agent.execution.executor import _FillOutcome  # type: ignore[attr-defined]
+
+        if raises:
+            with pytest.raises(RuntimeError):
+                _FillOutcome(filled_qty=filled_qty, status=status)  # type: ignore[arg-type]
+        else:
+            outcome = _FillOutcome(filled_qty=filled_qty, status=status)  # type: ignore[arg-type]
+            assert outcome.filled_qty == filled_qty
+            assert outcome.status == status
+
+
+# ---------------------------------------------------------------------------
+# B. _handle_exit 부분/0 체결 → halt 선제 설정 (silent-failure-hunter C1)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleExitHaltOnPartialFill:
+    """청산 부분/0 체결 후 ExecutorError 발생 전 is_halted=True 선제 설정 검증.
+
+    _handle_exit 는 status != 'full' 이면 self._halt = True 를 설정한 다음
+    ExecutorError 를 raise 한다. 이로써 같은 sweep 내 후속 EntrySignal 이
+    is_halted 체크에서 즉시 skip 된다.
+    """
+
+    def _partial_exit_setup(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+        *,
+        partial_fill_qty: int,
+    ) -> tuple[Executor, FakeOrderSubmitterWithPartialFill]:
+        """청산 부분체결 Executor 세팅 헬퍼."""
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=partial_fill_qty)
+        cfg = ExecutorConfig(order_fill_timeout_s=0.05, order_poll_interval_s=0.01)
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # OR → long 상태 + 포지션 직접 등록
+        for h in range(0, 30):
+            strategy.on_bar(_bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500))
+        strategy.on_bar(_bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000))
+        risk_manager.record_entry(_SYMBOL_A, Decimal("50050"), 10, _kst(9, 31))
+
+        # 손절 bar 공급
+        stop_price = Decimal("50050") * (Decimal("1") - Decimal("0.015"))
+        stop_int = int(stop_price)
+        stop_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=stop_int - 100,
+            high=stop_int - 50,
+            low=stop_int - 200,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [stop_bar])
+
+        return exc, submitter
+
+    def test_청산_부분체결_ExecutorError_후_is_halted_True(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 부분체결 → ExecutorError raise 후 executor.is_halted 가 True."""
+        exc, _ = self._partial_exit_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            partial_fill_qty=3,
+        )
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        assert exc.is_halted is True, "청산 부분체결 후 is_halted 가 True 여야 한다"
+
+    def test_청산_zero_fill_ExecutorError_후_is_halted_True(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 zero fill → ExecutorError raise 후 executor.is_halted 가 True."""
+        exc, _ = self._partial_exit_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            partial_fill_qty=0,
+        )
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        assert exc.is_halted is True, "청산 zero fill 후 is_halted 가 True 여야 한다"
+
+    def test_청산_부분체결_후_후속_entry_는_halt로_skip됨(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 부분체결 → halt 선제 → 다음 세션에서 entry 가 is_halted 로 skip.
+
+        ExecutorError 를 catch 한 뒤 start_session 없이 재호출 시
+        is_halted=True 이므로 EntrySignal 이 submit_buy 없이 skip 된다.
+        """
+        exc, submitter = self._partial_exit_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            partial_fill_qty=3,
+        )
+
+        with pytest.raises(ExecutorError):
+            exc.step(_kst(9, 36))
+
+        assert exc.is_halted
+
+        # halt 상태에서 새 진입 시도 — submit_buy 가 호출되지 않아야 한다
+        # (strategy 은 이미 long 진입 이후라 on_time 으로 다시 시그널 나오지 않으므로
+        #  직접 breakout bar 추가해 EntrySignal 유도)
+        # strategy 를 새로 만들어 진입 가능 상태로 초기화
+        new_strategy = ORBStrategy(
+            StrategyConfig(
+                stop_loss_pct=Decimal("0.015"),
+                take_profit_pct=Decimal("0.030"),
+            )
+        )
+        # 새 세션 없이 그대로 step 호출 — is_halted=True 라 entry skip
+        for h in range(0, 30):
+            new_strategy.on_bar(_bar(_SYMBOL_A, 9, h, close=49_000, high=49_500, low=48_500))
+        breakout_bar = _bar(_SYMBOL_A, 9, 31, close=50_100, high=50_100, low=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [breakout_bar])
+        # exc._strategy 를 교체하지 않고 is_halted 상태 자체가 entry 를 막는다는 것을 검증
+        import contextlib
+
+        buy_calls_before = len(submitter.buy_calls)
+        # step 은 risk_manager.session_date 가 여전히 _DATE 로 남아있어 호출 가능
+        # 다른 이유로 실패해도 submit_buy 미호출 여부만 체크
+        with contextlib.suppress(ExecutorError, RuntimeError):
+            exc.step(_kst(9, 37))
+
+        msg = "halt 상태에서는 submit_buy 가 호출되면 안 된다"
+        assert len(submitter.buy_calls) == buy_calls_before, msg
+
+
+# ---------------------------------------------------------------------------
+# C. _resolve_fill cancel 백오프 한계 초과 → halt 선제 설정 (silent-failure-hunter I1)
+# ---------------------------------------------------------------------------
+
+
+class FakeOrderSubmitterWithCancelFail:
+    """cancel_order 가 항상 KisClientError 를 발생시키는 더블.
+
+    partial_fill_qty 수량 부분체결 상태를 유지하면서 취소 자체는 실패한다.
+    _resolve_fill 의 cancel 백오프 한계 초과 경로를 검증하기 위해 사용.
+    """
+
+    def __init__(self, *, partial_fill_qty: int = 5) -> None:
+        self._partial_fill_qty = partial_fill_qty
+        self._counter = 0
+        self._last_order_number: str | None = None
+        self._last_qty: int = 0
+        self.buy_calls: list[tuple[str, int]] = []
+        self.sell_calls: list[tuple[str, int]] = []
+        self.cancel_calls: list[str] = []
+
+    def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+        self._counter += 1
+        self.buy_calls.append((symbol, qty))
+        self._last_qty = qty
+        self._last_order_number = f"ORD-BUY-{self._counter:04d}"
+        return OrderTicket(
+            order_number=self._last_order_number,
+            symbol=symbol,
+            side="buy",
+            qty=qty,
+            price=None,
+            submitted_at=_kst(9, 30),
+        )
+
+    def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+        self._counter += 1
+        self.sell_calls.append((symbol, qty))
+        self._last_qty = qty
+        self._last_order_number = f"ORD-SELL-{self._counter:04d}"
+        return OrderTicket(
+            order_number=self._last_order_number,
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            price=None,
+            submitted_at=_kst(9, 30),
+        )
+
+    def get_pending_orders(self) -> list[PendingOrder]:
+        """부분체결 상태를 항상 반환 (취소 성공 여부와 무관하게)."""
+        if self._last_order_number is None:
+            return []
+        filled = self._partial_fill_qty
+        remaining = self._last_qty - filled
+        if remaining < 0:
+            remaining = 0
+        return [
+            PendingOrder(
+                order_number=self._last_order_number,
+                symbol=_SYMBOL_A,
+                side="buy",
+                qty_ordered=self._last_qty,
+                qty_filled=filled,
+                qty_remaining=remaining,
+                price=None,
+                submitted_at=_kst(9, 30),
+            )
+        ]
+
+    def cancel_order(self, order_number: str) -> None:
+        """항상 KisClientError 를 raise — 취소 실패 시뮬레이션."""
+        self.cancel_calls.append(order_number)
+        raise KisClientError(f"cancel 실패 (시뮬레이션): order_number={order_number}")
+
+
+class TestResolveFillCancelFailure:
+    """_resolve_fill cancel 백오프 한계 초과 시 halt 선제 설정 (silent-failure-hunter I1).
+
+    시나리오:
+    - partial fill setup (filled_qty=k > 0)
+    - cancel_order 가 backoff_max_attempts+1 회 모두 KisClientError 반환
+    - _resolve_fill 은 ExecutorError 를 raise 하지 않고 _FillOutcome(partial, k) 반환
+    - executor._halt = True 선제 설정
+    - CRITICAL 로그 "cancel_failed" 방출
+    """
+
+    def _cancel_fail_setup(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+        *,
+        partial_fill_qty: int = 15,
+        withdrawable: int = 10_000_000,
+        backoff_max_attempts: int = 1,
+    ) -> tuple[Executor, FakeOrderSubmitterWithCancelFail]:
+        """cancel 실패 시나리오 Executor 세팅 헬퍼."""
+        fake_balance_provider.set_balance(_empty_balance(withdrawable=withdrawable))
+
+        submitter = FakeOrderSubmitterWithCancelFail(partial_fill_qty=partial_fill_qty)
+        cfg = ExecutorConfig(
+            order_fill_timeout_s=0.05,
+            order_poll_interval_s=0.01,
+            backoff_max_attempts=backoff_max_attempts,
+            backoff_initial_s=0.001,  # 테스트에서 백오프 지연 최소화
+        )
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, withdrawable)
+        _setup_orb_entry_bars(strategy, fake_bar_source)
+        return exc, submitter
+
+    def test_cancel_백오프_한계_초과시_step_은_StepReport_반환(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """cancel_order 백오프 한계 초과 시 ExecutorError 를 raise 하지 않고
+        StepReport 를 반환해야 한다 (ADR-0015 silent-failure-hunter I1).
+        """
+        exc, _ = self._cancel_fail_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+
+        report = exc.step(_kst(9, 32))
+
+        assert report is not None, "cancel 실패 후에도 StepReport 를 반환해야 한다"
+
+    def test_cancel_백오프_한계_초과시_halt_선제_설정된다(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """cancel_order 백오프 한계 초과 → executor.is_halted == True."""
+        exc, _ = self._cancel_fail_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+
+        exc.step(_kst(9, 32))
+
+        assert exc.is_halted is True, "cancel 백오프 한계 초과 시 halt 가 선제 설정되어야 한다"
+
+    def test_cancel_백오프_한계_초과시_critical_로그_방출(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """cancel_order 백오프 한계 초과 → CRITICAL 로그 'cancel_failed' 포함."""
+        from loguru import logger
+
+        critical_messages: list[str] = []
+
+        def _sink(msg: Any) -> None:
+            if msg.record["level"].name == "CRITICAL":
+                critical_messages.append(msg.record["message"])
+
+        sink_id = logger.add(_sink, level="CRITICAL")
+        try:
+            exc, _ = self._cancel_fail_setup(
+                strategy,
+                risk_manager,
+                fake_balance_provider,
+                fake_bar_source,
+            )
+            exc.step(_kst(9, 32))
+        finally:
+            logger.remove(sink_id)
+
+        msg = f"CRITICAL 'cancel_failed' 로그가 없음. got={critical_messages}"
+        assert any("cancel_failed" in m for m in critical_messages), msg
+
+    def test_cancel_백오프_한계_초과시_filled_qty_가_EntryEvent에_기록됨(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """cancel 실패 후에도 체결된 filled_qty 는 EntryEvent.qty 로 기록된다."""
+        exc, _ = self._cancel_fail_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            partial_fill_qty=15,
+        )
+
+        report = exc.step(_kst(9, 32))
+
+        # cancel 실패 후 filled_qty=15 이 EntryEvent 에 기록되어야 한다
+        assert len(report.entry_events) == 1, "부분체결 + cancel 실패에도 EntryEvent 가 있어야 한다"
+        msg = f"EntryEvent.qty 는 filled_qty=15 이어야 한다 (got {report.entry_events[0].qty})"
+        assert report.entry_events[0].qty == 15, msg
+
+    def test_cancel_백오프_한계_초과시_RiskManager_active_positions에_filled_qty_반영(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """cancel 실패 후 RiskManager.active_positions[0].qty == filled_qty."""
+        exc, _ = self._cancel_fail_setup(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            partial_fill_qty=15,
+        )
+
+        exc.step(_kst(9, 32))
+
+        assert len(risk_manager.active_positions) == 1
+        assert risk_manager.active_positions[0].qty == 15, (
+            f"RiskManager 에 filled_qty=15 가 기록되어야 한다 "
+            f"(got {risk_manager.active_positions[0].qty})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# D. 부분체결 후 reconcile mismatch 없음 + halt 미유지 (refactor-invariant)
+# ---------------------------------------------------------------------------
+
+
+class TestPartialFillReconcileIntegration:
+    """부분체결 후 broker_holdings / risk_holdings 가 일치하면 reconcile mismatch 없음.
+
+    진입 부분체결(filled_qty=k) → RiskManager active_positions qty=k.
+    broker holdings 도 k 로 세팅하면 mismatch_symbols == ().
+    partial entry 는 halt 를 켜지 않는다 (_handle_exit 와 다름).
+    """
+
+    def _partial_entry_and_reconcile(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+        *,
+        filled_qty: int = 15,
+        withdrawable: int = 10_000_000,
+    ) -> tuple[Executor, FakeOrderSubmitterWithPartialFill]:
+        """부분체결 후 broker holdings 를 filled_qty 로 맞춘 Executor 반환."""
+        submitter = FakeOrderSubmitterWithPartialFill(partial_fill_qty=filled_qty)
+        cfg = ExecutorConfig(
+            order_fill_timeout_s=0.05,
+            order_poll_interval_s=0.01,
+        )
+
+        tick = [_kst(9, 30), _kst(9, 30, 1)]
+
+        def advancing_clock() -> datetime:
+            if len(tick) > 1:
+                return tick.pop(0)
+            return tick[0]
+
+        fake_balance_provider.set_balance(_empty_balance(withdrawable=withdrawable))
+
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            clock=advancing_clock,
+            sleep=lambda _: None,
+        )
+        exc.start_session(_DATE, withdrawable)
+        _setup_orb_entry_bars(strategy, fake_bar_source)
+        exc.step(_kst(9, 32))
+
+        # 진입 완료 후 broker holdings 를 filled_qty 로 맞춤
+        fake_balance_provider.set_balance(_balance_with_holding(_SYMBOL_A, qty=filled_qty))
+        return exc, submitter
+
+    def test_부분체결_후_reconcile_mismatch_없음(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """부분체결 후 broker_holdings == filled_qty, risk_holdings == filled_qty
+        이면 mismatch_symbols == ().
+        """
+        exc, _ = self._partial_entry_and_reconcile(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            filled_qty=15,
+        )
+
+        report = exc.reconcile()
+
+        msg = f"broker=risk=15 이면 mismatch 없어야 한다 (got {report.mismatch_symbols})"
+        assert report.mismatch_symbols == (), msg
+
+    def test_부분체결_후_halt_유지되지_않음(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """진입 부분체결은 _handle_exit 와 달리 halt 를 선제 설정하지 않는다."""
+        exc, _ = self._partial_entry_and_reconcile(
+            strategy,
+            risk_manager,
+            fake_balance_provider,
+            fake_bar_source,
+            filled_qty=15,
+        )
+
+        # 부분체결 후 is_halted 가 False 이어야 한다
+        # (cancel 실패가 없는 일반 부분체결 경로)
+        assert exc.is_halted is False, "진입 부분체결 자체는 halt 를 켜지 않는다"
+
+
+# ---------------------------------------------------------------------------
+# E. force_close 다중 심볼 부분청산 상호작용 (skip — 후속 PR)
+# ---------------------------------------------------------------------------
+
+
+class TestForceCloseAllPartialFillInterop:
+    """force_close_all 에서 여러 심볼 중 1개만 부분청산 ExecutorError 시 상호작용.
+
+    이 케이스는 현재 _open_lots 순회 순서·_process_signals 예외 전파 지점에 따라
+    검증 복잡도가 높아 즉시 GREEN 을 보장하기 어렵다.
+    후속 PR 에서 구현 의도를 명시하고 skip 으로 등록한다.
+    """
+
+    @pytest.mark.skip(reason="force_close 다중 심볼 부분체결 상호작용 — 후속 PR")
+    def test_force_close_부분체결_심볼은_ExecutorError_하지만_다른_심볼_청산은_정상진행(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """force_close_all 이 한 심볼의 ExecutorError 로 중단되지만,
+        그 전에 체결된 다른 심볼의 ExitEvent 는 last_sweep_exit_events 로 조회 가능.
+
+        현재 _open_lots 순회 순서·_process_signals 예외 전파 지점에 따라
+        검증 복잡도가 달라 후속 PR 에서 구현 설계 확정 후 GREEN 전환.
+        """
+        # 이 테스트는 skip 되므로 본문 구현 불필요.
+        pass
 
 
 # ---------------------------------------------------------------------------

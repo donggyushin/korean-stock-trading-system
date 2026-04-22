@@ -298,4 +298,8 @@ pytest **245 → 324 → 384 → 464 → 477 → 539 → 542건 green** (기존 
 
 [x] `src/stock_agent/storage/` 패키지 신설. `TradingRecorder` Protocol(`@runtime_checkable`) + `SqliteTradingRecorder` + `NullTradingRecorder` + `StorageError`. 단일 파일 DB `data/trading.db`(historical `data/stock_agent.db` 와 별개). 스키마 v1: `orders`/`daily_pnl`/`schema_version` 3 테이블 + 2 인덱스. PRAGMA: WAL(파일 전용)/NORMAL/foreign_keys ON. autocommit + 스키마 init 한정 `BEGIN IMMEDIATE`. 실패 정책: `record_*` silent fail + 연속 실패 dedupe 경보(`monitor/notifier.py` 패턴 재사용), 생성자 실패만 `StorageError` raise → `NullTradingRecorder` 폴백(`_default_recorder_factory`). `EntryEvent`·`ExitEvent` 에 `order_number: str` 필드 추가. `main.py` 확장: `Runtime.recorder`, `_default_recorder_factory`, 콜백 4종에 `recorder.record_*` 삽입, `_graceful_shutdown`/`finally` 멱등 `close()`. 의존성 추가 없음(stdlib `sqlite3`). ADR-0013.
 
+### Phase 3 다섯 번째 산출물 — broker 체결조회 + 부분체결 정책 (2026-04-22)
+
+[x] ADR-0015 적용. `KisClient.cancel_order(order_number) -> None` 신설 + `PendingOrder.qty_filled: int` 필드 추가. `_to_pending_order` 가 PyKis 정식 필드 우선 매핑 → `qty_remaining` fallback. `execution/executor.py`: `OrderSubmitter.cancel_order` Protocol 확장 + `_resolve_fill(ticket) -> _FillOutcome` 교체 (타임아웃 시 `cancel_order` + 부분/0 체결 수습) + `_handle_entry` 부분체결 → `filled_qty` 만 기록, 0 체결 → skip + `_handle_exit` 부분/0 체결 → `ExecutorError`. 의존성 추가 없음.
+
 **Phase 3 코드 산출물 전부 완료. PASS 선언은 모의투자 환경 연속 10영업일 무중단 + 0 unhandled error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신 후.**

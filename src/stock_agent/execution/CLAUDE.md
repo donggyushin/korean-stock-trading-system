@@ -30,6 +30,16 @@ stock-agent 의 오케스트레이션 경계 모듈. `ORBStrategy` (시그널) +
 빈 문자열·naive timestamp·qty≤0·price≤0 → `RuntimeError`).
 `_handle_entry`/`_handle_exit` 가 `ticket.order_number` 를 주입.
 
+**Phase 3 다섯 번째 산출물(broker 체결조회 + 부분체결 정책, ADR-0015) 완료(2026-04-22)에 따른 확장**:
+`OrderSubmitter` Protocol 에 `cancel_order(order_number: str) -> None` 추가.
+`LiveOrderSubmitter.cancel_order` (KisClient 위임) + `DryRunOrderSubmitter.cancel_order` (info 로그 + no-op).
+내부 `_FillOutcome` DTO 신설 (`filled_qty: int`, `status: Literal["full","partial","none"]`).
+`_wait_fill` → `_resolve_fill(ticket) -> _FillOutcome` 교체 — 타임아웃 시 `cancel_order` 호출 + 부분/0 체결 수습.
+`_handle_entry`: partial → `filled_qty` 만 `record_entry` + `EntryEvent.qty=filled_qty` + warning 로그.
+zero → skip + info 로그 + `return False` (RiskManager 미기록).
+`_handle_exit`: `status != "full"` → `ExecutorError` 승격 (운영자 개입 유도).
+`StepReport` 구조는 변경 없음 — `entry_events.qty` 가 실체결 수량으로 해석됨(계약 의미 명확화).
+
 Phase 3 PASS 선언은 모의투자 환경에서 **연속 10영업일 무중단 + 0 unhandled
 error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 본 PR 은 그
 조건 중 단 하나도 자동으로 충족하지 않는다 — 이번 PR 의 산출은 단위 테스트로
@@ -42,8 +52,8 @@ error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 
 | APScheduler 스케줄링 | `main.py` | `Executor.step(now)` 만 노출 — 호출 주기는 외부 책임 |
 | ~~텔레그램 알림~~ | ~~`monitor/notifier.py`~~ | **완료 2026-04-21** — [monitor/CLAUDE.md](../monitor/CLAUDE.md) 참조 |
 | ~~SQLite 영속화~~ | ~~`storage/db.py`~~ | **완료 2026-04-22** — [storage/CLAUDE.md](../storage/CLAUDE.md) 참조 |
-| KIS 체결조회 API | `broker/` 확장 | 실체결가 정확도 향상 (현재 슬리피지 0.1% 가정) |
-| 부분체결 잔량 처리 | `broker/cancel_order` 등 | 시장가 즉시 전량 체결 가정 |
+| ~~KIS 체결조회 API~~ | ~~`broker/` 확장~~ | **완료 2026-04-22** (ADR-0015) — [broker/CLAUDE.md](../broker/CLAUDE.md) 참조 |
+| ~~부분체결 잔량 처리~~ | ~~`broker/cancel_order` 등~~ | **완료 2026-04-22** (ADR-0015) — `_resolve_fill` + `cancel_order` 통합 |
 | `config/strategy.yaml` 로더 | `main.py` 진입 시 | 현재 코드 상수 + 생성자 주입 |
 
 ## 핵심 결정 — Protocol 의존성 역전
@@ -228,11 +238,13 @@ last_reconcile: ReconcileReport | None   # property, read-only
 3. `risk_manager.evaluate_entry(signal, available_cash)` — 거부면 종료
    (RiskManager 가 이미 사유 로그).
 4. 승인이면 `_with_backoff(submit_buy)` → `OrderTicket`.
-5. `_wait_fill(ticket)` — 시장가 즉시 체결 가정, timeout → `ExecutorError`.
+5. `outcome = _resolve_fill(ticket)` — 타임아웃 시 `cancel_order` 호출 + 부분/0 체결
+   수습 (ADR-0015). `status == "none"` → 즉시 skip, `return False` (RiskManager 미기록).
 6. `entry_fill_price = buy_fill_price(signal.price, slippage_rate)` —
    `backtest.costs.buy_fill_price` 재사용.
-7. `risk_manager.record_entry(symbol, entry_fill_price, qty, now)` +
-   `_open_lots[symbol] = _OpenLot(entry_fill_price, qty)`.
+7. `risk_manager.record_entry(symbol, entry_fill_price, outcome.filled_qty, now)` +
+   `_open_lots[symbol] = _OpenLot(entry_fill_price, outcome.filled_qty)`. `status ==
+   "partial"` 이면 warning 로그 (잔량 취소 완료, 체결분만 기록).
 
 ## ExitSignal 처리
 
@@ -240,7 +252,9 @@ last_reconcile: ReconcileReport | None   # property, read-only
    외부에서 직접 `record_entry` 한 경우(테스트·수동 시나리오) 호환. 둘 다 없으면
    `ExecutorError` (전략-Executor 동기화 위반).
 2. `_with_backoff(submit_sell)` → `OrderTicket`.
-3. `_wait_fill(ticket)`.
+3. `outcome = _resolve_fill(ticket)` — `status != "full"` 이면 `self._halt = True`
+   선제 설정 + `ExecutorError` 승격 (ADR-0015 — 브로커 잔고가 일부만 감소한 상태로
+   남아 다음 `reconcile()` 가 mismatch 감지까지 기다리지 않고 즉시 halt).
 4. `exit_fill_price = sell_fill_price(signal.price, slippage_rate)`.
 5. PnL 계산 — 백테스트 엔진과 동일 산식 (`buy_commission` + `sell_commission`
    + `sell_tax` 모두 `backtest.costs` 재사용):
@@ -289,14 +303,20 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
 `get_balance` / `get_pending_orders` / `submit_buy` / `submit_sell` 모두
 이 래퍼를 통과한다 — 일시적 네트워크 장애가 단발 step 을 자동 죽이지 않게.
 
-## 시장가 체결가 추정 (V0)
+## 시장가 체결가 추정 및 부분체결 정책 (ADR-0015)
 
-현재 PR 은 KIS 체결조회 API 통합을 의도적으로 분리한다. 체결가는 시그널 가격
-(분봉 close, 참고가) 에 슬리피지 ±0.1% 를 적용해 추정한다 — 백테스트 비용
-모델과 동일 가정으로, 백테스트 결과의 실전 괴리를 추적 가능한 한 가지 변수로
-유지하기 위해서. 모의투자 2주 운영에서 측정된 실제 슬리피지가 0.1% 와 크게
-다르면 후속 PR 에서 (a) 실체결가 회수 API 도입 또는 (b) `slippage_rate`
-설정값 조정을 진행한다.
+체결가는 시그널 가격(분봉 close, 참고가) 에 슬리피지 ±0.1% 를 적용해 추정한다 —
+백테스트 비용 모델과 동일 가정으로, 백테스트 결과의 실전 괴리를 추적 가능한
+한 가지 변수로 유지하기 위해서.
+
+부분체결·미체결 정책 (ADR-0015 적용):
+- `_resolve_fill(ticket) -> _FillOutcome` 이 `get_pending_orders()` 폴링으로 체결 상태를 확인.
+- 타임아웃 시 `cancel_order(order_number)` 호출 후 잔량 취소 + 부분/0 체결 수습.
+- 진입 부분체결: `filled_qty` 만 원장 기록 + warning 로그. 0 체결: skip + info 로그.
+- 청산 부분/0 체결: `ExecutorError` 승격 (운영자 개입 유도 — 미청산 포지션 리스크).
+
+모의투자 2주 운영에서 측정된 실제 슬리피지가 0.1% 와 크게 다르면 후속 PR 에서
+`slippage_rate` 설정값 조정을 진행한다.
 
 ## 분봉 처리 idempotent
 
@@ -323,7 +343,7 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
   CLAUDE.md 하드 규칙, `.claude/hooks/tests-writer-guard.sh` fail-closed).
 - 관련 테스트 파일: `tests/test_executor.py`. 카테고리: 공개 심볼 노출,
   ExecutorConfig 검증, 생성·세션, step 가드, EntrySignal 승인·거부·로그,
-  ExitSignal 승인·무결성·fallback 로그, force_close, 체결 대기(_wait_fill),
+  ExitSignal 승인·무결성·fallback 로그, force_close, 체결 확정(_resolve_fill),
   DryRunOrderSubmitter, reconcile(일치·mismatch·critical 로그·ReconcileReport
   immutability), halt 가시성·영속성·start_session 리셋, KisClientError 백오프,
   에러 좁힘, 멀티 심볼, 분봉 idempotent, StepReport/ReconcileReport 구조,
@@ -349,11 +369,9 @@ generic `except Exception` 금지. `assert` 대신 명시적 예외. broker/stra
 ## 범위 제외 (의도적 defer)
 
 - **APScheduler 도입** — `step(now)` 만 노출. 외부 스케줄러 책임.
-- **텔레그램 알림** — `monitor/notifier.py` (후속 PR).
-- **부분체결 잔량 취소·재발주** — `KisClient.cancel_order` 미구현. 시장가 주문
-  통상 즉시 전량 체결되는 KIS 동작 가정. 후속 PR.
-- **KIS 체결조회 API 통합** — 실체결가 정확도 향상. broker 확장 별도 PR.
-  현재는 슬리피지 0.1% 추정.
+- **텔레그램 알림** — `monitor/notifier.py` 완료 (2026-04-21).
+- **부분체결 잔량 취소·재발주** — `_resolve_fill` + `cancel_order` 통합으로 완료 (2026-04-22, ADR-0015).
+- **KIS 체결조회 API 통합** — `PendingOrder.qty_filled` + `cancel_order` 통합으로 완료 (2026-04-22, ADR-0015). 현재 슬리피지 0.1% 추정은 유지 — 모의투자 2주 운영 후 실측값으로 재검토.
 - **자동 포지션 복구** — reconcile 불일치 시 자동 보정 금지. 운영자 개입 +
   다음 세션 `start_session` 으로 리셋만 허용.
 - **`config/strategy.yaml` YAML 로더** — `main.py` 착수 시 도입. 현재는

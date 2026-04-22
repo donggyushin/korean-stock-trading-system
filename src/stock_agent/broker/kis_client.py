@@ -81,15 +81,49 @@ class OrderTicket:
 
 @dataclass(frozen=True, slots=True)
 class PendingOrder:
-    """미체결(또는 부분체결 잔량) 주문 1건."""
+    """미체결(또는 부분체결 잔량) 주문 1건.
+
+    `qty_filled` 는 체결된 수량, `qty_remaining` 은 남은 미체결 수량.
+    PyKis 정식 필드(`executed_quantity`, `pending_quantity`) 를 우선 매핑하고,
+    없을 때만 `qty_remaining` attribute fallback 을 사용한다 (ADR-0015).
+
+    불변식 (`__post_init__` 검증):
+    - `qty_ordered > 0`
+    - `qty_filled >= 0`, `qty_remaining >= 0`
+    - `qty_filled + qty_remaining == qty_ordered`
+
+    위반 시 `RuntimeError` — `_to_pending_order` 매핑 버그를 조기에 차단해
+    `_resolve_fill` 판정의 silent 오동작 방지.
+    """
 
     order_number: str
     symbol: str
     side: Literal["buy", "sell"]
     qty_ordered: int
+    qty_filled: int
     qty_remaining: int
     price: int | None
     submitted_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.qty_ordered <= 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_ordered 는 양수여야 합니다 (got={self.qty_ordered})"
+            )
+        if self.qty_filled < 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_filled 는 0 이상이어야 합니다 (got={self.qty_filled})"
+            )
+        if self.qty_remaining < 0:
+            raise RuntimeError(
+                f"PendingOrder.qty_remaining 는 0 이상이어야 합니다 (got={self.qty_remaining})"
+            )
+        if self.qty_filled + self.qty_remaining != self.qty_ordered:
+            raise RuntimeError(
+                f"PendingOrder: qty_filled({self.qty_filled}) + qty_remaining"
+                f"({self.qty_remaining}) != qty_ordered({self.qty_ordered}) — "
+                "필드 매핑 불일치"
+            )
 
 
 class KisClient:
@@ -249,6 +283,52 @@ class KisClient:
             return []
         return [_to_pending_order(o) for o in result]
 
+    def cancel_order(self, order_number: str) -> None:
+        """주문번호로 미체결 잔량 취소. 멱등(이미 체결·취소 시 no-op + info 로그).
+
+        내부적으로 `account().pending_orders()` 를 재조회해 `order_number` 매칭
+        엔트리의 PyKis `.cancel()` 을 호출한다. 매칭 실패 = 이미 체결 또는 이미
+        취소된 상태이므로 조용히 성공 처리.
+
+        Args:
+            order_number: 취소 대상 주문번호. 빈 문자열은 사전 거부.
+
+        Raises:
+            KisClientError: `order_number` 가 빈 문자열, close 후 호출, 라이브러리 예외.
+            RuntimeError: paper guard 위반 등 설정 오류 (그대로 전파).
+        """
+        if not order_number:
+            raise KisClientError(
+                "cancel_order: order_number 가 비어 있어 취소 대상을 특정할 수 없습니다."
+            )
+
+        self._order_rate_limiter.acquire(f"cancel {order_number}")
+
+        def _do() -> None:
+            pending = self._kis.account().pending_orders() or ()
+            for entry in pending:
+                entry_number = str(getattr(entry, "number", "") or "")
+                if entry_number == order_number:
+                    cancel_method = getattr(entry, "cancel", None)
+                    if not callable(cancel_method):
+                        raise KisClientError(
+                            "cancel_order: 매칭된 미체결 항목에 cancel() 이 없습니다. "
+                            f"order_number={order_number}"
+                        )
+                    cancel_method()
+                    return
+            # 매칭 실패 경로 — "이미 체결 또는 취소됨" (멱등 의도) 과
+            # "애초에 존재하지 않는 주문번호" 를 구분할 수 없다. 후자는
+            # 호출 측 버그이므로 warning 으로 승격해 운영 로그 grep 가시성
+            # 확보 (silent-failure-hunter C2).
+            logger.warning(
+                "broker.cancel.not_pending order_number={n} — "
+                "이미 체결 또는 취소됨(멱등) 또는 존재하지 않는 주문번호",
+                n=order_number,
+            )
+
+        self._call(f"주문 취소 order_number={order_number}", _do)
+
     def close(self) -> None:
         """리소스 정리. 멱등. 라이브러리 close 실패는 warning 로그만."""
         if self._closed:
@@ -316,13 +396,26 @@ def _to_pending_order(order: Any) -> PendingOrder:
     submitted_at = submitted_raw if isinstance(submitted_raw, datetime) else datetime.now(UTC)
 
     qty = int(getattr(order, "qty", 0))
-    remaining = int(getattr(order, "qty_remaining", qty))
+    # PyKis 정식 필드(`executed_quantity`, `pending_quantity`) 를 우선 매핑.
+    # 없으면 테스트 호환을 위해 `qty_remaining` attribute fallback.
+    executed_raw = getattr(order, "executed_quantity", None)
+    pending_raw = getattr(order, "pending_quantity", None)
+    if executed_raw is not None:
+        filled = int(executed_raw)
+        remaining = int(pending_raw) if pending_raw is not None else max(0, qty - filled)
+    elif (remaining_raw := getattr(order, "qty_remaining", None)) is not None:
+        remaining = int(remaining_raw)
+        filled = max(0, qty - remaining)
+    else:
+        filled = 0
+        remaining = qty
 
     return PendingOrder(
         order_number=str(getattr(order, "number", "") or ""),
         symbol=str(getattr(order, "symbol", "")),
         side=side,
         qty_ordered=qty,
+        qty_filled=filled,
         qty_remaining=remaining,
         price=price,
         submitted_at=submitted_at,
