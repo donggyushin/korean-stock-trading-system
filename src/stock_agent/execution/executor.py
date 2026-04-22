@@ -32,7 +32,7 @@
 from __future__ import annotations
 
 import time as _time_module
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -56,7 +56,7 @@ from stock_agent.broker import (
 )
 from stock_agent.broker.kis_client import KisClient
 from stock_agent.data import MinuteBar
-from stock_agent.risk import RiskManager
+from stock_agent.risk import PositionRecord, RiskManager
 from stock_agent.strategy import EntrySignal, ExitReason, ExitSignal, ORBStrategy, Signal
 
 KST = timezone(timedelta(hours=9))
@@ -101,6 +101,30 @@ class BarSource(Protocol):
     """분봉 조회 경계. `RealtimeDataStore` 가 자연스럽게 만족."""
 
     def get_minute_bars(self, symbol: str) -> list[MinuteBar]: ...
+
+
+class OpenPositionInput(Protocol):
+    """Issue #33 — `Executor.restore_session` 이 받는 오픈 포지션 구조적 타입.
+
+    `storage.OpenPositionRow` 가 자연스럽게 만족한다. Protocol 로 둠으로써
+    `execution` → `storage` 역방향 import 를 피한다 (`storage/db.py` 가 이미
+    `execution.EntryEvent/ExitEvent` 를 import 하므로 순환 회피).
+    """
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def qty(self) -> int: ...
+
+    @property
+    def entry_price(self) -> Decimal: ...
+
+    @property
+    def entry_ts(self) -> datetime: ...
+
+    @property
+    def order_number(self) -> str: ...
 
 
 # ---- 라이브 어댑터 -------------------------------------------------------
@@ -406,10 +430,100 @@ class Executor:
         self._last_processed_bar_time.clear()
         self._open_lots.clear()
         self._halt = False
+        self._last_reconcile = None
         logger.info(
             "executor.start_session date={d} capital={c}",
             d=session_date,
             c=starting_capital_krw,
+        )
+
+    def restore_session(
+        self,
+        session_date: date,
+        starting_capital_krw: int,
+        *,
+        open_positions: Sequence[OpenPositionInput],
+        closed_symbols: Sequence[str] = (),
+        entries_today: int,
+        daily_realized_pnl_krw: int,
+    ) -> None:
+        """Issue #33 — 세션 중간 재기동 시 Executor 상태 복원.
+
+        `start_session` 은 "0 으로 리셋" 이지만 본 메서드는 DB 재생 결과를
+        직접 주입한다. 흐름:
+
+        1. `RiskManager.restore_session` — active_positions · entries_today ·
+           daily_realized_pnl_krw 복원.
+        2. `_open_lots` 를 open_positions 로 초기화 — 후속 ExitSignal 이 들어
+           왔을 때 PnL 계산이 원래 진입가 기준으로 동작하도록.
+        3. `ORBStrategy.restore_long_position` 을 오픈 포지션별 호출 — 이후
+           분봉 처리에서 손절/익절 판정이 원래 진입가 기준으로 동작.
+        4. `ORBStrategy.mark_session_closed` 를 당일 이미 청산된 심볼별 호출
+           — 당일 재돌파에도 재진입 차단 (1일 1심볼 1회 진입 계약 보존).
+        5. `_halt`/`_last_processed_bar_time` 리셋. `_last_reconcile` 는
+           None — 재기동 후 첫 step 에서 reconcile 이 다시 실행돼 잔고/RM
+           일관성을 재검증.
+
+        `closed_symbols ∩ open_positions.symbols` 는 무시(open 쪽 우선) — 정상
+        경로에선 발생하지 않음. 발생 시 storage 데이터 이상이므로 warning.
+
+        Args:
+            session_date: 복원 대상 세션 날짜.
+            starting_capital_krw: 세션 시작 자본. `RiskManager` 가 검증.
+            open_positions: `storage.load_open_positions` 결과.
+            closed_symbols: `storage.load_daily_pnl().closed_symbols`.
+            entries_today: 당일 총 진입 횟수 (청산 포함).
+            daily_realized_pnl_krw: 당일 실현손익 누계.
+
+        Raises:
+            RuntimeError: RiskManager 가 입력 검증에서 거부한 경우 (자본·
+                entries·symbol 형식·중복). ORBStrategy 검증 실패도 전파.
+        """
+        position_records = [
+            PositionRecord(
+                symbol=p.symbol,
+                entry_price=p.entry_price,
+                qty=p.qty,
+                entry_ts=p.entry_ts,
+            )
+            for p in open_positions
+        ]
+        self._risk_manager.restore_session(
+            session_date,
+            starting_capital_krw,
+            open_positions=position_records,
+            entries_today=entries_today,
+            daily_realized_pnl_krw=daily_realized_pnl_krw,
+        )
+        self._last_processed_bar_time.clear()
+        self._open_lots = {
+            p.symbol: _OpenLot(entry_price=p.entry_price, qty=p.qty) for p in open_positions
+        }
+        self._halt = False
+        self._last_reconcile = None
+        open_symbols = {p.symbol for p in open_positions}
+        for pos in open_positions:
+            self._strategy.restore_long_position(pos.symbol, pos.entry_price, pos.entry_ts)
+        overlap = open_symbols.intersection(closed_symbols)
+        if overlap:
+            logger.warning(
+                "executor.restore_session: closed_symbols 에 open_positions 심볼이 섞여 있음 — "
+                "open 을 우선 적용. overlap={overlap}",
+                overlap=sorted(overlap),
+            )
+        for sym in closed_symbols:
+            if sym in open_symbols:
+                continue
+            self._strategy.mark_session_closed(sym, session_date)
+        logger.warning(
+            "executor.restore_session date={d} capital={c} open={op} closed={cl} "
+            "entries={e} pnl={pnl}",
+            d=session_date,
+            c=starting_capital_krw,
+            op=len(open_positions),
+            cl=len(closed_symbols),
+            e=entries_today,
+            pnl=daily_realized_pnl_krw,
         )
 
     # ---- 주 루프 --------------------------------------------------------

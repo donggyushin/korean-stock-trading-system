@@ -618,3 +618,132 @@ def test_or_confirmed_false_to_true_전이_검증():
     assert state_after is not None
     assert state_after.or_confirmed is True
     assert state_after.position_state == "flat"
+
+
+# ---------------------------------------------------------------------------
+# restore_long_position (Issue #33)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreLongPosition:
+    """restore_long_position — 재기동 시 open position 의 ORB 상태 복원."""
+
+    def test_position_state_long_설정(self):
+        """복원 후 position_state == 'long'."""
+        strategy = ORBStrategy()
+        strategy.restore_long_position(_SYMBOL, Decimal("70000"), _now(9, 45))
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        assert state.position_state == "long"
+
+    def test_or_confirmed_True_설정(self):
+        """복원 후 or_confirmed == True — 이후 bar가 OR 미확정 경로를 타지 않도록."""
+        strategy = ORBStrategy()
+        strategy.restore_long_position(_SYMBOL, Decimal("70000"), _now(9, 45))
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        assert state.or_confirmed is True
+
+    def test_stop_take_재계산(self):
+        """stop_price / take_price 는 기본 config 기준으로 재계산된다."""
+        cfg = StrategyConfig()  # stop_loss_pct=0.015, take_profit_pct=0.030
+        strategy = ORBStrategy(cfg)
+        entry_price = Decimal("70000")
+        strategy.restore_long_position(_SYMBOL, entry_price, _now(9, 45))
+
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        expected_stop = entry_price * (Decimal("1") - cfg.stop_loss_pct)
+        expected_take = entry_price * (Decimal("1") + cfg.take_profit_pct)
+        assert state.stop_price == pytest.approx(expected_stop)
+        assert state.take_price == pytest.approx(expected_take)
+
+    def test_entry_price_설정(self):
+        """복원 후 state.entry_price == 주입한 entry_price."""
+        entry_price = Decimal("68500")
+        strategy = ORBStrategy()
+        strategy.restore_long_position(_SYMBOL, entry_price, _now(10, 0))
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        assert state.entry_price == entry_price
+
+    def test_복원_후_stop_loss_bar_주입_exit_신호(self):
+        """복원된 long 포지션에 손절가 이하 bar 주입 → stop_loss ExitSignal."""
+        entry_price = Decimal("70000")
+        cfg = StrategyConfig()
+        strategy = ORBStrategy(cfg)
+        strategy.restore_long_position(_SYMBOL, entry_price, _now(9, 45))
+
+        stop = entry_price * (Decimal("1") - cfg.stop_loss_pct)
+        # low 가 stop 이하인 bar
+        signals = strategy.on_bar(_bar(_SYMBOL, 10, 0, 70000, 70000, float(stop) - 1, 69500))
+        assert len(signals) == 1
+        assert isinstance(signals[0], ExitSignal)
+        assert signals[0].reason == "stop_loss"
+
+    def test_symbol_포맷_오류_RuntimeError(self):
+        """6자리 아닌 symbol → RuntimeError."""
+        strategy = ORBStrategy()
+        with pytest.raises(RuntimeError, match="symbol"):
+            strategy.restore_long_position("1234", Decimal("70000"), _now(9, 45))
+
+    def test_naive_entry_ts_RuntimeError(self):
+        """naive datetime entry_ts → RuntimeError."""
+        strategy = ORBStrategy()
+        naive_ts = datetime(2026, 4, 20, 9, 45)  # tzinfo=None
+        with pytest.raises(RuntimeError, match="entry_ts"):
+            strategy.restore_long_position(_SYMBOL, Decimal("70000"), naive_ts)
+
+    def test_entry_price_0이하_RuntimeError(self):
+        """entry_price ≤ 0 → RuntimeError."""
+        strategy = ORBStrategy()
+        with pytest.raises(RuntimeError, match="entry_price"):
+            strategy.restore_long_position(_SYMBOL, Decimal("0"), _now(9, 45))
+
+
+# ---------------------------------------------------------------------------
+# mark_session_closed (Issue #33)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkSessionClosed:
+    """mark_session_closed — 재기동 시 당일 이미 청산된 심볼을 closed 로 표시."""
+
+    def test_position_state_closed_설정(self):
+        """mark_session_closed 후 position_state == 'closed'."""
+        strategy = ORBStrategy()
+        strategy.mark_session_closed(_SYMBOL, _DATE)
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        assert state.position_state == "closed"
+
+    def test_or_confirmed_True_설정(self):
+        """mark_session_closed 후 or_confirmed == True."""
+        strategy = ORBStrategy()
+        strategy.mark_session_closed(_SYMBOL, _DATE)
+        state = strategy.get_state(_SYMBOL)
+        assert state is not None
+        assert state.or_confirmed is True
+
+    def test_closed_후_돌파_bar_재진입_차단(self):
+        """closed 표시 후 or_high 상향 돌파 bar 주입해도 빈 리스트."""
+        strategy = ORBStrategy()
+        strategy.mark_session_closed(_SYMBOL, _DATE)
+        # OR 확인 없이 돌파 bar 주입 — closed 상태이므로 재진입 없어야 함
+        signals = strategy.on_bar(_bar(_SYMBOL, 10, 0, 70000, 75000, 69500, 74000))
+        assert signals == []
+
+    def test_symbol_포맷_오류_RuntimeError(self):
+        """6자리 아닌 symbol → RuntimeError."""
+        strategy = ORBStrategy()
+        with pytest.raises(RuntimeError, match="symbol"):
+            strategy.mark_session_closed("ABCDE", _DATE)
+
+    def test_다른_심볼과_상태_격리(self):
+        """closed 표시한 심볼 외 다른 심볼 상태에는 영향 없음."""
+        symbol_b = "000660"
+        strategy = ORBStrategy()
+        strategy.mark_session_closed(_SYMBOL, _DATE)
+        # symbol_b 는 아직 상태 없음
+        state_b = strategy.get_state(symbol_b)
+        assert state_b is None

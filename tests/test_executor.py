@@ -2875,3 +2875,258 @@ class TestExecutorLastSweepEventsSnapshot:
         snapshot = exc.last_sweep_entry_events
         # tuple 은 in-place mutation 이 없으므로 append 시도 시 AttributeError
         assert not hasattr(snapshot, "append"), "tuple 에 append 가 없어야 함"
+
+
+# ---------------------------------------------------------------------------
+# restore_session (Issue #33)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOpenPosition:
+    """OpenPositionInput Protocol 을 만족하는 더블."""
+
+    def __init__(
+        self,
+        symbol: str,
+        qty: int,
+        entry_price: Decimal,
+        entry_ts: datetime,
+        order_number: str = "ORD-0001",
+    ) -> None:
+        self.symbol = symbol
+        self.qty = qty
+        self.entry_price = entry_price
+        self.entry_ts = entry_ts
+        self.order_number = order_number
+
+
+class TestExecutorRestoreSession:
+    """Executor.restore_session — DB 스냅샷을 받아 상태를 직접 복원."""
+
+    def test_open_position_1건_risk_manager_active_positions_복원(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """open_positions 1건 → RiskManager.active_positions 1건."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        pos = _FakeOpenPosition(
+            symbol=_SYMBOL_A,
+            qty=10,
+            entry_price=Decimal("50000"),
+            entry_ts=_kst(9, 45),
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[pos],
+            entries_today=1,
+            daily_realized_pnl_krw=0,
+        )
+        assert len(risk_manager.active_positions) == 1
+        assert risk_manager.active_positions[0].symbol == _SYMBOL_A
+
+    def test_open_position_1건_strategy_long_상태_복원(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """open_positions 1건 → ORBStrategy 에서 해당 심볼 position_state == 'long'."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        pos = _FakeOpenPosition(
+            symbol=_SYMBOL_A,
+            qty=10,
+            entry_price=Decimal("50000"),
+            entry_ts=_kst(9, 45),
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[pos],
+            entries_today=1,
+            daily_realized_pnl_krw=0,
+        )
+        state = strategy.get_state(_SYMBOL_A)
+        assert state is not None
+        assert state.position_state == "long"
+
+    def test_closed_symbol_strategy_closed_상태(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """closed_symbols 에 포함된 심볼 → strategy position_state == 'closed'."""
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            symbols=(_SYMBOL_A, _SYMBOL_B),
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[],
+            closed_symbols=[_SYMBOL_B],
+            entries_today=1,
+            daily_realized_pnl_krw=0,
+        )
+        state_b = strategy.get_state(_SYMBOL_B)
+        assert state_b is not None
+        assert state_b.position_state == "closed"
+
+    def test_open_closed_overlap_open_우선(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """open_positions 와 closed_symbols 에 같은 심볼이 있으면 open 우선 (long 유지)."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        pos = _FakeOpenPosition(
+            symbol=_SYMBOL_A,
+            qty=10,
+            entry_price=Decimal("50000"),
+            entry_ts=_kst(9, 45),
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[pos],
+            closed_symbols=[_SYMBOL_A],  # overlap
+            entries_today=1,
+            daily_realized_pnl_krw=0,
+        )
+        state = strategy.get_state(_SYMBOL_A)
+        assert state is not None
+        assert state.position_state == "long"
+
+    def test_last_reconcile_None으로_리셋(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """restore_session 후 last_reconcile == None (재기동 후 첫 step 에서 재검증)."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[],
+            entries_today=0,
+            daily_realized_pnl_krw=0,
+        )
+        assert exc.last_reconcile is None
+
+    def test_entries_today_risk_manager에_반영(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """entries_today=5 → RiskManager.entries_today == 5."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[],
+            entries_today=5,
+            daily_realized_pnl_krw=0,
+        )
+        assert risk_manager.entries_today == 5
+
+    def test_daily_realized_pnl_risk_manager에_반영(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """daily_realized_pnl_krw=-15000 → RiskManager.daily_realized_pnl_krw == -15000."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[],
+            entries_today=0,
+            daily_realized_pnl_krw=-15_000,
+        )
+        assert risk_manager.daily_realized_pnl_krw == -15_000
+
+
+class TestExecutorStartSessionResetsLastReconcile:
+    """start_session 호출 시 last_reconcile 이 None 으로 리셋된다."""
+
+    def test_start_session_last_reconcile_None(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """start_session 후 last_reconcile == None."""
+        exc = _make_executor(
+            strategy, risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        assert exc.last_reconcile is None
+
+    def test_step_후_start_session_last_reconcile_리셋(
+        self,
+        strategy: ORBStrategy,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """step 으로 reconcile 이 한 번 실행된 뒤 start_session 재호출 시 None 리셋."""
+        exc = _make_executor(
+            strategy,
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            clock=lambda: _kst(9, 32),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        fake_bar_source.set_bars(_SYMBOL_A, [])
+        exc.step(_kst(9, 32))
+        # step 이후 last_reconcile 은 채워져 있어야 함
+        assert exc.last_reconcile is not None
+
+        # 다음 세션 start_session 호출 → None 리셋
+        from datetime import date as _date
+
+        next_day = _date(2026, 4, 22)
+        exc.start_session(next_day, _STARTING_CAPITAL)
+        assert exc.last_reconcile is None
