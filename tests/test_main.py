@@ -2679,13 +2679,11 @@ class TestOnSessionStartRecorderNull:
         cb()
 
         critical_calls = mock_logger.critical.call_args_list
-        assert (
-            len(critical_calls) >= 1
-        ), f"logger.critical 이 호출되지 않았습니다. calls={critical_calls}"
+        assert_msg = f"logger.critical 이 호출되지 않았습니다. calls={critical_calls}"
+        assert len(critical_calls) >= 1, assert_msg
         messages = [str(c) for c in critical_calls]
-        assert any(
-            "session_start.recorder_null" in m for m in messages
-        ), f"'session_start.recorder_null' 문자열이 logger.critical 에 없음. messages={messages}"
+        has_stage = any("session_start.recorder_null" in m for m in messages)
+        assert has_stage, f"recorder_null 미발견. messages={messages}"
 
     def test_I2_null_recorder_notify_error_stage_session_start_recorder_null(
         self, mocker: Any
@@ -2772,9 +2770,8 @@ class TestOnSessionStartRecorderNull:
             for c in fake_notifier.notify_error.call_args_list
             if c[0][0].stage == "session_start.recorder_null"
         ]
-        assert (
-            len(null_alarm_calls) == 0
-        ), f"NullTradingRecorder 가 아닌데 recorder_null 경보가 발생. calls={null_alarm_calls}"
+        assert_msg = f"recorder_null 경보 불필요 발생. calls={null_alarm_calls}"
+        assert len(null_alarm_calls) == 0, assert_msg
 
     def test_I5_null_recorder_plus_withdrawable_0_notify_error_2회(self, mocker: Any) -> None:
         """I5 — NullTradingRecorder + withdrawable==0 조합.
