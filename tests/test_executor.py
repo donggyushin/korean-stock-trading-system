@@ -152,6 +152,7 @@ class FakeOrderSubmitter:
         self._poll_count: int = 0
         self.buy_calls: list[tuple[str, int]] = []
         self.sell_calls: list[tuple[str, int]] = []
+        self.cancel_calls: list[str] = []
         self._counter = 0
 
     def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
@@ -195,6 +196,9 @@ class FakeOrderSubmitter:
                 )
             ]
         return []
+
+    def cancel_order(self, order_number: str) -> None:
+        self.cancel_calls.append(order_number)
 
 
 class FakeBalanceProvider:

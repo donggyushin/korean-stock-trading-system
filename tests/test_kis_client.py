@@ -928,7 +928,7 @@ class TestCancelOrder:
         settings = _make_settings(monkeypatch)
         return KisClient(settings, pykis_factory=pykis_factory, order_rate_limiter=limiter)
 
-    def _make_pending_entry(self, mocker: MockerFixture, number: str) -> object:
+    def _make_pending_entry(self, mocker: MockerFixture, number: str) -> Any:
         """pending_orders() 에 포함될 엔트리 mock. PyKis KisPendingOrder 구조를 따른다.
 
         PyKis KisPendingOrder 는 중간 .order 래퍼 없이 entry.number(str) 와
