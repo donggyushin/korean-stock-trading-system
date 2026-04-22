@@ -676,7 +676,7 @@ class TestRestoreLongPosition:
 
         stop = entry_price * (Decimal("1") - cfg.stop_loss_pct)
         # low 가 stop 이하인 bar
-        signals = strategy.on_bar(_bar(_SYMBOL, 10, 0, 70000, 70000, float(stop) - 1, 69500))
+        signals = strategy.on_bar(_bar(_SYMBOL, 10, 0, 70000, 70000, stop - Decimal("1"), 69500))
         assert len(signals) == 1
         assert isinstance(signals[0], ExitSignal)
         assert signals[0].reason == "stop_loss"
