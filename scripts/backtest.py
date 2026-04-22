@@ -56,7 +56,11 @@ from stock_agent.backtest import (
     BacktestResult,
     TradeRecord,
 )
+from stock_agent.backtest.loader import BarLoader
+from stock_agent.config import get_settings
 from stock_agent.data import (
+    KisMinuteBarLoader,
+    KisMinuteBarLoadError,
     MinuteCsvBarLoader,
     MinuteCsvLoadError,
     UniverseLoadError,
@@ -78,10 +82,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--loader",
+        choices=["csv", "kis"],
+        default="csv",
+        help=(
+            "분봉 소스. csv=MinuteCsvBarLoader(--csv-dir 필수), "
+            "kis=KisMinuteBarLoader(실전 APP_KEY 3종 + IP 화이트리스트 필요, "
+            "KIS 서버 최대 1년 보관)."
+        ),
+    )
+    parser.add_argument(
         "--csv-dir",
         type=Path,
-        required=True,
-        help="분봉 CSV 디렉토리 ({symbol}.csv 레이아웃).",
+        default=None,
+        help="분봉 CSV 디렉토리 ({symbol}.csv 레이아웃). --loader=csv 때 필수, --loader=kis 때 무시.",
     )
     parser.add_argument(
         "--from",
@@ -127,7 +141,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("data/backtest_trades.csv"),
         help="체결 기록 CSV 출력 경로 (TradeRecord 전체 필드).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # --loader 별 필수 인자 조건부 검증. argparse required 만으로는 표현 불가.
+    if args.loader == "csv" and args.csv_dir is None:
+        parser.error("--loader=csv 에는 --csv-dir 이 필요합니다.")
+    return args
 
 
 def _resolve_symbols(raw: str) -> tuple[str, ...]:
@@ -158,40 +176,62 @@ class _ReportContext:
     starting_capital_krw: int
 
 
+def _build_loader(args: argparse.Namespace) -> BarLoader:
+    """`--loader` 분기로 `BarLoader` 구현체를 생성한다.
+
+    `kis` 모드는 `get_settings()` 호출로 `.env` 실전 키를 로드해
+    `KisMinuteBarLoader` 를 반환한다 (실전 키 미주입 시 생성자에서
+    `KisMinuteBarLoadError` fail-fast).
+    """
+    if args.loader == "kis":
+        settings = get_settings()
+        return KisMinuteBarLoader(settings)
+    # csv: --csv-dir 은 _parse_args 단계에서 conditional required 통과 후.
+    assert args.csv_dir is not None, "csv 모드에서 csv_dir 는 _parse_args 가 강제한다"
+    return MinuteCsvBarLoader(args.csv_dir)
+
+
 def _run_pipeline(args: argparse.Namespace) -> None:
     """실제 파이프라인 — 호출자가 예외 분기를 책임진다.
 
     엔진·로더 공개 API 만 호출. 경계를 single-purpose 로 분리해 `main()` 은
-    예외 → exit code 매핑에 집중한다 (sensitivity 와 동일 기조).
+    예외 → exit code 매핑에 집중한다 (sensitivity 와 동일 기조). `KisMinuteBarLoader`
+    는 SQLite 커넥션을 닫아야 하므로 `try/finally` 로 `close()` 호출.
     """
     symbols = _resolve_symbols(args.symbols)
-    loader = MinuteCsvBarLoader(args.csv_dir)
+    loader = _build_loader(args)
     config = BacktestConfig(starting_capital_krw=args.starting_capital)
     engine = BacktestEngine(config)
 
     logger.info(
-        "backtest.start from={s} to={e} symbols={n} capital={c}",
+        "backtest.start loader={l} from={s} to={e} symbols={n} capital={c}",
+        l=args.loader,
         s=args.start,
         e=args.end,
         n=len(symbols),
         c=args.starting_capital,
     )
-    result = engine.run(loader.stream(args.start, args.end, symbols))
+    try:
+        result = engine.run(loader.stream(args.start, args.end, symbols))
 
-    context = _ReportContext(
-        start=args.start,
-        end=args.end,
-        symbols=symbols,
-        starting_capital_krw=args.starting_capital,
-    )
+        context = _ReportContext(
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+            starting_capital_krw=args.starting_capital,
+        )
 
-    args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    args.output_trades_csv.parent.mkdir(parents=True, exist_ok=True)
+        args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+        args.output_trades_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    args.output_markdown.write_text(_render_markdown(result, context), encoding="utf-8")
-    _write_metrics_csv(result.metrics, args.output_csv)
-    _write_trades_csv(result.trades, args.output_trades_csv)
+        args.output_markdown.write_text(_render_markdown(result, context), encoding="utf-8")
+        _write_metrics_csv(result.metrics, args.output_csv)
+        _write_trades_csv(result.trades, args.output_trades_csv)
+    finally:
+        close = getattr(loader, "close", None)
+        if callable(close):
+            close()
 
     logger.info(
         "backtest.done trades={t} rejected={r} post_slippage={p} mdd={m} verdict={v}",
@@ -378,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
         _run_pipeline(args)
     except MinuteCsvLoadError as e:
         logger.error(f"CSV 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except KisMinuteBarLoadError as e:
+        logger.error(f"KIS 분봉 입력 오류: {e}")
         return _EXIT_INPUT_ERROR
     except UniverseLoadError as e:
         logger.error(f"유니버스 YAML 오류: {e}")

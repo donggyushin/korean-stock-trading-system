@@ -68,7 +68,7 @@ graph TD
     config[config.py<br/>Settings]
     safety[safety.py<br/>가드 함수]
     broker[broker/<br/>KisClient · OrderRateLimiter]
-    data[data/<br/>HistoricalDataStore · RealtimeDataStore<br/>MinuteCsvBarLoader · KospiUniverse]
+    data[data/<br/>HistoricalDataStore · RealtimeDataStore<br/>MinuteCsvBarLoader · KisMinuteBarLoader · KospiUniverse]
     strategy[strategy/<br/>ORBStrategy · Signal DTO]
     risk[risk/<br/>RiskManager · RiskDecision]
     backtest[backtest/<br/>BacktestEngine · sensitivity]
@@ -191,7 +191,7 @@ flowchart LR
 
 ### `BarLoader` Protocol 재호출 안전 계약
 
-`backtest.loader.BarLoader` 는 `stream(start, end, symbols) -> Iterable[MinuteBar]` 를 정의한다. **동일 인자로 여러 번 호출하면 매번 새 Iterable 을 반환해야 한다** — `sensitivity.run_sensitivity` 가 파라미터 조합마다 재호출하기 때문. 1회 소비 iterator 공유는 계약 위반이다. 두 구현체(`InMemoryBarLoader`, `MinuteCsvBarLoader`) 모두 이 계약을 준수한다.
+`backtest.loader.BarLoader` 는 `stream(start, end, symbols) -> Iterable[MinuteBar]` 를 정의한다. **동일 인자로 여러 번 호출하면 매번 새 Iterable 을 반환해야 한다** — `sensitivity.run_sensitivity` 가 파라미터 조합마다 재호출하기 때문. 1회 소비 iterator 공유는 계약 위반이다. 세 구현체(`InMemoryBarLoader`, `MinuteCsvBarLoader`, `KisMinuteBarLoader`) 모두 이 계약을 준수한다.
 
 ### 시그널 가격 필드의 의미
 
@@ -348,8 +348,8 @@ main 브랜치 보호: required status check `Lint, format, test` 통과 필수,
 | 스크립트 | 역할 | 필수 인자 | 의존 모듈 |
 |---|---|---|---|
 | `scripts/healthcheck.py` | KIS 모의 잔고 + 실시간 시세(선택) + 텔레그램 알림 확인 | 없음 (`.env` 로드) | `broker`, `data`, `config` |
-| `scripts/backtest.py` | CSV 분봉 입력 → 단일 런 백테스트 → Markdown/메트릭 CSV/체결 CSV 3종 산출 | `--csv-dir`, `--from`, `--to` | `backtest`, `data`, `config` |
-| `scripts/sensitivity.py` | 파라미터 민감도 32 조합 그리드 → Markdown/CSV 산출 | `--csv-dir`, `--from`, `--to` | `backtest`, `data`, `config` |
+| `scripts/backtest.py` | 분봉 입력 → 단일 런 백테스트 → Markdown/메트릭 CSV/체결 CSV 3종 산출 | `--from`, `--to`, `--loader={csv,kis}` (`--csv-dir` 는 `--loader=csv` 시 필수) | `backtest`, `data`, `config` |
+| `scripts/sensitivity.py` | 파라미터 민감도 32 조합 그리드 → Markdown/CSV 산출 | `--from`, `--to`, `--loader={csv,kis}` (`--csv-dir` 는 `--loader=csv` 시 필수) | `backtest`, `data`, `config` |
 | `python -m stock_agent.main` | 장중 자동매매 실행 — BlockingScheduler + Executor 오케스트레이터 | 없음 (선택: `--dry-run`, `--starting-capital`, `--universe-path`, `--log-dir`) | `execution`, `strategy`, `risk`, `broker`, `data`, `config` |
 
 ### 장중 실행 오케스트레이터 (main.py)
@@ -402,7 +402,7 @@ Phase 진행 상태와 구체적 산출물은 [CLAUDE.md](../CLAUDE.md) 의 "현
 | `src/stock_agent/main.py` | 장중 실행 진입점 (BlockingScheduler + Executor 오케스트레이터) | **완료 2026-04-21 (코드·테스트 레벨)** |
 | `src/stock_agent/monitor/` | 텔레그램 알림 라우팅 (Notifier Protocol + TelegramNotifier/NullNotifier) | **완료 2026-04-21** — [monitor/CLAUDE.md](../src/stock_agent/monitor/CLAUDE.md) 참조 |
 | `src/stock_agent/storage/` | 체결·주문 영속화 (SQLite) + 세션 재기동 복원 경로 | **완료 2026-04-22** — [storage/CLAUDE.md](../src/stock_agent/storage/CLAUDE.md) 참조 |
-| `src/stock_agent/data/` 의 KIS 과거 분봉 어댑터 | KIS 과거 분봉 API 어댑터 (현재 CSV 만 지원) | 별도 PR |
+| `src/stock_agent/data/` 의 KIS 과거 분봉 어댑터 | KIS 과거 분봉 API 어댑터 (`KisMinuteBarLoader`, ADR-0016) | **완료 2026-04-22 (코드·테스트 레벨)** — KIS 서버 최대 1년 보관 제약으로 2~3년 PASS 기준은 CSV 경로로 수행 |
 
 ### 미완료 검증
 

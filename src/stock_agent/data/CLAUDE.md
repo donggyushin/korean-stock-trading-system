@@ -12,9 +12,10 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 `HistoricalDataStore`, `HistoricalDataError`, `DailyBar`,
 `KospiUniverse`, `UniverseLoadError`, `load_kospi200_universe`,
 `RealtimeDataStore`, `RealtimeDataError`, `TickQuote`, `MinuteBar`,
-`MinuteCsvBarLoader`, `MinuteCsvLoadError`
+`MinuteCsvBarLoader`, `MinuteCsvLoadError`,
+`KisMinuteBarLoader`, `KisMinuteBarLoadError`
 
-## 현재 상태 (2026-04-21 기준)
+## 현재 상태 (2026-04-22 기준)
 
 - **`historical.py`** — Phase 1 세 번째 산출물(축소판, v3)
   - 공개 API 1종: `fetch_daily_ohlcv(symbol, start, end)` + 보조 `close()` / 컨텍스트 매니저.
@@ -55,6 +56,18 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
   - **의존성 주입**: `pykis_factory: Callable | None`, `clock: Callable[[], datetime] | None` (KST aware), `polling_interval_s: float = 1.0`, `ws_connect_timeout_s: float = 5.0`. Settings 확장 없음.
   - **범위 제외(의도적 defer)**: 자동 재접속/재폴백(Phase 3), 과거 분봉 백필(`minute_csv.py` 가 CSV 경로를 담당), 호가(bid/ask)·잔량(Phase 5), volume 델타 정규화(Phase 3), 멀티프로세스/스레드 다중 인스턴스.
 
+- **`kis_minute_bars.py`** — Phase 2 일곱 번째 산출물 (KIS 과거 분봉 API 어댑터)
+  - **공개 API**: `KisMinuteBarLoader(settings: Settings, cache_db: Path | None = None)` + `stream(start, end, symbols) -> Iterator[MinuteBar]` · 예외 `KisMinuteBarLoadError`.
+  - **KIS API 엔드포인트**: `/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice` (국내주식 주식일별분봉조회 [국내주식-213]), `api="FHKST03010230"`. python-kis 2.1.6 미래핑 → `kis.fetch()` 로우레벨 직접 호출. 실전(live) 키 전용 — `settings.has_live_keys == False` 이면 생성자에서 `KisMinuteBarLoadError`. PyKis 인스턴스 생성 직후 `install_order_block_guard` 설치.
+  - **페이지네이션**: 120건 역방향 커서 + 1분 감소. 종료 조건 `len(rows) < 120` 또는 `min_time <= "090000"`.
+  - **레이트 리밋 재시도**: `EGW00201` 응답 → `sleep(61.0)` 후 재시도, 최대 3회.
+  - **SQLite 캐시**: 별도 파일 `data/minute_bars.db` (기본 경로). `data/stock_agent.db` 일봉 캐시·`data/trading.db` 원장과 독립된 생명주기. 스키마 v1: `minute_bars(symbol, bar_time, open, high, low, close, volume, PRIMARY KEY(symbol, bar_time))` + `schema_version`. 가격은 `TEXT`로 저장해 `Decimal` 정밀도 보존.
+  - **KIS 서버 보관 한도**: **최대 1년 분봉**. 2~3년 백테스트 요구는 본 어댑터로 해결 불가. Issue #5 후속으로 별도 데이터 소스(외부 유료 데이터, 직접 수집 등) 분리 평가 필요. Phase 2 PASS 검증은 CSV 어댑터(`minute_csv.py`)로 수행한다.
+  - **`BarLoader` Protocol 준수**: `backtest/loader.py`의 `BarLoader` Protocol — `stream(start, end, symbols)` 계약 충족. 동일 인자 재호출 시 매번 새 Iterable 반환.
+  - **CLI 스위치**: `scripts/backtest.py`·`scripts/sensitivity.py`에 `--loader={csv,kis}` 옵션 추가 (default `"csv"`). `--csv-dir`는 `--loader=csv`일 때만 필수.
+  - **의존성**: stdlib + python-kis 2.1.6 + sqlite3. 추가 라이브러리 0.
+  - **테스트**: `tests/test_kis_minute_bar_loader.py` 39건. KIS API 호출 목킹 (실 네트워크 접촉 0).
+
 - **`minute_csv.py`** — Phase 2 네 번째 산출물 (실데이터 분봉 어댑터 — CSV 임포트)
   - **공개 API**: `MinuteCsvBarLoader(csv_dir: Path)` + `stream(start, end, symbols) -> Iterator[MinuteBar]` · 예외 `MinuteCsvLoadError`.
   - **레이아웃**: `{csv_dir}/{symbol}.csv`, 심볼별 단일 파일. 헤더 `bar_time,open,high,low,close,volume` (정확한 순서).
@@ -71,7 +84,7 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
   - **fail-fast 누락 파일**: 요청 심볼 중 CSV 가 없으면 `MinuteCsvLoadError` (경로 포함). `InMemoryBarLoader` 의 조용한 필터링과 의도적 차이 — 원천 I/O 경계는 엄격.
   - **가드·에러**: `start > end` → `RuntimeError` (래핑 안 함). 심볼 `^\d{6}$` 위반 → `MinuteCsvLoadError`. 생성자에 비-Path·파일·미존재 경로 전달 → `MinuteCsvLoadError`.
   - **의존성**: stdlib `csv.reader` + `heapq.merge` + `decimal.Decimal` 만. 추가 라이브러리 0.
-  - **범위 제외(의도적 defer)**: SQLite 캐시(성능 실측 후 후속 PR), KIS 과거 분봉 API 어댑터(30일 롤링 제약으로 장기 PASS 기준 부적합 — 별도 PR), CSV 자동 생성·수집(운영자가 외부에서 준비), `scripts/backtest.py` CLI 및 파라미터 민감도 리포트(Phase 2 후속 산출물).
+  - **범위 제외(의도적 defer)**: SQLite 캐시(성능 실측 후 후속 PR), CSV 자동 생성·수집(운영자가 외부에서 준비). KIS 과거 분봉 API 어댑터는 `kis_minute_bars.py`로 완료(2026-04-22). 단, **KIS 서버 최대 1년 보관 제약**으로 2~3년 PASS 기준 자체를 못 맞춰 Phase 2 PASS 검증은 CSV(`minute_csv.py`)로 수행한다.
 
 ## 설계 원칙
 
@@ -87,9 +100,10 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 - `universe.py`: 실제 PyYAML import 허용(외부 네트워크 없음), 파일은 `tmp_path` 에 작성해 격리. 로거 캡처는 loguru sink 바인딩으로.
 - `realtime.py`: 실 pykis import 금지. `pykis_factory` 에 `MagicMock` 반환 팩토리 주입, `clock` 주입으로 분 경계 제어, `polling_interval_s=0.0` 으로 폴링 루프 단축. WebSocket 모드 테스트는 `ensure_connected` 성공 mock, 폴링 fallback 테스트는 `ensure_connected` 를 `TimeoutError` 로 mock. 27 케이스 — 생명주기·WebSocket·폴링·분봉 집계·가드/엣지·live 키(fail-fast·factory 호출·`install_order_block_guard` 호출) 카테고리 커버.
 - `minute_csv.py`: 외부 I/O 없음 (stdlib `csv` + `tmp_path` CSV 작성만). 헬퍼로 `_write_csv(tmp_path, symbol, rows, *, header)` 패턴 사용 — 헤더 오버라이드로 정상·오류 시나리오를 같은 헬퍼로 커버. 56 케이스 — 생성자·정상 stream·다중 심볼·중복 심볼 행위 고정·날짜/심볼 필터·빈 파일·volume·헤더/행 파싱·bar_time/오프셋/분 경계·가격/OHLC·심볼 포맷·`symbols=()` `RuntimeError` 카테고리 커버.
+- `kis_minute_bars.py`: 실 KIS API 접촉 0. `pykis_factory` 에 `MagicMock` 반환 팩토리 주입, `kis.fetch()` 응답을 dict 더블로 대체. `EGW00201` 레이트 리밋 재시도·페이지네이션 종료 조건·캐시 적중·SQLite 저장·`has_live_keys=False` fail-fast 시나리오 포함. 39 케이스.
 - DB 는 `tmp_path / "test.db"` 또는 `":memory:"` 사용. `clock` 주입으로 "오늘" 판정을 고정.
 - 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root CLAUDE.md 하드 규칙).
-- 관련 테스트: `tests/test_historical.py`, `tests/test_universe.py`, `tests/test_realtime.py`, `tests/test_minute_csv.py`.
+- 관련 테스트: `tests/test_historical.py`, `tests/test_universe.py`, `tests/test_realtime.py`, `tests/test_minute_csv.py`, `tests/test_kis_minute_bar_loader.py`.
 
 ## 소비자 참고
 
@@ -103,7 +117,7 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 
 - **자동 유니버스 갱신**: Phase 5 후보. pykrx 수정 릴리스 또는 KRX 정보데이터시스템 스크래핑으로 `config/universe.yaml` 을 타겟으로 자동 갱신.
 - **다중 유니버스**(KOSPI 50, KOSDAQ 150 등): 현재는 KOSPI 200 고정. 필요 시 `load_universe(index_name)` 로 확장.
-- **과거 분봉 백필**: `minute_csv.py` 가 CSV 임포트 경로를 담당 (2026-04-20 Phase 2 네 번째 산출물). KIS 과거 분봉 API 어댑터는 약 30일 롤링 제약으로 2~3년 PASS 기준 자체를 못 맞춰 별도 PR 로 분리 — Phase 2 PASS 검증은 CSV 로 수행. SQLite 캐시는 성능 실측 후 후속 PR.
+- **과거 분봉 백필**: `minute_csv.py` 가 CSV 임포트 경로를 담당 (2026-04-20 Phase 2 네 번째 산출물). `kis_minute_bars.py` 가 KIS API 어댑터를 담당 (2026-04-22 Phase 2 일곱 번째 산출물, ADR-0016). 단 **KIS 서버 최대 1년 보관 제약**으로 2~3년 PASS 기준은 충족 불가 — Phase 2 PASS 검증은 CSV 로 수행. 2~3년 데이터는 Issue #5 후속으로 외부 데이터 소스 분리 평가. SQLite 캐시(`minute_bars.db`)는 `kis_minute_bars.py` 에서 이미 구현. `minute_csv.py` 용 SQLite 캐시는 성능 실측 후 후속 PR.
 - **영업일 캘린더 기반 캐시 판정**: 현재는 "end 날짜 존재 여부" 휴리스틱. 임시공휴일 엣지에서 오작동 확인되면 `pykrx.stock.get_previous_business_day` 도입.
 - **거래대금 상위 필터링 / 유동성 필터**: 전략 레이어 책임.
 - **PostgreSQL 전환**: Phase 5 재설계 범위.

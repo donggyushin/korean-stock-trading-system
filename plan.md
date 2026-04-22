@@ -145,10 +145,11 @@ stock-agent/
 - [x] `risk/manager.py`: 포지션 사이징, 손절/익절, 일일 손실 한도 — 완료 2026-04-20
 - [x] `backtest/engine.py`: 자체 시뮬레이션 루프 엔진 코어 — 완료 2026-04-20 (코드·테스트 레벨). 슬리피지 0.1% 시장가 불리, 수수료 0.015%(매수·매도 대칭), 거래세 0.18%(매도만) 반영.
   - 리포트 항목: 총수익률, MDD, 샤프, 승률, 평균 손익비, 일평균 거래수, 수수료·세금 반영 후 순수익
-- [x] `data/minute_csv.py`: CSV 분봉 어댑터 — 완료 2026-04-20. 레이아웃 `{csv_dir}/{symbol}.csv`, 헤더 `bar_time,open,high,low,close,volume`. 누락 파일 fail-fast, 여러 심볼 `heapq.merge` 정렬 스트리밍, stdlib 전용 추가 의존성 0. KIS 과거 분봉 API 어댑터는 별도 PR 로 분리.
+- [x] `data/minute_csv.py`: CSV 분봉 어댑터 — 완료 2026-04-20. 레이아웃 `{csv_dir}/{symbol}.csv`, 헤더 `bar_time,open,high,low,close,volume`. 누락 파일 fail-fast, 여러 심볼 `heapq.merge` 정렬 스트리밍, stdlib 전용 추가 의존성 0.
+- [x] `data/kis_minute_bars.py`: KIS 과거 분봉 API 어댑터 — 완료 2026-04-22 (ADR-0016). `KisMinuteBarLoader` + `KisMinuteBarLoadError`. KIS API `FHKST03010230` (`kis.fetch()` 로우레벨 직접 호출). 120건 역방향 페이지네이션, `EGW00201` 레이트 리밋 재시도(최대 3회), SQLite 캐시 `data/minute_bars.db` (별도 파일). 실전(live) 키 전용, `install_order_block_guard` 설치. `scripts/backtest.py`·`scripts/sensitivity.py` 에 `--loader={csv,kis}` 옵션 추가. **중요 제한**: KIS 서버 최대 1년 분봉 보관 — 2~3년 PASS 기준은 충족 불가. Phase 2 PASS 검증은 CSV 경로로 수행. 2~3년 데이터는 Issue #5 후속으로 별도 데이터 소스 분리 평가. 테스트 39건.
 - [x] 파라미터 민감도 그리드: OR 구간(15/30분), 손절/익절 레벨 비교 — 완료 2026-04-20. `src/stock_agent/backtest/sensitivity.py` + `scripts/sensitivity.py` + `tests/test_sensitivity.py` (80건). 기본 그리드 32 조합, 현재 운영 기본값 포함. 민감도 리포트는 sanity check 용도이며 walk-forward 검증을 대체하지 않는다.
 - [x] `scripts/backtest.py`: 단일 런 백테스트 CLI — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → Markdown·메트릭 CSV·체결 CSV 3종 산출. PASS 판정 리포트 기록(낙폭 절대값 15% 미만일 때 PASS, 즉 `mdd > Decimal("-0.15")` 이면 PASS — 경계 -15% 정확값은 FAIL). exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`UniverseLoadError`·`RuntimeError` / `3` `OSError`. 테스트 65건.
-- **산출물**: 파라미터 민감도 테이블 (`scripts/sensitivity.py` CLI, CSV/Markdown 출력) — 완료. 단일 런 백테스트 CLI (`scripts/backtest.py`) — 완료. 백테스트 리포트 HTML/노트북은 Phase 5 후보 (의도적 defer).
+- **산출물**: 파라미터 민감도 테이블 (`scripts/sensitivity.py` CLI, CSV/Markdown 출력) — 완료. 단일 런 백테스트 CLI (`scripts/backtest.py`) — 완료. KIS 과거 분봉 API 어댑터 (`data/kis_minute_bars.py`, ADR-0016) — 완료 2026-04-22. 백테스트 리포트 HTML/노트북은 Phase 5 후보 (의도적 defer). **Phase 2 PASS 선언 잔여 조건**: 2~3년 실데이터 수집(운영자 외부 작업 — KIS 1년 제약으로 `--loader=kis` 로는 불가, Issue #5 후속 평가) + `uv run python scripts/backtest.py --csv-dir ... --from 2023-01-01 --to 2025-12-31` 실행 후 낙폭 절대값 15% 미만 (MDD > -15%) 확인.
 
 ### Phase 3 — 모의투자 자동 실행 (5~7일)
 - **착수 전제**: 실전 APP_KEY (시세 전용) 발급 완료 + KIS Developers 포털에서 IP 화이트리스트 등록 + `healthcheck.py` 4종 통과 (**평일 장중 09:00~15:30 KST에 실행해야 안정적으로 통과** — 4번 체크 `check_realtime_price`는 WebSocket 모드에서 장중 체결 이벤트가 있어야 2초 내 `TickQuote` 수신 가능; 나머지 3종은 시간대 무관).
@@ -236,7 +237,7 @@ python scripts/healthcheck.py
 | 감정적 개입 (수동 매매 섞임) | 시스템 검증 불가 | 실전 전환 후 **최소 1개월 수동 개입 금지**, 개선은 코드 반영으로만 |
 | `python-kis` paper-only 초기화 우회 | 설계가 라이브러리 내부 구현에 의존 | Phase 4 실전 전환 시 실전 APP_KEY/SECRET 별도 발급 및 슬롯 분리 (`PyKis.virtual` 프로퍼티로 라우팅 확인) |
 | 회귀 코드 머지 | 실거래 자금 시스템에 결함 유입 | GitHub Actions CI 자동 실행 + main 브랜치 보호로 CI 통과 필수 |
-| pykrx 분봉 미지원 | **백테스트용 과거 분봉** 데이터 확보 경로 미정 (장중 실시간 분봉은 `data/realtime.py` 로 해소) | `minute_csv.py` 로 CSV 임포트 경로 해소 (2026-04-20). KIS 과거 분봉 API 어댑터는 별도 PR. |
+| pykrx 분봉 미지원 | **백테스트용 과거 분봉** 데이터 확보 경로 미정 (장중 실시간 분봉은 `data/realtime.py` 로 해소) | `minute_csv.py` 로 CSV 임포트 경로 해소 (2026-04-20). `kis_minute_bars.py` 로 KIS API 어댑터 해소 (2026-04-22, ADR-0016). 단 **KIS 서버 최대 1년 보관 제약** — 2~3년 PASS 기준은 CSV 경로로 수행. 장기 데이터는 Issue #5 후속 평가. |
 | pykrx 1.2.7 지수 API(`get_index_portfolio_deposit_file` 등) KRX 서버 호환성 깨짐 + KIS Developers 인덱스 구성종목 API 미제공 | 자동 유니버스 갱신 불가 | `config/universe.yaml` 로 수동 관리. 연 2회 정기변경(6월·12월)마다 운영자 갱신. Phase 5 에서 자동화 경로(pykrx 수정 릴리스 대기 또는 KRX 정보데이터시스템 스크래핑) 재도입. |
 | KIS paper 도메인(`openapivts`) 시세 API(`/quotations/*`) 미제공 → python-kis 고레벨 시세 API paper 환경에서 사용 불가 | 모의투자 자동 실행(Phase 3) 에서 실시간 체결가 수신 불가 | 시세 전용 실전 APP_KEY 발급, 실전 도메인(`openapi`) 직접 호출 (`RealtimeDataStore`). Phase 3 착수 전 실전 앱 발급·IP 화이트리스트 등록 필수. |
 | 실전 키 IP 화이트리스트 이탈 (공인 IP 변경, ISP 동적 IP 할당 등) | 시세 단절 → `RealtimeDataStore` 전체 장애 | `healthcheck.py` 에서 `EGW00123` 계열 오류 감지 시 힌트 로그("KIS Developers 포털 → 앱 관리 → 허용 IP 갱신") 출력. 장기적으로 VPS 이전 시 고정 IP 확보 (Phase 5). |
@@ -273,6 +274,8 @@ Phase 2 여섯 번째 산출물 — `scripts/backtest.py` CLI 완료 (2026-04-20
 6. [x] `scripts/backtest.py` — 완료 2026-04-20. `MinuteCsvBarLoader` + `BacktestEngine` 1회 실행 → 3종 산출물(Markdown 리포트·메트릭 CSV·체결 CSV). 공개 인자: `--csv-dir` (required), `--from`/`--to` (required, `date.fromisoformat`), `--symbols` (default 유니버스 전체), `--starting-capital` (default 1,000,000), `--output-markdown`/`--output-csv`/`--output-trades-csv`. PASS 판정: 낙폭 절대값 15% 미만일 때 PASS (`mdd > Decimal("-0.15")` 이면 PASS — 경계 정확값 -15%는 FAIL). exit code 에는 반영 안 함 — 운영자 수동 검토 보존, CI 자동 pass/fail 금지. exit code 규약: `0` 정상 / `2` `MinuteCsvLoadError`·`UniverseLoadError`·`RuntimeError` / `3` `OSError` (sensitivity.py 는 `UniverseLoadError` 분기 미포함 — 별도 PR 이슈). 외부 네트워크·KIS 접촉 0, 의존성 추가 0. 테스트: `tests/test_backtest_cli.py` 65건. **PASS 라벨이 출력돼도 즉시 실전 전환 금지 — Phase 3 모의투자 2주 무사고 운영이 전제.**
 
 pytest **245 → 324 → 384 → 464 → 477 → 539 → 542건 green** (기존 539 + verdict 경계값 보강 2건 + UniverseLoadError 회귀 1건). ruff check/format + black --check 모두 green. 의존성 추가 없음.
+
+7. [x] `src/stock_agent/data/kis_minute_bars.py` — 완료 2026-04-22 (ADR-0016). `KisMinuteBarLoader` + `KisMinuteBarLoadError`. KIS API `FHKST03010230` (`kis.fetch()` 로우레벨 직접 호출). 120건 역방향 페이지네이션 + `EGW00201` 레이트 리밋 재시도(최대 3회) + SQLite 캐시 `data/minute_bars.db` (별도 파일). 실전(live) 키 전용, `install_order_block_guard` 설치. `scripts/backtest.py`·`scripts/sensitivity.py` 에 `--loader={csv,kis}` 추가. **중요 제한**: KIS 서버 최대 1년 보관 — Phase 2 PASS 검증은 CSV 로 수행. 테스트 39건 신규. 의존성 추가 없음.
 
 ---
 
