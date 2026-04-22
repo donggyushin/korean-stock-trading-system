@@ -42,7 +42,9 @@ select = ["E", "F", "I", "B", "UP", "N", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 # 테스트 함수명에 한글 사용 허용 (가독성 우선).
-"tests/**/*.py" = ["N802"]
+# N806: 지연 import 패턴(예: `KisMinuteBarLoader, _ = _import_loader()`) 에서
+# 클래스 변수명을 클래스 정체성 유지 위해 대문자로 유지 — 테스트에 한정.
+"tests/**/*.py" = ["N802", "N806"]
 
 [tool.black]
 line-length = 100

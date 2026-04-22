@@ -46,7 +46,15 @@ from stock_agent.backtest import (
     run_sensitivity,
     write_csv,
 )
-from stock_agent.data import MinuteCsvBarLoader, MinuteCsvLoadError, load_kospi200_universe
+from stock_agent.backtest.loader import BarLoader
+from stock_agent.config import get_settings
+from stock_agent.data import (
+    KisMinuteBarLoader,
+    KisMinuteBarLoadError,
+    MinuteCsvBarLoader,
+    MinuteCsvLoadError,
+    load_kospi200_universe,
+)
 
 # exit code 규약: 2 = 입력·설정 오류 (재시도 무의미), 3 = I/O 오류 (재시도 가치 있음).
 _EXIT_INPUT_ERROR = 2
@@ -72,10 +80,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--loader",
+        choices=["csv", "kis"],
+        default="csv",
+        help=(
+            "분봉 소스. csv=MinuteCsvBarLoader(--csv-dir 필수), "
+            "kis=KisMinuteBarLoader(실전 APP_KEY 3종 + IP 화이트리스트 필요, "
+            "KIS 서버 최대 1년 보관)."
+        ),
+    )
+    parser.add_argument(
         "--csv-dir",
         type=Path,
-        required=True,
-        help="분봉 CSV 디렉토리 ({symbol}.csv 레이아웃).",
+        default=None,
+        help="분봉 CSV 디렉토리 ({symbol}.csv). --loader=csv 때 필수, --loader=kis 때 무시.",
     )
     parser.add_argument(
         "--from",
@@ -127,7 +145,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Markdown 표를 오름차순으로 정렬 (기본 내림차순).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.loader == "csv" and args.csv_dir is None:
+        parser.error("--loader=csv 에는 --csv-dir 이 필요합니다.")
+    return args
+
+
+def _build_loader(args: argparse.Namespace) -> BarLoader:
+    """`--loader` 분기로 `BarLoader` 구현체를 생성한다."""
+    if args.loader == "kis":
+        settings = get_settings()
+        return KisMinuteBarLoader(settings)
+    assert args.csv_dir is not None, "csv 모드에서 csv_dir 는 _parse_args 가 강제한다"
+    return MinuteCsvBarLoader(args.csv_dir)
 
 
 def _resolve_symbols(raw: str) -> tuple[str, ...]:
@@ -157,33 +187,39 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     그대로 전파.
     """
     symbols = _resolve_symbols(args.symbols)
-    loader = MinuteCsvBarLoader(args.csv_dir)
+    loader = _build_loader(args)
     base_config = BacktestConfig(starting_capital_krw=args.starting_capital)
     grid = default_grid()
     logger.info(
-        "sensitivity.start from={s} to={e} symbols={n} combos={c}",
+        "sensitivity.start loader={l} from={s} to={e} symbols={n} combos={c}",
+        l=args.loader,
         s=args.start,
         e=args.end,
         n=len(symbols),
         c=grid.size,
     )
-    rows = run_sensitivity(
-        loader=loader,
-        start=args.start,
-        end=args.end,
-        symbols=symbols,
-        base_config=base_config,
-        grid=grid,
-    )
-    args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    markdown = render_markdown_table(
-        rows,
-        sort_by=args.sort_by,
-        descending=not args.ascending,
-    )
-    args.output_markdown.write_text(markdown, encoding="utf-8")
-    write_csv(rows, args.output_csv)
+    try:
+        rows = run_sensitivity(
+            loader=loader,
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+            base_config=base_config,
+            grid=grid,
+        )
+        args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+        markdown = render_markdown_table(
+            rows,
+            sort_by=args.sort_by,
+            descending=not args.ascending,
+        )
+        args.output_markdown.write_text(markdown, encoding="utf-8")
+        write_csv(rows, args.output_csv)
+    finally:
+        close = getattr(loader, "close", None)
+        if callable(close):
+            close()
     logger.info(
         "sensitivity.done rows={n} markdown={m} csv={c}",
         n=len(rows),
@@ -215,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
         _run_pipeline(args)
     except MinuteCsvLoadError as e:
         logger.error(f"CSV 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except KisMinuteBarLoadError as e:
+        logger.error(f"KIS 분봉 입력 오류: {e}")
         return _EXIT_INPUT_ERROR
     except RuntimeError as e:
         logger.error(f"설정·검증 오류: {e}")

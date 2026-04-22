@@ -9,6 +9,10 @@ from stock_agent.data.historical import (
     HistoricalDataError,
     HistoricalDataStore,
 )
+from stock_agent.data.kis_minute_bars import (
+    KisMinuteBarLoader,
+    KisMinuteBarLoadError,
+)
 from stock_agent.data.minute_csv import (
     MinuteCsvBarLoader,
     MinuteCsvLoadError,
@@ -29,6 +33,8 @@ __all__ = [
     "DailyBar",
     "HistoricalDataError",
     "HistoricalDataStore",
+    "KisMinuteBarLoadError",
+    "KisMinuteBarLoader",
     "KospiUniverse",
     "MinuteBar",
     "MinuteCsvBarLoader",
