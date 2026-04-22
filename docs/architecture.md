@@ -396,7 +396,7 @@ Phase 진행 상태와 구체적 산출물은 [CLAUDE.md](../CLAUDE.md) 의 "현
 | `src/stock_agent/execution/` | 장중 실시간 루프, 주문 송수신, 체결 추적 | **완료 2026-04-21 (코드·테스트 레벨)** |
 | `src/stock_agent/main.py` | 장중 실행 진입점 (BlockingScheduler + Executor 오케스트레이터) | **완료 2026-04-21 (코드·테스트 레벨)** |
 | `src/stock_agent/monitor/` | 텔레그램 알림 라우팅 (Notifier Protocol + TelegramNotifier/NullNotifier) | **완료 2026-04-21** — [monitor/CLAUDE.md](../src/stock_agent/monitor/CLAUDE.md) 참조 |
-| `src/stock_agent/storage/` | 체결·주문 영속화 (SQLite) | Phase 3 (미착수) |
+| `src/stock_agent/storage/` | 체결·주문 영속화 (SQLite) | **완료 2026-04-22** — [storage/CLAUDE.md](../src/stock_agent/storage/CLAUDE.md) 참조 |
 | `src/stock_agent/data/` 의 KIS 과거 분봉 어댑터 | KIS 과거 분봉 API 어댑터 (현재 CSV 만 지원) | 별도 PR |
 
 ### 미완료 검증

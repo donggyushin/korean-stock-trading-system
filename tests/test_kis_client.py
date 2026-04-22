@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from decimal import Decimal
+from typing import Any
 
 import pytest
+from loguru import logger
 from pytest_mock import MockerFixture
 
 from stock_agent.broker.kis_client import (
@@ -99,17 +101,45 @@ def _make_pending_order_mock(
     qty: int = 1,
     qty_remaining: int = 1,
     price: int | None = 70_000,
+    qty_filled: int | None = None,
+    use_pykis_fields: bool = False,
 ):
-    """PendingOrder 변환 대상이 될 PyKis order mock 생성. time/created_at 은 None 고정."""
+    """PendingOrder 변환 대상이 될 PyKis order mock 생성. time/created_at 은 None 고정.
+
+    qty_filled: None 이면 헬퍼 내부에서 max(0, qty - qty_remaining) 으로 계산.
+    use_pykis_fields: True 면 PyKis 정식 필드(executed_quantity/pending_quantity)를 세팅.
+                      False(기본값)면 기존 호환 방식(qty_remaining 직접 세팅)으로 동작.
+    """
     order = mocker.MagicMock()
     order.number = number
     order.symbol = symbol
     order.side = side
     order.qty = qty
-    order.qty_remaining = qty_remaining
     order.price = price
     order.time = None
     order.created_at = None
+
+    # qty_filled 기본값 계산
+    resolved_filled = qty_filled if qty_filled is not None else max(0, qty - qty_remaining)
+
+    if use_pykis_fields:
+        # PyKis 정식 필드 세팅 — _to_pending_order 가 이쪽을 우선 읽어야 한다
+        order.executed_quantity = resolved_filled
+        order.pending_quantity = qty_remaining
+        # qty_remaining 속성은 MagicMock 이 자동 생성하나, 정식 필드 우선 테스트이므로
+        # getattr fallback 경로를 확인하기 위해 명시적으로 지우지 않는다
+        # (MagicMock 특성상 존재하지 않는 속성 접근 시 새 MagicMock 반환 — int 변환 시 오류)
+        del order.qty_remaining  # fallback 경로 비활성화
+    else:
+        # 기존 호환 방식
+        order.qty_remaining = qty_remaining
+        # executed_quantity / pending_quantity 는 MagicMock 이 자동 생성하므로
+        # AttributeError 가 발생하지 않는다 → getattr(order, "executed_quantity", None)
+        # 가 MagicMock 을 반환해 정수 변환 시 문제가 생길 수 있음.
+        # 기존 코드는 이 필드를 보지 않으므로 del 로 명시적 제거.
+        del order.executed_quantity
+        del order.pending_quantity
+
     return order
 
 
@@ -686,3 +716,387 @@ def test_qty_0이하_가드가_rate_limiter보다_먼저_작동한다(
 
     mock_limiter.acquire.assert_not_called()
     fake_kis.account.return_value.sell.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 신규 테스트 18: PendingOrder.qty_filled 필드 매핑 — ADR-0014 결정 1
+# ---------------------------------------------------------------------------
+
+
+class TestPendingOrderQtyFilledMapping:
+    """PendingOrder.qty_filled 필드 매핑 시나리오 검증 (ADR-0014 결정 1).
+
+    _to_pending_order 가 PyKis 정식 필드(executed_quantity/pending_quantity)를
+    우선 사용하고, 없을 때만 기존 fallback(qty_remaining) 으로 qty_filled 를 추론함을 확인.
+    """
+
+    def test_executed_quantity_있으면_qty_filled에_매핑된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """executed_quantity=3, pending_quantity=7, qty=10 → qty_filled=3, qty_remaining=7."""
+        settings = _make_settings(monkeypatch)
+
+        order_mock = _make_pending_order_mock(
+            mocker,
+            number="PO-100",
+            symbol="005930",
+            side="buy",
+            qty=10,
+            qty_remaining=7,  # use_pykis_fields=True 면 pending_quantity 로 매핑됨
+            qty_filled=3,
+            use_pykis_fields=True,
+        )
+        fake_kis.account.return_value.pending_orders.return_value = [order_mock]
+
+        kc = KisClient(settings, pykis_factory=pykis_factory)
+        result = kc.get_pending_orders()
+
+        assert len(result) == 1
+        po = result[0]
+        assert po.qty_ordered == 10
+        assert po.qty_filled == 3  # executed_quantity 를 읽어야 한다
+        assert po.qty_remaining == 7  # pending_quantity 를 읽어야 한다
+
+    def test_executed_quantity_없으면_qty_remaining으로_qty_filled를_추론한다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """executed_quantity 없이 qty_remaining=4, qty=10 → qty_filled=6 (=10-4) fallback."""
+        settings = _make_settings(monkeypatch)
+
+        order_mock = _make_pending_order_mock(
+            mocker,
+            number="PO-101",
+            symbol="005930",
+            side="buy",
+            qty=10,
+            qty_remaining=4,
+            use_pykis_fields=False,  # executed_quantity 없는 기존 mock 방식
+        )
+        fake_kis.account.return_value.pending_orders.return_value = [order_mock]
+
+        kc = KisClient(settings, pykis_factory=pykis_factory)
+        result = kc.get_pending_orders()
+
+        assert len(result) == 1
+        po = result[0]
+        assert po.qty_ordered == 10
+        assert po.qty_remaining == 4
+        assert po.qty_filled == 6  # qty - qty_remaining = 10 - 4 = 6
+
+    def test_executed_quantity도_pending_quantity도_없으면_qty_filled는_0이다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """executed_quantity/pending_quantity 둘 다 없고 qty=10 만 있을 때.
+
+        qty_filled=0, qty_remaining=10 으로 정규화되어야 한다.
+        """
+        settings = _make_settings(monkeypatch)
+
+        # qty=10, qty_remaining=10 → qty_filled = max(0, 10-10) = 0 (미체결 전량)
+        order_mock = _make_pending_order_mock(
+            mocker,
+            number="PO-102",
+            symbol="005930",
+            side="buy",
+            qty=10,
+            qty_remaining=10,
+            use_pykis_fields=False,
+        )
+        fake_kis.account.return_value.pending_orders.return_value = [order_mock]
+
+        kc = KisClient(settings, pykis_factory=pykis_factory)
+        result = kc.get_pending_orders()
+
+        assert len(result) == 1
+        po = result[0]
+        assert po.qty_ordered == 10
+        assert po.qty_remaining == 10
+        assert po.qty_filled == 0  # 체결 수량 없음
+
+    def test_기존_get_pending_orders_테스트와_호환된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """기존 테스트 8 케이스에 qty_filled 가 추가돼도 다른 필드 계약은 깨지지 않는다."""
+        settings = _make_settings(monkeypatch)
+
+        buy_order = _make_pending_order_mock(
+            mocker,
+            number="PO-001",
+            symbol="005930",
+            side="buy",
+            qty=10,
+            qty_remaining=10,
+            price=70_000,
+        )
+        sell_order = _make_pending_order_mock(
+            mocker,
+            number="PO-002",
+            symbol="000660",
+            side="sell",
+            qty=5,
+            qty_remaining=3,
+            price=150_000,
+        )
+
+        fake_kis.account.return_value.pending_orders.return_value = [buy_order, sell_order]
+
+        kc = KisClient(settings, pykis_factory=pykis_factory)
+        result = kc.get_pending_orders()
+
+        assert len(result) == 2
+        po_buy = result[0]
+        assert po_buy.order_number == "PO-001"
+        assert po_buy.qty_ordered == 10
+        assert po_buy.qty_remaining == 10
+        assert po_buy.qty_filled == 0  # 10 - 10 = 0
+
+        po_sell = result[1]
+        assert po_sell.order_number == "PO-002"
+        assert po_sell.qty_ordered == 5
+        assert po_sell.qty_remaining == 3
+        assert po_sell.qty_filled == 2  # 5 - 3 = 2
+
+
+# ---------------------------------------------------------------------------
+# loguru 로그 캡처 픽스처 (test_rate_limiter.py 와 동일 패턴)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _loguru_messages() -> Iterator[list[dict[str, Any]]]:
+    """loguru 로그 메시지 capture. pytest caplog 는 stdlib logging 만 잡아서 별도 sink."""
+    captured: list[dict[str, Any]] = []
+
+    def _sink(message: Any) -> None:
+        record = message.record
+        captured.append({"level": record["level"].name, "message": record["message"]})
+
+    handler_id = logger.add(_sink, level="INFO")
+    try:
+        yield captured
+    finally:
+        logger.remove(handler_id)
+
+
+# ---------------------------------------------------------------------------
+# 신규 테스트 19: KisClient.cancel_order — ADR-0014 결정 2
+# ---------------------------------------------------------------------------
+
+
+class TestCancelOrder:
+    """KisClient.cancel_order(order_number) 계약 검증 (ADR-0014 결정 2).
+
+    계약:
+    - _require_open 경유 (close 후 KisClientError)
+    - OrderRateLimiter.acquire 1회 호출 (라벨에 "cancel" + order_number 포함)
+    - 매칭 pending 엔트리의 cancel() 호출
+    - 매칭 실패 시 no-op + logger.info
+    - 빈 order_number 는 KisClientError fail-fast
+    - 라이브러리 예외(RuntimeError 제외)는 KisClientError 래핑
+    - 멱등 — 두 번 호출해도 두 번째는 no-op
+    """
+
+    def _make_kc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_kis,
+        pykis_factory,
+        *,
+        limiter=None,
+    ) -> KisClient:
+        settings = _make_settings(monkeypatch)
+        return KisClient(settings, pykis_factory=pykis_factory, order_rate_limiter=limiter)
+
+    def _make_pending_entry(self, mocker: MockerFixture, number: str) -> object:
+        """pending_orders() 에 포함될 엔트리 mock. PyKis KisPendingOrder 구조를 따른다.
+
+        PyKis KisPendingOrder 는 중간 .order 래퍼 없이 entry.number(str) 와
+        entry.cancel()(KisCancelableOrderMixin 상속 메서드) 를 직접 노출한다.
+        """
+        entry = mocker.MagicMock()
+        entry.number = number  # str 고정 — MagicMock auto-attr 이 아닌 실제 문자열
+        entry.cancel = mocker.MagicMock()  # 명시 세팅 — assert_called_once() 대응
+        return entry
+
+    def test_매칭_엔트리가_있을때_cancel이_호출된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """pending_orders 목록에 order_number 매칭 엔트리가 있으면 cancel() 이 호출된다."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        entry = self._make_pending_entry(mocker, "ORD-CANCEL-001")
+        fake_kis.account.return_value.pending_orders.return_value = [entry]
+
+        kc.cancel_order("ORD-CANCEL-001")
+
+        entry.cancel.assert_called_once()
+
+    def test_매칭_실패시_no_op이고_로그가_남는다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+        _loguru_messages: list[dict[str, Any]],
+    ) -> None:
+        """pending_orders 에 order_number 가 없으면 cancel() 호출 없이 info 로그만 남긴다."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        other_entry = self._make_pending_entry(mocker, "ORD-OTHER-999")
+        fake_kis.account.return_value.pending_orders.return_value = [other_entry]
+
+        kc.cancel_order("ORD-NOT-FOUND-001")
+
+        other_entry.cancel.assert_not_called()
+        # loguru 로그에 "not_pending" 또는 order_number 가 포함돼야 한다
+        assert any(
+            "ORD-NOT-FOUND-001" in m["message"] or "not_pending" in m["message"]
+            for m in _loguru_messages
+        ), f"기대한 로그가 없음. captured={[m['message'] for m in _loguru_messages]}"
+
+    def test_빈_order_number는_KisClientError를_raise한다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """order_number 가 빈 문자열이면 pending_orders 조회 없이 KisClientError fail-fast."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        with pytest.raises(KisClientError):
+            kc.cancel_order("")
+
+        # 빈 문자열 가드라 account 는 호출되지 않아야 한다
+        fake_kis.account.return_value.pending_orders.assert_not_called()
+
+    def test_close_후_호출시_KisClientError를_raise한다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """close() 후 cancel_order 호출 시 _require_open 이 KisClientError 를 올린다."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+        kc.close()
+
+        with pytest.raises(KisClientError):
+            kc.cancel_order("ORD-AFTER-CLOSE")
+
+    def test_rate_limiter_acquire가_1회_호출된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """cancel_order 는 OrderRateLimiter.acquire 를 "cancel {order_number}" 라벨로 1회 호출한다.
+
+        acquire 호출 라벨이 올바른지, 호출 횟수가 정확히 1회인지 검증한다.
+        """
+        mock_limiter = mocker.MagicMock(spec=OrderRateLimiter)
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory, limiter=mock_limiter)
+
+        # pending_orders 는 빈 목록 — no-op 경로지만 acquire 는 호출돼야 한다
+        fake_kis.account.return_value.pending_orders.return_value = []
+
+        kc.cancel_order("ORD-RATE-001")
+
+        mock_limiter.acquire.assert_called_once()
+        label: str = mock_limiter.acquire.call_args[0][0]
+        assert "cancel" in label
+        assert "ORD-RATE-001" in label
+
+    def test_라이브러리_예외는_KisClientError로_래핑된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """pending_orders() 에서 RuntimeError 외 예외 발생 시 KisClientError 로 래핑된다."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        original = ValueError("KIS 서버 오류")
+        fake_kis.account.return_value.pending_orders.side_effect = original
+
+        with pytest.raises(KisClientError) as excinfo:
+            kc.cancel_order("ORD-ERR-001")
+
+        assert excinfo.value.__cause__ is original
+
+    def test_RuntimeError는_래핑되지_않고_전파된다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """pending_orders() 에서 RuntimeError 발생 시 KisClientError 로 감싸지 않고 그대로 전파."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        rt_err = RuntimeError("paper guard 차단")
+        fake_kis.account.return_value.pending_orders.side_effect = rt_err
+
+        with pytest.raises(RuntimeError) as excinfo:
+            kc.cancel_order("ORD-RT-001")
+
+        assert not isinstance(excinfo.value, KisClientError)
+        assert excinfo.value is rt_err
+
+    def test_멱등성_두번_호출시_두번째는_no_op이다(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+    ) -> None:
+        """첫 호출에서 cancel() 후 두 번째 호출에서는 pending 목록이 비어 no-op 경로를 탄다."""
+        kc = self._make_kc(monkeypatch, fake_kis, pykis_factory)
+
+        entry = self._make_pending_entry(mocker, "ORD-IDEM-001")
+
+        # 첫 호출: 매칭 엔트리 있음 → cancel() 호출
+        fake_kis.account.return_value.pending_orders.return_value = [entry]
+        kc.cancel_order("ORD-IDEM-001")
+        entry.cancel.assert_called_once()
+
+        # 두 번째 호출: pending 목록이 비어 있음 (이미 취소됨) → no-op
+        fake_kis.account.return_value.pending_orders.return_value = []
+        kc.cancel_order("ORD-IDEM-001")  # 예외 없이 통과해야 한다
+
+        # cancel 은 첫 호출에서만 1회 호출됐어야 한다
+        entry.cancel.assert_called_once()
