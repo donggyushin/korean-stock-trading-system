@@ -95,7 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--csv-dir",
         type=Path,
         default=None,
-        help="분봉 CSV 디렉토리 ({symbol}.csv 레이아웃). --loader=csv 때 필수, --loader=kis 때 무시.",
+        help="분봉 CSV 디렉토리 ({symbol}.csv). --loader=csv 때 필수, --loader=kis 때 무시.",
     )
     parser.add_argument(
         "--from",

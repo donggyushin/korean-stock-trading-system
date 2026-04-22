@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, call
+from unittest.mock import call
 
 import pytest
 from pytest_mock import MockerFixture
@@ -175,7 +175,7 @@ def mock_sleep(mocker: MockerFixture):
 
 def _import_loader():
     """KisMinuteBarLoader 를 지연 import 해 반환. 모듈 없으면 ImportError."""
-    from stock_agent.data.kis_minute_bars import KisMinuteBarLoadError, KisMinuteBarLoader
+    from stock_agent.data.kis_minute_bars import KisMinuteBarLoader, KisMinuteBarLoadError
 
     return KisMinuteBarLoader, KisMinuteBarLoadError
 
@@ -414,10 +414,7 @@ class TestSingleSymbolSinglePage:
         KisMinuteBarLoader, _ = _import_loader()
         settings = _make_settings_with_live_keys(monkeypatch)
 
-        rows = [
-            _make_output2_row(_YESTERDAY, 15, 30 - i)
-            for i in range(30)
-        ]
+        rows = [_make_output2_row(_YESTERDAY, 15, 30 - i) for i in range(30)]
         fake_kis.fetch.return_value = _make_api_response(rows)
 
         loader = KisMinuteBarLoader(
@@ -444,9 +441,11 @@ class TestSingleSymbolSinglePage:
         KisMinuteBarLoader, _ = _import_loader()
         settings = _make_settings_with_live_keys(monkeypatch)
 
-        fake_kis.fetch.return_value = _make_api_response([
-            _make_output2_row(_YESTERDAY, 9, 31),
-        ])
+        fake_kis.fetch.return_value = _make_api_response(
+            [
+                _make_output2_row(_YESTERDAY, 9, 31),
+            ]
+        )
 
         loader = KisMinuteBarLoader(
             settings,
@@ -686,16 +685,16 @@ class TestMultiDateLoop:
         KisMinuteBarLoader, _ = _import_loader()
         settings = _make_settings_with_live_keys(monkeypatch)
 
-        sat = date(2026, 4, 18)  # 토요일
-        sun = date(2026, 4, 19)  # 일요일
+        sat = date(2026, 4, 18)  # 토요일 — 빈 응답 기대
+        # sun = date(2026, 4, 19) — 일요일도 빈 응답이지만 변수 불필요
         mon = date(2026, 4, 20)  # 월요일
 
         # 구현은 end=mon 부터 역방향 순회: mon → sun → sat
         # mon: 실데이터, sun: 빈(일요일), sat: 빈(토요일)
         fake_kis.fetch.side_effect = [
             _make_api_response([_make_output2_row(mon, 9, 31)]),  # mon: 실데이터
-            _make_api_response([]),                                # sun: 빈(일요일)
-            _make_api_response([]),                                # sat: 빈(토요일)
+            _make_api_response([]),  # sun: 빈(일요일)
+            _make_api_response([]),  # sat: 빈(토요일)
         ]
 
         loader = KisMinuteBarLoader(
@@ -941,8 +940,15 @@ class TestResponseParsing:
         settings = _make_settings_with_live_keys(monkeypatch)
 
         row = _make_output2_row(
-            _YESTERDAY, 9, 31, 0,
-            oprc="71000", hgpr="71500", lwpr="70800", prpr="71200", vol="1234",
+            _YESTERDAY,
+            9,
+            31,
+            0,
+            oprc="71000",
+            hgpr="71500",
+            lwpr="70800",
+            prpr="71200",
+            vol="1234",
         )
         fake_kis.fetch.return_value = _make_api_response([row])
 
@@ -1123,9 +1129,11 @@ class TestCacheTodayAlwaysRefetches:
         conn.commit()
         conn.close()
 
-        fake_kis.fetch.return_value = _make_api_response([
-            _make_output2_row(_TODAY, 9, 31),
-        ])
+        fake_kis.fetch.return_value = _make_api_response(
+            [
+                _make_output2_row(_TODAY, 9, 31),
+            ]
+        )
 
         loader = KisMinuteBarLoader(
             settings,
@@ -1204,9 +1212,11 @@ class TestOrderGuardInstalled:
         KisMinuteBarLoader, _ = _import_loader()
         settings = _make_settings_with_live_keys(monkeypatch)
 
-        fake_kis.fetch.return_value = _make_api_response([
-            _make_output2_row(_YESTERDAY, 9, 31),
-        ])
+        fake_kis.fetch.return_value = _make_api_response(
+            [
+                _make_output2_row(_YESTERDAY, 9, 31),
+            ]
+        )
 
         loader = KisMinuteBarLoader(
             settings,
@@ -1433,7 +1443,7 @@ class TestOutOfRangeBarFiltered:
         earlier_date = date(2026, 4, 20)  # start 이전
         rows = [
             _make_output2_row(earlier_date, 9, 31),  # 범위 밖
-            _make_output2_row(_YESTERDAY, 9, 31),    # 범위 내
+            _make_output2_row(_YESTERDAY, 9, 31),  # 범위 내
         ]
         fake_kis.fetch.return_value = _make_api_response(rows)
 
@@ -1472,7 +1482,7 @@ class TestInvalidRowSkipped:
         settings = _make_settings_with_live_keys(monkeypatch)
 
         bad_row = _make_output2_row(_YESTERDAY, 9, 31, oprc="")  # malformed
-        good_row = _make_output2_row(_YESTERDAY, 9, 32)          # 정상
+        good_row = _make_output2_row(_YESTERDAY, 9, 32)  # 정상
         fake_kis.fetch.return_value = _make_api_response([bad_row, good_row])
 
         loader = KisMinuteBarLoader(

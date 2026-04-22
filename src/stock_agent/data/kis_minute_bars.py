@@ -158,9 +158,7 @@ class KisMinuteBarLoader:
         self._rate_limit_wait_s = rate_limit_wait_s
         self._rate_limit_max_retries = rate_limit_max_retries
 
-        self._cache_db_path = (
-            cache_db_path if cache_db_path is not None else _DEFAULT_CACHE_DB_PATH
-        )
+        self._cache_db_path = cache_db_path if cache_db_path is not None else _DEFAULT_CACHE_DB_PATH
         self._conn: sqlite3.Connection | None = None
         self._kis: Any | None = None
         self._closed = False
@@ -169,9 +167,7 @@ class KisMinuteBarLoader:
         try:
             self._init_db()
         except (OSError, sqlite3.Error) as exc:
-            raise KisMinuteBarLoadError(
-                f"SQLite 캐시 초기화 실패: {self._cache_db_path}"
-            ) from exc
+            raise KisMinuteBarLoadError(f"SQLite 캐시 초기화 실패: {self._cache_db_path}") from exc
 
     # ---- 공개 API ------------------------------------------------------
 
@@ -227,7 +223,7 @@ class KisMinuteBarLoader:
                 logger.warning(f"SQLite close 중 예외 (무시): {exc!r}")
             self._conn = None
 
-    def __enter__(self) -> "KisMinuteBarLoader":
+    def __enter__(self) -> KisMinuteBarLoader:
         return self
 
     def __exit__(
@@ -254,8 +250,7 @@ class KisMinuteBarLoader:
 
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._conn.execute(
-                """
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS minute_bars (
                     symbol TEXT NOT NULL,
                     bar_time TEXT NOT NULL,
@@ -266,8 +261,7 @@ class KisMinuteBarLoader:
                     volume INTEGER NOT NULL,
                     PRIMARY KEY (symbol, bar_time)
                 )
-                """
-            )
+                """)
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
             )
@@ -529,9 +523,7 @@ class KisMinuteBarLoader:
                     keep_token=True,
                 )
             except Exception as exc:
-                raise KisMinuteBarLoadError(
-                    "PyKis 실전 인스턴스 생성 실패"
-                ) from exc
+                raise KisMinuteBarLoadError("PyKis 실전 인스턴스 생성 실패") from exc
             install_order_block_guard(kis)
             self._kis = kis
             return kis
@@ -562,9 +554,7 @@ class KisMinuteBarLoader:
                 volume=volume,
             )
         except (ValueError, InvalidOperation, TypeError) as exc:
-            logger.warning(
-                f"KIS 분봉 행 파싱 실패 — skip: symbol={symbol} row={row!r} err={exc!r}"
-            )
+            logger.warning(f"KIS 분봉 행 파싱 실패 — skip: symbol={symbol} row={row!r} err={exc!r}")
             return None
 
 
