@@ -3156,3 +3156,146 @@ class TestParseSkipErrorFromRowFactory:
         )
 
         assert err.detail == "field=stck_oprc reason=empty", f"detail 속성 불일치: {err.detail!r}"
+
+
+# ===========================================================================
+# TestCollectSymbolBarsWeekendSkip — _collect_symbol_bars 주말 skip 검증 (Issue #61)
+# ===========================================================================
+
+
+class TestCollectSymbolBarsWeekendSkip:
+    """_collect_symbol_bars 가 토·일 날짜를 건너뛰고 영업일만 fetch 하는지 검증.
+
+    수정 전 현재 HEAD 기준으로 아래 3 케이스 모두 FAIL 한다 (RED 상태).
+    - _collect_symbol_bars 루프에 주말 가드가 없어 토·일 날짜에도 _fetch_day 가 호출됨.
+    """
+
+    def test_collect_symbol_bars_skips_saturday_sunday(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+        mock_sleep,
+        tmp_path: Path,
+    ) -> None:
+        """금(2026-04-17) ~ 월(2026-04-20) 구간 → fetch 는 금·월 2일만 호출.
+
+        토(2026-04-18)·일(2026-04-19)은 skip 되므로 FID_INPUT_DATE_1 집합에
+        "20260418"·"20260419" 이 존재하지 않아야 한다.
+        """
+        KisMinuteBarLoader, _ = _import_loader()
+        settings = _make_settings_with_live_keys(monkeypatch)
+
+        fri = date(2026, 4, 17)  # 금요일 (weekday=4)
+        mon = date(2026, 4, 20)  # 월요일 (weekday=0)
+        # 토=2026-04-18 (weekday=5), 일=2026-04-19 (weekday=6)
+
+        # 금·월 각각 1건씩 정상 응답
+        def _side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            date_str = params.get("FID_INPUT_DATE_1", "")
+            if date_str == "20260417":
+                return _make_api_response([_make_output2_row(fri, 9, 31)])
+            if date_str == "20260420":
+                return _make_api_response([_make_output2_row(mon, 9, 31)])
+            # 토·일이 실수로 호출되면 빈 응답(테스트 자체는 call_args_list 로 검증)
+            return _make_api_response([])
+
+        fake_kis.fetch.side_effect = _side_effect
+
+        loader = KisMinuteBarLoader(
+            settings,
+            pykis_factory=pykis_factory,
+            clock=_fixed_clock(datetime(2026, 4, 22, 10, 0, tzinfo=KST)),  # 화요일 — 교란 없음
+            cache_db_path=tmp_path / "test.db",
+            sleep=mock_sleep,
+        )
+        list(loader.stream(fri, mon, (_SYMBOL,)))
+        loader.close()
+
+        # fetch 가 호출된 FID_INPUT_DATE_1 집합 수집
+        called_dates = {
+            c.kwargs.get("params", {}).get("FID_INPUT_DATE_1")
+            for c in fake_kis.fetch.call_args_list
+        }
+        assert called_dates == {
+            "20260417",
+            "20260420",
+        }, f"토·일이 포함되지 않아야 한다. 실제 호출 날짜: {called_dates}"
+
+    def test_collect_symbol_bars_all_weekend_range_returns_empty(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+        mock_sleep,
+        tmp_path: Path,
+    ) -> None:
+        """start=토(2026-04-18), end=일(2026-04-19) — 전 구간 주말이면 fetch 호출 0 + 빈 결과."""
+        KisMinuteBarLoader, _ = _import_loader()
+        settings = _make_settings_with_live_keys(monkeypatch)
+
+        sat = date(2026, 4, 18)  # 토요일
+        sun = date(2026, 4, 19)  # 일요일
+
+        # 주말 가드가 없으면 fetch 가 불리므로 정상 dict 반환으로 설정
+        # (KisMinuteBarLoadError 가 아닌 "call_count > 0" 단언에서 FAIL 하도록)
+        fake_kis.fetch.return_value = _make_api_response([])
+
+        loader = KisMinuteBarLoader(
+            settings,
+            pykis_factory=pykis_factory,
+            clock=_fixed_clock(datetime(2026, 4, 22, 10, 0, tzinfo=KST)),
+            cache_db_path=tmp_path / "test.db",
+            sleep=mock_sleep,
+        )
+        bars = list(loader.stream(sat, sun, (_SYMBOL,)))
+        loader.close()
+
+        msg = f"_fetch_day 가 호출되지 않아야 한다. 실제 호출 수: {fake_kis.fetch.call_count}"
+        assert fake_kis.fetch.call_count == 0, msg
+        assert bars == [], f"주말 전용 구간은 빈 결과여야 한다. 실제: {bars!r}"
+
+    def test_collect_symbol_bars_weekend_does_not_write_db(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_kis,
+        pykis_factory,
+        guard_patch,
+        mock_sleep,
+        tmp_path: Path,
+    ) -> None:
+        """주말 날짜는 _fetch_day / _write_bars_to_db 경로에 진입하지 않음.
+
+        수정 전: _collect_symbol_bars 가 토·일에도 _fetch_day 를 호출 → fetch.call_count > 0.
+        수정 후: 주말 가드로 skip → fetch.call_count == 0.
+        fetch 호출 횟수를 직접 단언해 "_write_bars_to_db 미진입" 을 간접 검증.
+        """
+        KisMinuteBarLoader, _ = _import_loader()
+        settings = _make_settings_with_live_keys(monkeypatch)
+
+        sat = date(2026, 4, 18)  # 토요일
+        sun = date(2026, 4, 19)  # 일요일
+
+        # 주말 가드 없으면 fetch 가 불리므로 정상 dict 반환 설정
+        fake_kis.fetch.return_value = _make_api_response([])
+
+        db_path = tmp_path / "test.db"
+        loader = KisMinuteBarLoader(
+            settings,
+            pykis_factory=pykis_factory,
+            clock=_fixed_clock(datetime(2026, 4, 22, 10, 0, tzinfo=KST)),
+            cache_db_path=db_path,
+            sleep=mock_sleep,
+        )
+        list(loader.stream(sat, sun, (_SYMBOL,)))
+        loader.close()
+
+        # 주말 가드가 동작하면 fetch 가 전혀 불리지 않아야 한다
+        msg = (
+            f"주말 날짜에 _fetch_day 가 호출되지 않아야 한다. "
+            f"실제 fetch 호출 수: {fake_kis.fetch.call_count}"
+        )
+        assert fake_kis.fetch.call_count == 0, msg
