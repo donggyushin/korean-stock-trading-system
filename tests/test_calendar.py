@@ -9,7 +9,6 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -116,7 +115,9 @@ class TestLoadKospiHolidays:
         assert result.as_of_date == date(2026, 4, 23)
 
     def test_holidays_원소_pyyaml_자동파싱_date_타입(self, tmp_path: Path) -> None:
-        """holidays 원소가 PyYAML 에 의해 date 로 자동 파싱된 경우에도 frozenset[date] 로 정상 처리."""
+        """holidays 원소가 PyYAML 에 의해 date 로 자동 파싱된 경우에도
+        frozenset[date] 로 정상 처리.
+        """
         _, HolidayCalendar, _, _, load_kospi_holidays = _import_calendar()
 
         # PyYAML 은 따옴표 없는 YYYY-MM-DD 원소를 date 로 자동 파싱한다

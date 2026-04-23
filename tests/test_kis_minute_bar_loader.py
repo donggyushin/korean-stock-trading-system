@@ -3416,7 +3416,10 @@ class TestCollectSymbolBarsHolidaySkip:
         bars = list(loader.stream(start, end, (_SYMBOL,)))
         loader.close()
 
-        msg = f"전 구간 비영업일이면 _fetch_day 가 호출되지 않아야 한다. 실제 호출 수: {fake_kis.fetch.call_count}"
+        msg = (
+            f"전 구간 비영업일이면 _fetch_day 가 호출되지 않아야 한다. "
+            f"실제 호출 수: {fake_kis.fetch.call_count}"
+        )
         assert fake_kis.fetch.call_count == 0, msg
         assert bars == [], f"전 구간 비영업일은 빈 결과여야 한다. 실제: {bars!r}"
 
@@ -3508,7 +3511,11 @@ class TestCollectSymbolBarsHolidaySkip:
         }
         sat = date(2026, 4, 18)
         sun = date(2026, 4, 19)
-        msg_sat = f"토요일({sat}) 은 주말 가드에서 먼저 skip 되므로 calendar 에 도달하지 않아야 한다."
+        msg_sat = (
+            f"토요일({sat}) 은 주말 가드에서 먼저 skip 되므로 calendar 에 도달하지 않아야 한다."
+        )
         assert sat not in called_with_dates, msg_sat
-        msg_sun = f"일요일({sun}) 은 주말 가드에서 먼저 skip 되므로 calendar 에 도달하지 않아야 한다."
+        msg_sun = (
+            f"일요일({sun}) 은 주말 가드에서 먼저 skip 되므로 calendar 에 도달하지 않아야 한다."
+        )
         assert sun not in called_with_dates, msg_sun
