@@ -488,10 +488,10 @@ class TestRunPipeline:
         assert kwargs["throttle_s"] == pytest.approx(1.5)
 
     def test_기본값_경로_throttle_s_0_2_생성자_전달(self, monkeypatch) -> None:
-        """--from/--to 만 지정한 기본값 경로에서 KisMinuteBarLoader 생성자에 throttle_s=0.2 가 전달된다.
+        """기본값 경로(`--from`/`--to` 만 지정)에서 throttle_s=0.2 생성자 전달 검증.
 
-        _make_args 는 throttle_s default=0.0 으로 CLI default(0.2) 와 달라 직접 사용 불가.
-        backfill_cli._parse_args 로 argparse default 를 통과한 Namespace 를 만들어 검증.
+        `_make_args` 는 throttle_s default=0.0 이라 CLI default(0.2) 와 달라 직접 사용 불가.
+        `_parse_args` 로 argparse default 를 통과한 Namespace 를 만들어 검증한다.
         """
         _require_module()
         fake_loader = _make_fake_loader(bars_per_symbol=[])

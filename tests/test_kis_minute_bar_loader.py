@@ -2253,9 +2253,8 @@ class TestParseRowSkipCategories:
             "stck_oprc",
             "stck_prpr",
         ]
-        assert (
-            actual_keys == expected_keys
-        ), f"keys= CSV 불일치.\n기대: {expected_keys}\n실제: {actual_keys}"
+        fail_msg = f"keys= CSV 불일치.\n기대: {expected_keys}\n실제: {actual_keys}"
+        assert actual_keys == expected_keys, fail_msg
 
     # -----------------------------------------------------------------------
     # 7. 서로 다른 kind 혼재 — 각각 1회씩

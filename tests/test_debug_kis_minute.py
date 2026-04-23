@@ -11,7 +11,6 @@ import sys
 from datetime import date, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -133,9 +132,8 @@ class TestValidateArgs:
         # _default_date: today = monday, candidate = sunday → 주말 skip → friday
         monday = datetime(2026, 4, 20, 10, 0, 0, tzinfo=KST)
 
-        # debug_cli 내부의 datetime.now 를 교체하기 위해 모듈 내 datetime 을 monkeypatch 할 수 없음
-        # → _default_date 함수를 직접 우회하고 계산 로직을 독립 검증
-        # today = 2026-04-20(월), candidate = 2026-04-19(일), skip → 2026-04-18(토), skip → 2026-04-17(금)
+        # debug_cli 내부 datetime.now 교체 어려움 → _default_date 계산 로직 독립 검증
+        # today=2026-04-20(월), candidate=2026-04-19(일)→skip, 2026-04-18(토)→skip, 2026-04-17(금)
         today = monday.date()
         candidate = today - timedelta(days=1)
         while candidate.weekday() >= 5:
@@ -244,8 +242,8 @@ class TestCoerceJsonSafe:
         result = debug_cli._coerce_json_safe(nested)  # type: ignore[union-attr]
         assert result == {"outer": {"inner": 123}}
         # 모든 key 가 str
-        assert all(isinstance(k, str) for k in result.keys())
-        assert all(isinstance(k, str) for k in result["outer"].keys())
+        assert all(isinstance(k, str) for k in result)
+        assert all(isinstance(k, str) for k in result["outer"])
 
     def test_list_재귀_변환(self) -> None:
         """list → 재귀 변환."""
