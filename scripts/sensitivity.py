@@ -53,6 +53,7 @@ from stock_agent.data import (
     KisMinuteBarLoadError,
     MinuteCsvBarLoader,
     MinuteCsvLoadError,
+    UniverseLoadError,
     load_kospi200_universe,
 )
 
@@ -232,10 +233,13 @@ def main(argv: list[str] | None = None) -> int:
     """CLI 엔트리포인트 — 예외 → exit code 매핑만 책임진다.
 
     예외 분류 (프로젝트 가드레일 "generic except Exception 금지" 기조 준수 —
-    좁힌 세 타입으로만 잡고 나머지는 Python 기본 전파):
+    좁힌 타입으로만 잡고 나머지는 Python 기본 전파):
 
-    - `MinuteCsvLoadError` · `RuntimeError` → exit 2 (입력·설정 오류, 재시도
-      무의미). CSV 스키마 오류, 알 수 없는 prefix/필드, 범위 검증 위반 등.
+    - `MinuteCsvLoadError` · `KisMinuteBarLoadError` · `UniverseLoadError` ·
+      `RuntimeError` → exit 2 (입력·설정 오류, 재시도 무의미). CSV 스키마
+      오류, 알 수 없는 prefix/필드, 범위 검증 위반, 유니버스 YAML 결손 등.
+      `UniverseLoadError` 는 `Exception` 직상속이라 `RuntimeError` 분기에
+      잡히지 않으므로 별도 분기 필요 (`scripts/backtest.py` 와 동일 계약).
     - `OSError` → exit 3 (I/O 오류, 재시도 가치 있음). 디스크 풀·권한·경로
       오류 등.
     - 위 이외의 예외는 버그로 간주해 Python traceback 그대로 종료 (loguru 가
@@ -254,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
         return _EXIT_INPUT_ERROR
     except KisMinuteBarLoadError as e:
         logger.error(f"KIS 분봉 입력 오류: {e}")
+        return _EXIT_INPUT_ERROR
+    except UniverseLoadError as e:
+        logger.error(f"유니버스 YAML 오류: {e}")
         return _EXIT_INPUT_ERROR
     except RuntimeError as e:
         logger.error(f"설정·검증 오류: {e}")
