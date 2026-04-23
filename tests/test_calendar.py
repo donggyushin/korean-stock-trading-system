@@ -60,7 +60,7 @@ def _make_valid_yaml_content(
     *,
     as_of_date: str = "2026-04-23",
     source: str = "KRX 정보데이터시스템 [12001] 휴장일 정보",
-    holidays: list = None,
+    holidays: list | None = None,
 ) -> dict:
     """유효한 holidays YAML 내용을 dict 로 반환."""
     if holidays is None:
