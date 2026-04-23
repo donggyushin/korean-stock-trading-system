@@ -70,6 +70,7 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
     - 페이지 단위 전원 파싱 실패가 여러 번 관측되면 `_fetch_day` return 직전 별도 `logger.warning` 1줄 방출 — `malformed_pages_count=N`. `malformed_pages_count=` 는 운영 grep 계약.
     - 전체 `row={!r}` repr 은 제거 (로그 용량·가격 유출 방지) — `_parse_decimal`/`_parse_int` 에 필드 라벨(`field=`) 포함, raw 원값은 포함 안 함. 진단이 필요하면 `scripts/debug_kis_minute.py` 로 분리된 덤프 경로 사용.
     - `_ParseSkipError.from_row(kind, row, detail=None)` classmethod 팩토리 — "항상 sorted dict keys" 계약을 단일 지점에 격리. `_parse_row` 의 모든 raise 지점이 `from_row` 경유.
+  - **주말 영업일 가드 (Issue #61)**: `_collect_symbol_bars` 에서 `current.weekday() >= 5` (토=5, 일=6) 이면 `_fetch_day` 호출 없이 skip. KIS 주말 요청 시 직전 영업일 데이터가 반환되어 `date_mismatch` 로 전원 skip 되던 허탕 호출 제거. 공휴일(월~금) 은 여전히 KIS 호출 후 `date_mismatch` skip 경로. `_fetch_day` docstring 정정: 빈 응답은 보관 경계 밖(≒1년 이전) 에만 해당 — 주말·공휴일에는 KIS 가 직전 영업일 데이터를 반환하므로 빈 응답 아님.
   - **단일 스레드 전용 (ADR-0008)**: `sqlite3.Connection` 기본값 `check_same_thread=True` 유지. `_lock` 은 `_ensure_kis` 지연 초기화만 보호 — 다른 스레드에서 DB 호출 경로 진입 시 `sqlite3.ProgrammingError` 폭파. 백테스트 엔진 병렬화 요구 발생 시 별도 ADR 로 재평가 (H3 명문화, Issue #48).
   - **KIS 서버 보관 한도**: **최대 1년 분봉**. 2~3년 백테스트 요구는 본 어댑터로 해결 불가. Issue #5 후속으로 별도 데이터 소스(외부 유료 데이터, 직접 수집 등) 분리 평가 필요. Phase 2 PASS 검증은 CSV 어댑터(`minute_csv.py`)로 수행한다.
   - **`BarLoader` Protocol 준수**: `backtest/loader.py`의 `BarLoader` Protocol — `stream(start, end, symbols)` 계약 충족. 동일 인자 재호출 시 매번 새 Iterable 반환.
@@ -109,7 +110,7 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 - `universe.py`: 실제 PyYAML import 허용(외부 네트워크 없음), 파일은 `tmp_path` 에 작성해 격리. 로거 캡처는 loguru sink 바인딩으로.
 - `realtime.py`: 실 pykis import 금지. `pykis_factory` 에 `MagicMock` 반환 팩토리 주입, `clock` 주입으로 분 경계 제어, `polling_interval_s=0.0` 으로 폴링 루프 단축. WebSocket 모드 테스트는 `ensure_connected` 성공 mock, 폴링 fallback 테스트는 `ensure_connected` 를 `TimeoutError` 로 mock. 27 케이스 — 생명주기·WebSocket·폴링·분봉 집계·가드/엣지·live 키(fail-fast·factory 호출·`install_order_block_guard` 호출) 카테고리 커버.
 - `minute_csv.py`: 외부 I/O 없음 (stdlib `csv` + `tmp_path` CSV 작성만). 헬퍼로 `_write_csv(tmp_path, symbol, rows, *, header)` 패턴 사용 — 헤더 오버라이드로 정상·오류 시나리오를 같은 헬퍼로 커버. 56 케이스 — 생성자·정상 stream·다중 심볼·중복 심볼 행위 고정·날짜/심볼 필터·빈 파일·volume·헤더/행 파싱·bar_time/오프셋/분 경계·가격/OHLC·심볼 포맷·`symbols=()` `RuntimeError` 카테고리 커버.
-- `kis_minute_bars.py`: 실 KIS API 접촉 0. `pykis_factory` 에 `MagicMock` 반환 팩토리 주입, `kis.fetch()` 응답을 dict 더블로 대체. `EGW00201` 레이트 리밋 재시도·페이지네이션 종료 조건·캐시 적중·SQLite 저장·`has_live_keys=False` fail-fast 시나리오 포함. Issue #57 강화분: `TestParseSkipDetailField`(4) · `TestMalformedPageWarningKindsObserved`(2) · `TestMalformedPagesCountSummary`(3) · `TestParseSkipErrorFromRowFactory`(3) 추가. **70 케이스**.
+- `kis_minute_bars.py`: 실 KIS API 접촉 0. `pykis_factory` 에 `MagicMock` 반환 팩토리 주입, `kis.fetch()` 응답을 dict 더블로 대체. `EGW00201` 레이트 리밋 재시도·페이지네이션 종료 조건·캐시 적중·SQLite 저장·`has_live_keys=False` fail-fast 시나리오 포함. Issue #57 강화분: `TestParseSkipDetailField`(4) · `TestMalformedPageWarningKindsObserved`(2) · `TestMalformedPagesCountSummary`(3) · `TestParseSkipErrorFromRowFactory`(3) 추가. Issue #61 강화분: `TestCollectSymbolBarsWeekendSkip`(3) 추가. **75 케이스**.
 - DB 는 `tmp_path / "test.db"` 또는 `":memory:"` 사용. `clock` 주입으로 "오늘" 판정을 고정.
 - 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root CLAUDE.md 하드 규칙).
 - 관련 테스트: `tests/test_historical.py`, `tests/test_universe.py`, `tests/test_realtime.py`, `tests/test_minute_csv.py`, `tests/test_kis_minute_bar_loader.py`.

@@ -375,6 +375,14 @@ class KisMinuteBarLoader:
 
         current = end
         while current >= start:
+            # 영업일 가드 (Issue #61): KIS 는 주말 요청 시 빈 응답 대신 직전 영업일
+            # 데이터를 반환 → `_parse_row` 가 `date_mismatch` 로 전원 skip → API 호출
+            # 낭비 + rate limit 유발. 토(5)·일(6) 은 `_fetch_day` 호출 자체를 생략.
+            # 공휴일(월~금 중) 은 여전히 KIS 호출 후 `date_mismatch` 경로로 skip —
+            # 공휴일 캘린더 도입은 후속 이슈.
+            if current.weekday() >= 5:
+                current -= timedelta(days=1)
+                continue
             if current == today:
                 day_bars = self._fetch_day(symbol, current)
                 collected.extend(day_bars)
@@ -465,7 +473,12 @@ class KisMinuteBarLoader:
     def _fetch_day(self, symbol: str, day: date) -> list[MinuteBar]:
         """단일 날짜의 전체 bar 를 120 건 역방향 커서 페이지네이션으로 수집.
 
-        빈 응답은 주말·공휴일 또는 KIS 서버 보관 경계 밖으로 간주해 빈 리스트 반환.
+        빈 응답은 KIS 서버 보관 경계 밖(≒1년 이전) 으로 간주해 빈 리스트 반환.
+        주말은 `_collect_symbol_bars` 영업일 가드에서 걸러지므로 이 경로로 진입하지
+        않는다 — 혹 진입하더라도 KIS 는 **직전 영업일 데이터를 반환**해 `_parse_row`
+        가 `date_mismatch` 카테고리로 전원 skip 한다 (운영자 로그 상 정상 경로, Issue #61).
+        공휴일(월~금 중) 은 KIS 가 동일하게 직전 영업일 데이터를 반환 — `date_mismatch`
+        skip 경로로 처리되며, 공휴일 캘린더 도입은 별도 이슈.
 
         운영 경보 (M2, Issue #52 + Issue #57): `rows` 는 비어있지 않은데 `page_bars`
         가 비는 (전원 파싱 실패) 상황은 KIS 응답 스키마 변경 또는 수신 오염 징후라

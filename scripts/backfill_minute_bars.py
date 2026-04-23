@@ -10,8 +10,9 @@ uv run python scripts/backfill_minute_bars.py \
 
 `--throttle-s` 기본값 0.2s 는 KIS 실전 시세 API 공식 한도(계좌당 20 req/s) 대비
 페이지 호출 간격을 ≒ 5 req/s 수준으로 묶어 python-kis 내장 limiter 와 이중 안전을
-제공한다. 부하가 낮은 상황에서 가속하려면 `--throttle-s 0.1` 등으로 조절 가능하나,
-0 에 가까우면 KIS 측에서 "API 호출 횟수를 초과" 경고가 누적될 수 있다 (Issue #52).
+제공한다. 부하가 낮은 상황에서 가속하려면 `--throttle-s 0.1` 까지 조절 가능하며,
+`< 0.1` 은 `_EXIT_INPUT_ERROR` 로 거부된다 (KIS rate limit EGW00201 누적 방지,
+Issue #61).
 
 동작
 - `KisMinuteBarLoader` (실전 키 전용) 로 심볼별 `stream(start, end, (symbol,))`
@@ -96,9 +97,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.2,
         help=(
-            "페이지 호출 사이 추가 sleep 초 (0 이상). KIS 실전 시세 API 공식 "
+            "페이지 호출 사이 추가 sleep 초 (0.1 이상). KIS 실전 시세 API 공식 "
             "한도는 계좌당 20 req/s 수준 — 0.2s 간격 ≒ 5 req/s 로 python-kis "
-            "내장 limiter 와 이중 안전."
+            "내장 limiter 와 이중 안전. `< 0.1` 은 EGW00201 rate limit 유발로 거부."
         ),
     )
     parser.add_argument(
@@ -227,8 +228,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.start > args.end:
         logger.error(f"--from({args.start}) 는 --to({args.end}) 이전이어야 합니다.")
         return _EXIT_INPUT_ERROR
-    if args.throttle_s < 0:
-        logger.error(f"--throttle-s 는 0 이상이어야 합니다 (got={args.throttle_s}).")
+    if args.throttle_s < 0.1:
+        logger.error(
+            f"--throttle-s 는 0.1 이상이어야 합니다 (got={args.throttle_s}). "
+            f"KIS 실전 시세 API rate limit(EGW00201) 방지 하한 (Issue #61)."
+        )
         return _EXIT_INPUT_ERROR
 
     try:

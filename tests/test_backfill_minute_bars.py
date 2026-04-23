@@ -691,3 +691,57 @@ class TestMainExitCode:
         monkeypatch.setattr(backfill_cli, "_run_pipeline", _fake_pipeline)
         result = main(["--from=2026-01-02", "--to=2026-01-02"])
         assert result in (_EXIT_OK, _EXIT_PARTIAL_FAILURE)
+
+
+# ===========================================================================
+# 5. throttle-s 하한 가드 — Issue #61
+# ===========================================================================
+
+
+class TestThrottleLowerBoundGuard:
+    """--throttle-s < 0.1 은 KIS rate limit 방지를 위해 거부돼야 한다 (Issue #61).
+
+    수정 전 현재 HEAD 기준으로 두 케이스 모두 FAIL 한다 (RED 상태).
+    - main() 이 0.1 미만 throttle_s 를 _EXIT_INPUT_ERROR(2) 로 거부하지 않음.
+    """
+
+    _BASE_DATE_ARGV = ["--from=2025-04-22", "--to=2025-04-22"]
+
+    def test_throttle_s_below_minimum_returns_input_error(self, monkeypatch):
+        """--throttle-s 0.05 (< 0.1) → _EXIT_INPUT_ERROR(2) 반환.
+
+        KisMinuteBarLoader 팩토리(클래스)는 호출되지 않아야 한다.
+        """
+        _require_module()
+
+        loader_cls = MagicMock()
+        monkeypatch.setattr(backfill_cli, "KisMinuteBarLoader", loader_cls)
+        monkeypatch.setattr(
+            backfill_cli,
+            "get_settings",
+            lambda: _make_fake_settings(has_live_keys=True),
+        )
+
+        result = main([*self._BASE_DATE_ARGV, "--throttle-s=0.05", "--symbols=005930"])
+
+        msg = f"0.1 미만 throttle_s 는 _EXIT_INPUT_ERROR(2) 를 반환해야 한다. 실제={result!r}"
+        assert result == _EXIT_INPUT_ERROR, msg
+        loader_cls.assert_not_called(), "KisMinuteBarLoader 가 호출되지 않아야 한다."
+
+    def test_throttle_s_exactly_minimum_accepted(self, monkeypatch):
+        """--throttle-s 0.1 (경계값) → _EXIT_INPUT_ERROR 로 거부되지 않고 정상 통과."""
+        _require_module()
+
+        fake_loader = _make_fake_loader(bars_per_symbol=[])
+        loader_cls = MagicMock(return_value=fake_loader)
+        monkeypatch.setattr(backfill_cli, "KisMinuteBarLoader", loader_cls)
+        monkeypatch.setattr(
+            backfill_cli,
+            "get_settings",
+            lambda: _make_fake_settings(has_live_keys=True),
+        )
+
+        result = main([*self._BASE_DATE_ARGV, "--throttle-s=0.1", "--symbols=005930"])
+
+        msg = f"throttle_s=0.1 은 정상 처리돼야 한다. 실제 exit code={result!r}"
+        assert result != _EXIT_INPUT_ERROR, msg
