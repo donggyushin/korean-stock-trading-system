@@ -5,9 +5,13 @@
 ```
 uv run python scripts/backfill_minute_bars.py \
   --from 2025-04-22 --to 2026-04-22 \
-  --symbols 005930,000660 \
-  --throttle-s 0.0
+  --symbols 005930,000660
 ```
+
+`--throttle-s` 기본값 0.2s 는 KIS 실전 시세 API 공식 한도(계좌당 20 req/s) 대비
+페이지 호출 간격을 ≒ 5 req/s 수준으로 묶어 python-kis 내장 limiter 와 이중 안전을
+제공한다. 부하가 낮은 상황에서 가속하려면 `--throttle-s 0.1` 등으로 조절 가능하나,
+0 에 가까우면 KIS 측에서 "API 호출 횟수를 초과" 경고가 누적될 수 있다 (Issue #52).
 
 동작
 - `KisMinuteBarLoader` (실전 키 전용) 로 심볼별 `stream(start, end, (symbol,))`
@@ -90,8 +94,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--throttle-s",
         type=float,
-        default=0.0,
-        help="페이지 호출 사이 추가 sleep 초 (KIS 레이트 리밋 완화 — 0 이상).",
+        default=0.2,
+        help=(
+            "페이지 호출 사이 추가 sleep 초 (0 이상). KIS 실전 시세 API 공식 "
+            "한도는 계좌당 20 req/s 수준 — 0.2s 간격 ≒ 5 req/s 로 python-kis "
+            "내장 limiter 와 이중 안전."
+        ),
     )
     parser.add_argument(
         "--cache-db-path",

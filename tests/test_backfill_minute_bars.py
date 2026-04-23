@@ -203,10 +203,10 @@ class TestParseArgs:
         args = _parse_args(["--from=2025-04-01", "--to=2026-04-01"])
         assert args.symbols == ""
 
-    def test_기본값_throttle_s_0(self):
-        """--throttle-s 미지정 → 기본값 0.0."""
+    def test_기본값_throttle_s_0_2(self):
+        """--throttle-s 미지정 → 기본값 0.2."""
         args = _parse_args(["--from=2025-04-01", "--to=2026-04-01"])
-        assert args.throttle_s == pytest.approx(0.0)
+        assert args.throttle_s == pytest.approx(0.2)
 
     def test_기본값_cache_db_path_None(self):
         """--cache-db-path 미지정 → 기본값 None."""
