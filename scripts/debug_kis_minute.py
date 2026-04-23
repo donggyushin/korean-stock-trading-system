@@ -13,12 +13,16 @@ uv run python scripts/debug_kis_minute.py --symbol 005930 --date 2026-04-17
 
 동작
 - `Settings.has_live_keys == True` 게이트 — 실전 키 없으면 즉시 exit 2.
-- 실전 키 PyKis 인스턴스 생성 + `install_order_block_guard` 설치.
+- 실전 키 PyKis 인스턴스 생성 + `install_order_block_guard` 설치. 생성·fetch 실패는
+  `RuntimeError` 로 래핑해 exit 2 로 귀속 (Issue #52 C2).
 - `kis.fetch(<path>, api="FHKST03010230", params={...}, domain="real")` 1회 호출.
 - 응답 메타(`type`, `__data__` 존재, `rt_cd`·`msg_cd`·`msg1`) + `output2` 길이·첫
-  행 타입·정렬된 key 목록 + 첫 3 행 JSON 덤프를 stdout 과 파일 두 곳에 기록.
-- 가격·거래량 외 민감 정보(계좌번호·토큰 등) 는 포함하지 않는다 — 응답에 섞여
-  있으면 `output1` 덤프는 생략.
+  행 타입·정렬된 key 목록 + 첫 3 행 샘플을 stdout 과 파일 두 곳에 기록.
+- **기본은 key 목록만** (가격·거래량 값 유출 차단). `--include-values` opt-in
+  플래그를 지정하면 첫 3행 raw dict 값까지 포함 — 민감 가격 정보가 디스크·stdout
+  에 남을 수 있으므로 진단 긴급 시에만 사용.
+- 민감 정보(계좌번호·토큰 등) 가 섞여 오더라도 `output1` 는 설계상 수집하지
+  않는다 — `response.root_keys` 로 존재 여부만 확인 가능.
 
 exit code (`scripts/backfill_minute_bars.py` 기조)
 - 0: 정상 완료.
@@ -97,6 +101,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="덤프 JSON 저장 경로. 미지정 시 data/debug_kis_minute_<ts>.json.",
     )
+    parser.add_argument(
+        "--include-values",
+        action="store_true",
+        default=False,
+        help=(
+            "첫 3행 샘플에 가격·거래량 값까지 포함 (opt-in). 기본은 key 목록만 "
+            "기록해 로그·JSON 파일에 가격 유출을 차단한다."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -112,7 +125,10 @@ def _validate_args(args: argparse.Namespace) -> None:
 def _build_pykis(settings: Any) -> Any:
     """실전 키 PyKis 인스턴스 생성 + order block guard 설치.
 
-    `KisMinuteBarLoader._ensure_kis` 와 같은 파라미터 계약을 사용한다.
+    `KisMinuteBarLoader._ensure_kis` 와 같은 파라미터 계약을 사용하되, PyKis
+    생성·guard 설치 실패는 모두 `RuntimeError` 로 래핑해 `main` 의 exit 2 경로로
+    귀속시킨다 — `scripts/backfill_minute_bars.py` · `KisMinuteBarLoader` 의
+    예외 계약과 정합 (Issue #52 C2).
     """
     from pykis import PyKis  # noqa: PLC0415
 
@@ -120,14 +136,17 @@ def _build_pykis(settings: Any) -> Any:
     assert settings.kis_live_app_secret is not None
     assert settings.kis_live_account_no is not None
 
-    kis = PyKis(
-        id=settings.kis_hts_id,
-        account=settings.kis_live_account_no,
-        appkey=settings.kis_live_app_key.get_secret_value(),
-        secretkey=settings.kis_live_app_secret.get_secret_value(),
-        keep_token=True,
-    )
-    install_order_block_guard(kis)
+    try:
+        kis = PyKis(
+            id=settings.kis_hts_id,
+            account=settings.kis_live_account_no,
+            appkey=settings.kis_live_app_key.get_secret_value(),
+            secretkey=settings.kis_live_app_secret.get_secret_value(),
+            keep_token=True,
+        )
+        install_order_block_guard(kis)
+    except Exception as exc:
+        raise RuntimeError(f"PyKis 실전 인스턴스 생성 실패: {exc}") from exc
     return kis
 
 
@@ -185,7 +204,10 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
         d=date_str,
         c=args.cursor,
     )
-    response = kis.fetch(_API_PATH, api=_TR_ID, params=params, domain="real")
+    try:
+        response = kis.fetch(_API_PATH, api=_TR_ID, params=params, domain="real")
+    except Exception as exc:
+        raise RuntimeError(f"KIS fetch 호출 실패: {exc}") from exc
 
     data, response_type = _extract_raw_data(response)
     diagnostic: dict[str, Any] = {
@@ -209,6 +231,7 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
             "first_row_type": None,
             "first_row_keys": None,
             "sample_rows": None,
+            "include_values": bool(args.include_values),
         },
     }
 
@@ -222,12 +245,19 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
         return diagnostic
 
     diagnostic["output2"]["length"] = len(output2)
+    diagnostic["output2"]["include_values"] = bool(args.include_values)
     if output2:
         first = output2[0]
         diagnostic["output2"]["first_row_type"] = type(first).__name__
         if isinstance(first, dict):
             diagnostic["output2"]["first_row_keys"] = sorted(first.keys())
-        diagnostic["output2"]["sample_rows"] = [_coerce_json_safe(row) for row in output2[:3]]
+        if args.include_values:
+            diagnostic["output2"]["sample_rows"] = [_coerce_json_safe(row) for row in output2[:3]]
+        else:
+            diagnostic["output2"]["sample_rows"] = [
+                sorted(row.keys()) if isinstance(row, dict) else type(row).__name__
+                for row in output2[:3]
+            ]
 
     return diagnostic
 
@@ -243,6 +273,7 @@ def _print_human(diagnostic: dict[str, Any]) -> None:
     logger.info(f"response.root_keys: {res['root_keys']}")
     logger.info(f"output2.length: {out['length']}  first_row_type: {out['first_row_type']}")
     logger.info(f"output2.first_row_keys: {out['first_row_keys']}")
+    logger.info(f"output2.include_values: {out.get('include_values')}")
     sample = out.get("sample_rows") or []
     for idx, row in enumerate(sample):
         logger.info(f"output2[{idx}]: {row!r}")
