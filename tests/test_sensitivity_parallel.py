@@ -263,9 +263,8 @@ class TestDeterminismVsSerial:
         )
 
         for r_serial, r_parallel in zip(rows_serial, rows_parallel, strict=True):
-            assert (
-                r_serial.params == r_parallel.params
-            ), f"params 불일치: serial={r_serial.params}, parallel={r_parallel.params}"
+            msg = f"params 불일치: serial={r_serial.params}, parallel={r_parallel.params}"
+            assert r_serial.params == r_parallel.params, msg
 
     def test_net_pnl_직렬과_동일_workers2(self):
         """max_workers=2 — 각 행의 metrics.net_pnl_krw 가 직렬 결과와 일치."""
@@ -369,9 +368,8 @@ class TestOrderPreserved:
         assert len(rows_parallel) == len(combos)
         for i, (combo, row) in enumerate(zip(combos, rows_parallel, strict=True)):
             expected_params = tuple(combo.items())
-            assert (
-                row.params == expected_params
-            ), f"index={i}: 기대={expected_params}, 실제={row.params}"
+            msg = f"index={i}: 기대={expected_params}, 실제={row.params}"
+            assert row.params == expected_params, msg
 
     def test_단일_워커_순서_보장(self):
         """max_workers=1 에서도 순서가 보장된다."""
