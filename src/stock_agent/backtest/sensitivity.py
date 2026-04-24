@@ -372,7 +372,9 @@ def run_sensitivity_parallel(
             raise
     # 정상 종료 경로에서는 모든 인덱스가 채워져야 함 — 누락은 내부 invariant 위반.
     if any(r is None for r in results):
-        raise RuntimeError("run_sensitivity_parallel 내부 오류: 결과 누락 (combo idx 순서 무결성 위반)")
+        raise RuntimeError(
+            "run_sensitivity_parallel 내부 오류: 결과 누락 (combo idx 순서 무결성 위반)"
+        )
     return tuple(r for r in results if r is not None)
 
 

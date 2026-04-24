@@ -156,9 +156,9 @@ class TestWorkersRouting:
         called: dict[str, bool] = {"serial": False, "parallel": False}
 
         # 더미 loader — stream() 이 빈 이터러블 반환
-        from stock_agent.backtest import InMemoryBarLoader as _IML
+        from stock_agent.backtest import InMemoryBarLoader  # noqa: PLC0415
 
-        _dummy_loader = _IML([])
+        _dummy_loader = InMemoryBarLoader([])
 
         def _fake_build_loader(*args, **kwargs):
             return _dummy_loader
@@ -175,7 +175,9 @@ class TestWorkersRouting:
             return ()
 
         monkeypatch.setattr(sensitivity_cli, "_build_loader", _fake_build_loader)
-        monkeypatch.setattr(sensitivity_cli, "_build_loader_primitive", _fake_build_loader_primitive)
+        monkeypatch.setattr(
+            sensitivity_cli, "_build_loader_primitive", _fake_build_loader_primitive
+        )
         monkeypatch.setattr(sensitivity_cli, "run_sensitivity", _fake_serial)
         # run_sensitivity_parallel 가 없으면 AttributeError → RED
         monkeypatch.setattr(sensitivity_cli, "run_sensitivity_parallel", _fake_parallel)
@@ -230,5 +232,6 @@ class TestWorkersRouting:
         assert result == 0, f"exit code 기대 0, 실제 {result}"
         # 기본값이 어떤 경로든 반드시 하나는 호출돼야 한다
         assert called["serial"] or called["parallel"], (
-            "--workers 미지정 시 run_sensitivity 또는 run_sensitivity_parallel 중 하나가 호출돼야 한다"
+            "--workers 미지정 시 run_sensitivity 또는 run_sensitivity_parallel 중 하나가 "
+            "호출돼야 한다"
         )

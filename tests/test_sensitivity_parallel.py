@@ -37,6 +37,7 @@ from stock_agent.backtest import (
 # run_sensitivity_parallel 는 아직 미구현 — ImportError 로 RED 확인
 try:
     from stock_agent.backtest import run_sensitivity_parallel  # type: ignore[attr-defined]
+
     _IMPORT_OK = True
 except (ImportError, AttributeError):
     run_sensitivity_parallel = None  # type: ignore[assignment]
@@ -205,9 +206,7 @@ _requires_parallel = pytest.mark.skipif(
 
 def _assert_api_exists() -> None:
     """run_sensitivity_parallel 가 import 되지 않으면 AssertionError."""
-    assert (
-        _IMPORT_OK and run_sensitivity_parallel is not None
-    ), (
+    assert _IMPORT_OK and run_sensitivity_parallel is not None, (
         "run_sensitivity_parallel 가 stock_agent.backtest 에 없음 — "
         "ImportError/AttributeError (RED 상태)"
     )
@@ -264,9 +263,9 @@ class TestDeterminismVsSerial:
         )
 
         for r_serial, r_parallel in zip(rows_serial, rows_parallel, strict=True):
-            assert r_serial.params == r_parallel.params, (
-                f"params 불일치: serial={r_serial.params}, parallel={r_parallel.params}"
-            )
+            assert (
+                r_serial.params == r_parallel.params
+            ), f"params 불일치: serial={r_serial.params}, parallel={r_parallel.params}"
 
     def test_net_pnl_직렬과_동일_workers2(self):
         """max_workers=2 — 각 행의 metrics.net_pnl_krw 가 직렬 결과와 일치."""
@@ -370,9 +369,9 @@ class TestOrderPreserved:
         assert len(rows_parallel) == len(combos)
         for i, (combo, row) in enumerate(zip(combos, rows_parallel, strict=True)):
             expected_params = tuple(combo.items())
-            assert row.params == expected_params, (
-                f"index={i}: 기대={expected_params}, 실제={row.params}"
-            )
+            assert (
+                row.params == expected_params
+            ), f"index={i}: 기대={expected_params}, 실제={row.params}"
 
     def test_단일_워커_순서_보장(self):
         """max_workers=1 에서도 순서가 보장된다."""
@@ -641,5 +640,8 @@ class TestImportExists:
 
     def test_run_sensitivity_parallel_importable(self):
         """stock_agent.backtest 에서 run_sensitivity_parallel 를 import 할 수 있어야 한다."""
-        from stock_agent.backtest import run_sensitivity_parallel as _fn  # type: ignore[attr-defined]  # noqa: F401
+        from stock_agent.backtest import (  # noqa: F401, PLC0415
+            run_sensitivity_parallel as _fn,
+        )
+
         assert callable(_fn), "run_sensitivity_parallel 는 callable 이어야 한다"
