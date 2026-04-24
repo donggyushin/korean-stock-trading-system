@@ -272,11 +272,40 @@ def run_sensitivity(
         RuntimeError: 알 수 없는 prefix/필드명 등 config 생성 실패. 또는 config
             `__post_init__` 의 범위·순서 검증 위반.
     """
+    return run_sensitivity_combos(
+        loader=loader,
+        start=start,
+        end=end,
+        symbols=symbols,
+        base_config=base_config,
+        combos=list(grid.iter_combinations()),
+    )
+
+
+def run_sensitivity_combos(
+    loader: BarLoader,
+    start: date,
+    end: date,
+    symbols: tuple[str, ...],
+    base_config: BacktestConfig,
+    combos: list[dict[str, Any]],
+) -> tuple[SensitivityRow, ...]:
+    """명시적 조합 리스트에 대한 직렬 실행 — resume 경로용.
+
+    `run_sensitivity` 와 동일하지만 `grid.iter_combinations()` 대신 주어진
+    `combos` 를 그대로 순회한다. resume 플로우에서 미완료 조합만 실행하는
+    CLI 경로가 이 API 를 쓴다.
+
+    빈 `combos` 는 빈 튜플을 반환한다 (resume 플로우 상 "이미 전부 완료"
+    상태를 나타내는 유효 입력).
+
+    Args / Raises 계약은 `run_sensitivity` 와 동일. combos 순서가 반환 rows
+    순서와 1:1 대응한다.
+    """
     rows: list[SensitivityRow] = []
-    for combo in grid.iter_combinations():
+    for combo in combos:
         config = _apply_combo(base_config, combo)
         engine = BacktestEngine(config)
-        # 실패 시 traceback 만으로 combo 추적 가능하도록 직전에 debug 로그.
         logger.debug("sensitivity.run.attempt combo={combo}", combo=combo)
         result = engine.run(loader.stream(start, end, symbols))
         rows.append(_result_to_row(combo, result))
@@ -340,7 +369,46 @@ def run_sensitivity_parallel(
     """
     if max_workers is not None and max_workers < 1:
         raise RuntimeError(f"max_workers 는 1 이상이어야 합니다 (got={max_workers})")
-    combos = list(grid.iter_combinations())
+    return run_sensitivity_combos_parallel(
+        loader_factory=loader_factory,
+        start=start,
+        end=end,
+        symbols=symbols,
+        base_config=base_config,
+        combos=list(grid.iter_combinations()),
+        max_workers=max_workers,
+        mp_context=mp_context,
+    )
+
+
+def run_sensitivity_combos_parallel(
+    loader_factory: Callable[[], BarLoader],
+    start: date,
+    end: date,
+    symbols: tuple[str, ...],
+    base_config: BacktestConfig,
+    combos: list[dict[str, Any]],
+    *,
+    max_workers: int | None = None,
+    mp_context: BaseContext | None = None,
+) -> tuple[SensitivityRow, ...]:
+    """명시적 조합 리스트에 대한 병렬 실행 — resume 경로용.
+
+    `run_sensitivity_parallel` 와 동일하지만 `grid.iter_combinations()` 대신
+    주어진 `combos` 를 그대로 워커에 분산한다. 결과는 `combo_idx` 기준으로
+    정렬되어 입력 `combos` 순서와 1:1 대응한다.
+
+    빈 `combos` 는 빈 튜플을 반환한다 — ProcessPool 은 생성하지 않는다
+    (resume 플로우 상 "이미 전부 완료" 상태 단락).
+
+    Raises:
+        RuntimeError: `max_workers < 1`.
+        Exception: 워커 안에서 발생한 첫 예외. 잔여 future 는 즉시 취소.
+    """
+    if max_workers is not None and max_workers < 1:
+        raise RuntimeError(f"max_workers 는 1 이상이어야 합니다 (got={max_workers})")
+    if not combos:
+        return ()
     results: list[SensitivityRow | None] = [None] * len(combos)
     logger.info(
         "sensitivity.parallel.start combos={c} workers={w}",
@@ -366,11 +434,8 @@ def run_sensitivity_parallel(
                 idx, row = future.result()
                 results[idx] = row
         except BaseException:
-            # 첫 예외 → 잔여 future 즉시 취소. context manager 의 shutdown(wait=True)
-            # 이 후행돼도 idempotent.
             executor.shutdown(wait=False, cancel_futures=True)
             raise
-    # 정상 종료 경로에서는 모든 인덱스가 채워져야 함 — 누락은 내부 invariant 위반.
     if any(r is None for r in results):
         raise RuntimeError(
             "run_sensitivity_parallel 내부 오류: 결과 누락 (combo idx 순서 무결성 위반)"
@@ -443,6 +508,264 @@ def write_csv(rows: tuple[SensitivityRow, ...], path: Path) -> None:
                 [_format_param(row_params[k]) for k in param_keys]
                 + [_format_metric(k, _get_metric_value(row, k)) for k in metric_keys]
             )
+
+
+# ---------------------------------------------------------------------------
+# Resume 지원 — 기존 CSV 읽어 완료 조합 skip + 병합
+# ---------------------------------------------------------------------------
+
+
+# 축 이름 → 파서 매핑. `write_csv` 의 `_format_param` 은 `str(value)` 로 통일
+# 하므로 역방향 파싱은 축별로 명시 타입 복원. 새 축을 `default_grid` 또는
+# 외부 그리드에 추가할 때 여기에도 파싱 규칙을 추가해야 한다 (미등록 축은
+# `RuntimeError` fail-fast — silent str fallback 금지).
+_AXIS_PARSERS: dict[str, Callable[[str], Any]] = {
+    "strategy.or_start": time.fromisoformat,
+    "strategy.or_end": time.fromisoformat,
+    "strategy.force_close_at": time.fromisoformat,
+    "strategy.stop_loss_pct": Decimal,
+    "strategy.take_profit_pct": Decimal,
+    "risk.position_pct": Decimal,
+    "risk.daily_loss_limit_pct": Decimal,
+    "risk.max_positions": int,
+    "risk.daily_max_entries": int,
+    "risk.min_notional_krw": int,
+    "engine.slippage_rate": Decimal,
+    "engine.commission_rate": Decimal,
+    "engine.sell_tax_rate": Decimal,
+}
+
+
+def load_sensitivity_rows(
+    path: Path, grid: SensitivityGrid
+) -> tuple[SensitivityRow, ...]:
+    """기존 sensitivity CSV 를 파싱해 `SensitivityRow` 튜플로 복원.
+
+    `load_completed_combos` 가 params key 만 반환하는 것과 달리 이 함수는
+    메트릭 10종까지 복원해 `merge_sensitivity_rows` 입력으로 쓸 수 있다.
+    resume 플로우에서 기존 row 를 다시 `render_markdown_table` · `write_csv`
+    로 렌더링하기 위해 필수.
+
+    파싱 규칙:
+    - 축 값 — `_AXIS_PARSERS` (load_completed_combos 와 동일)
+    - 메트릭 — `BacktestMetrics` 7 필드 + 보조 3 필드. Decimal vs int 구분은
+      `_parse_metric_value` 가 필드명 기반으로 결정.
+
+    빈 CSV (데이터 0행) 는 빈 튜플. 파일 자체가 없으면 `FileNotFoundError`.
+
+    Raises:
+        FileNotFoundError: `path` 가 존재하지 않을 때.
+        RuntimeError: 헤더에 축/메트릭 이름 누락, 파싱 규칙 없는 축, 또는
+            행 길이가 헤더와 다를 때.
+    """
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    axis_names = tuple(ax.name for ax in grid.axes)
+    metric_names = _metric_columns()
+    with path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.reader(fp)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return ()
+        data_rows = list(reader)
+        if not data_rows:
+            return ()
+        missing_axes = [name for name in axis_names if name not in header]
+        if missing_axes:
+            raise RuntimeError(
+                f"CSV 헤더에 축 {missing_axes!r} 가 없습니다 (header={header})"
+            )
+        missing_metrics = [name for name in metric_names if name not in header]
+        if missing_metrics:
+            raise RuntimeError(
+                f"CSV 헤더에 메트릭 {missing_metrics!r} 가 없습니다 (header={header})"
+            )
+        unknown_axes = [name for name in axis_names if name not in _AXIS_PARSERS]
+        if unknown_axes:
+            raise RuntimeError(f"파싱 규칙 없는 축: {unknown_axes!r}")
+        axis_col = {name: header.index(name) for name in axis_names}
+        metric_col = {name: header.index(name) for name in metric_names}
+        rows: list[SensitivityRow] = []
+        for row in data_rows:
+            if len(row) < len(header):
+                raise RuntimeError(
+                    f"CSV 행 길이가 헤더보다 짧습니다 (row={row}, header={header})"
+                )
+            params = tuple(
+                (name, _AXIS_PARSERS[name](row[axis_col[name]])) for name in axis_names
+            )
+            metric_values = {
+                name: _parse_metric_value(name, row[metric_col[name]])
+                for name in metric_names
+            }
+            metrics = BacktestMetrics(
+                total_return_pct=metric_values["total_return_pct"],
+                max_drawdown_pct=metric_values["max_drawdown_pct"],
+                sharpe_ratio=metric_values["sharpe_ratio"],
+                win_rate=metric_values["win_rate"],
+                avg_pnl_ratio=metric_values["avg_pnl_ratio"],
+                trades_per_day=metric_values["trades_per_day"],
+                net_pnl_krw=metric_values["net_pnl_krw"],
+            )
+            rows.append(
+                SensitivityRow(
+                    params=params,
+                    metrics=metrics,
+                    trade_count=metric_values["trade_count"],
+                    rejected_total=metric_values["rejected_total"],
+                    post_slippage_rejections=metric_values["post_slippage_rejections"],
+                )
+            )
+        return tuple(rows)
+
+
+# 메트릭 필드 → int 로 파싱할 이름 집합. 나머지는 Decimal.
+_INT_METRIC_FIELDS: frozenset[str] = frozenset(
+    {
+        "net_pnl_krw",
+        "trade_count",
+        "rejected_total",
+        "post_slippage_rejections",
+    }
+)
+
+
+def _parse_metric_value(name: str, raw: str) -> Any:
+    """메트릭 필드 1개의 CSV 셀 파싱. 필드명 기반 int vs Decimal 분기."""
+    if name in _INT_METRIC_FIELDS:
+        return int(raw)
+    return Decimal(raw)
+
+
+def load_completed_combos(
+    path: Path, grid: SensitivityGrid
+) -> set[tuple[tuple[str, Any], ...]]:
+    """기존 sensitivity CSV 를 읽어 완료된 조합의 params key set 반환.
+
+    `write_csv` 가 생성한 포맷 (헤더: 축 이름 + 메트릭 10종) 을 가정한다. 각
+    데이터 행의 축 값을 `_AXIS_PARSERS` 로 원형 복원해 `(name, value)` tuple
+    순서대로 (grid 축 순서) 묶어 set 으로 반환한다.
+
+    빈 CSV (헤더만 있고 데이터 0행) 는 빈 set 을 반환한다 — `write_csv((), path)`
+    의 산출물도 헤더만 있고 축 컬럼이 없을 수 있어 (rows 가 비었을 때
+    `_consistent_param_keys` 가 빈 튜플을 반환하므로), 데이터 0행이면 헤더
+    검증을 건너뛴다. 데이터 1행 이상이면 grid.axes 의 모든 이름이 헤더에
+    있어야 하고 모든 축 이름이 `_AXIS_PARSERS` 에 등록되어 있어야 한다.
+
+    Args:
+        path: 기존 sensitivity CSV 파일 경로.
+        grid: 현재 실행 중인 그리드 (축 이름·순서 기준).
+
+    Returns:
+        완료 조합 params key 의 set. 각 key 는 `tuple((name, value), ...)` 로
+        grid 축 순서와 일치한다.
+
+    Raises:
+        FileNotFoundError: `path` 가 존재하지 않을 때.
+        RuntimeError: 데이터 행이 있는데 헤더에 축 이름이 누락됐거나, 축 이름이
+            `_AXIS_PARSERS` 에 등록되지 않은 경우.
+    """
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    axis_names = tuple(ax.name for ax in grid.axes)
+    with path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.reader(fp)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return set()
+        data_rows = list(reader)
+        if not data_rows:
+            return set()
+        missing_cols = [name for name in axis_names if name not in header]
+        if missing_cols:
+            raise RuntimeError(
+                f"CSV 헤더에 축 {missing_cols!r} 가 없습니다 (header={header})"
+            )
+        unknown = [name for name in axis_names if name not in _AXIS_PARSERS]
+        if unknown:
+            raise RuntimeError(f"파싱 규칙 없는 축: {unknown!r}")
+        col_idx = {name: header.index(name) for name in axis_names}
+        completed: set[tuple[tuple[str, Any], ...]] = set()
+        for row in data_rows:
+            key_items: list[tuple[str, Any]] = []
+            for name in axis_names:
+                raw = row[col_idx[name]]
+                parser = _AXIS_PARSERS[name]
+                key_items.append((name, parser(raw)))
+            completed.add(tuple(key_items))
+        return completed
+
+
+def filter_remaining_combos(
+    grid: SensitivityGrid,
+    completed: set[tuple[tuple[str, Any], ...]],
+) -> list[dict[str, Any]]:
+    """grid 에서 completed 에 없는 조합만 dict 리스트로 반환.
+
+    `grid.iter_combinations()` 순서를 유지해 결정론. completed 에 grid 에
+    없는 orphan 키가 섞여 있어도 단순 차집합 시맨틱으로 무시 (추가 검증·
+    경고 없음 — grid 가 사후 좁혀졌을 때 orphan 이 자연스럽게 생김).
+
+    Args:
+        grid: 현재 실행 중인 그리드.
+        completed: `load_completed_combos` 반환값.
+
+    Returns:
+        미완료 조합 dict 리스트. grid 축 순서가 각 dict 의 키 순서로 보존.
+    """
+    remaining: list[dict[str, Any]] = []
+    for combo in grid.iter_combinations():
+        key = tuple(combo.items())
+        if key not in completed:
+            remaining.append(combo)
+    return remaining
+
+
+def merge_sensitivity_rows(
+    existing: tuple[SensitivityRow, ...],
+    new: tuple[SensitivityRow, ...],
+    grid: SensitivityGrid,
+) -> tuple[SensitivityRow, ...]:
+    """existing·new SensitivityRow 를 grid 순서로 병합해 반환.
+
+    병합 정책:
+    - 동일 params 가 existing·new 양쪽에 있으면 **new 우선** (재실행된 조합
+      은 최신 결과 채택).
+    - grid 에 없는 조합이 existing/new 에 섞여 있으면 무시 (orphan).
+    - grid 의 조합이 existing·new 합집합에 없으면 `RuntimeError` (resume
+      flow 불완전 — 호출자가 미완료 조합을 실행해야 함).
+
+    Args:
+        existing: 기존 CSV 에서 로드한 row (또는 이전 실행 결과).
+        new: 이번 실행에서 추가된 row.
+        grid: 현재 실행 중인 그리드 (순서·포함 여부 기준).
+
+    Returns:
+        grid 순서로 정렬된 `SensitivityRow` 튜플. 길이 = `grid.size`.
+
+    Raises:
+        RuntimeError: 병합 후 grid 의 일부 조합이 누락된 경우.
+    """
+    by_key: dict[tuple[tuple[str, Any], ...], SensitivityRow] = {}
+    for row in existing:
+        by_key[row.params] = row
+    for row in new:
+        by_key[row.params] = row
+    result: list[SensitivityRow] = []
+    missing: list[tuple[tuple[str, Any], ...]] = []
+    for combo in grid.iter_combinations():
+        key = tuple(combo.items())
+        if key in by_key:
+            result.append(by_key[key])
+        else:
+            missing.append(key)
+    if missing:
+        raise RuntimeError(
+            f"병합 후 누락 조합: {len(missing)} 개 — {missing}"
+        )
+    return tuple(result)
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +997,14 @@ __all__ = [
     "SensitivityGrid",
     "SensitivityRow",
     "default_grid",
+    "filter_remaining_combos",
+    "load_completed_combos",
+    "load_sensitivity_rows",
+    "merge_sensitivity_rows",
     "render_markdown_table",
     "run_sensitivity",
+    "run_sensitivity_combos",
+    "run_sensitivity_combos_parallel",
     "run_sensitivity_parallel",
     "write_csv",
 ]

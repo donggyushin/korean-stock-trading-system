@@ -43,10 +43,14 @@ from loguru import logger
 
 from stock_agent.backtest import (
     BacktestConfig,
+    SensitivityRow,
     default_grid,
+    filter_remaining_combos,
+    load_sensitivity_rows,
+    merge_sensitivity_rows,
     render_markdown_table,
-    run_sensitivity,
-    run_sensitivity_parallel,
+    run_sensitivity_combos,
+    run_sensitivity_combos_parallel,
     write_csv,
 )
 from stock_agent.backtest.loader import BarLoader
@@ -160,6 +164,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "모두 워커별 새 인스턴스를 생성 (loader 는 pickle 불가)."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help=(
+            "이전 실행의 CSV 경로. 존재하면 거기 담긴 조합은 skip 하고 "
+            "미완료 조합만 실행 후 병합해 새 CSV/Markdown 으로 덮어쓴다. "
+            "경로를 지정했지만 파일이 없으면 전체 실행(신규)으로 간주. "
+            "컴퓨터 freeze / 재부팅 / 세션 종료에 대한 내성을 제공 — "
+            "같은 --output-csv 경로를 지정하면 idempotent 하게 이어서 실행 가능."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.loader == "csv" and args.csv_dir is None:
         parser.error("--loader=csv 에는 --csv-dir 이 필요합니다.")
@@ -227,67 +243,95 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     그대로 전파.
 
     `--workers` 분기 (ADR-0020):
-    - `1` → 기존 직렬 경로 `run_sensitivity` (회귀 안전망).
-    - `>= 2` → `run_sensitivity_parallel` (`ProcessPoolExecutor`). loader 는
-      워커별 새 인스턴스로 생성하므로 메인 프로세스에서 loader 를 만들지 않는다.
+    - `1` → 직렬 경로 `run_sensitivity_combos` (회귀 안전망).
+    - `>= 2` → `run_sensitivity_combos_parallel` (`ProcessPoolExecutor`).
+      loader 는 워커별 새 인스턴스로 생성하므로 메인 프로세스에서 loader 를
+      만들지 않는다.
+
+    `--resume` 분기:
+    - 미지정 또는 파일 부재 → 전체 그리드 실행 (기존 동작).
+    - 파일 존재 → 기존 row 로드 → 미완료 조합만 실행 → 병합 후 CSV/MD 덮어쓰기.
+      이미 모두 완료된 상태면 엔진 호출 0회. freeze / 재부팅 내성.
     """
     symbols = _resolve_symbols(args.symbols)
     workers = _resolve_workers(args.workers)
     base_config = BacktestConfig(starting_capital_krw=args.starting_capital)
     grid = default_grid()
+
+    existing_rows: tuple[SensitivityRow, ...] = ()
+    remaining_combos = list(grid.iter_combinations())
+    if args.resume is not None and args.resume.exists():
+        existing_rows = load_sensitivity_rows(args.resume, grid)
+        completed = {row.params for row in existing_rows}
+        remaining_combos = filter_remaining_combos(grid, completed)
+        logger.info(
+            "sensitivity.resume loaded={loaded} remaining={remaining} path={p}",
+            loaded=len(existing_rows),
+            remaining=len(remaining_combos),
+            p=args.resume,
+        )
+
     logger.info(
-        "sensitivity.start loader={l} from={s} to={e} symbols={n} combos={c} workers={w}",
+        "sensitivity.start loader={l} from={s} to={e} symbols={n} "
+        "combos_total={c} combos_remaining={r} workers={w}",
         l=args.loader,
         s=args.start,
         e=args.end,
         n=len(symbols),
         c=grid.size,
+        r=len(remaining_combos),
         w=workers,
     )
 
-    if workers == 1:
-        loader = _build_loader(args)
-        try:
-            rows = run_sensitivity(
-                loader=loader,
+    new_rows: tuple[SensitivityRow, ...] = ()
+    if remaining_combos:
+        if workers == 1:
+            loader = _build_loader(args)
+            try:
+                new_rows = run_sensitivity_combos(
+                    loader=loader,
+                    start=args.start,
+                    end=args.end,
+                    symbols=symbols,
+                    base_config=base_config,
+                    combos=remaining_combos,
+                )
+            finally:
+                close = getattr(loader, "close", None)
+                if callable(close):
+                    close()
+        else:
+            loader_factory = functools.partial(
+                _build_loader_primitive,
+                args.loader,
+                args.csv_dir,
+            )
+            new_rows = run_sensitivity_combos_parallel(
+                loader_factory=loader_factory,
                 start=args.start,
                 end=args.end,
                 symbols=symbols,
                 base_config=base_config,
-                grid=grid,
+                combos=remaining_combos,
+                max_workers=workers,
             )
-        finally:
-            close = getattr(loader, "close", None)
-            if callable(close):
-                close()
     else:
-        loader_factory = functools.partial(
-            _build_loader_primitive,
-            args.loader,
-            args.csv_dir,
-        )
-        rows = run_sensitivity_parallel(
-            loader_factory=loader_factory,
-            start=args.start,
-            end=args.end,
-            symbols=symbols,
-            base_config=base_config,
-            grid=grid,
-            max_workers=workers,
-        )
+        logger.info("sensitivity.skip_engine — 이미 완료된 조합으로 재렌더만 수행")
+
+    merged_rows = merge_sensitivity_rows(existing_rows, new_rows, grid)
 
     args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown_table(
-        rows,
+        merged_rows,
         sort_by=args.sort_by,
         descending=not args.ascending,
     )
     args.output_markdown.write_text(markdown, encoding="utf-8")
-    write_csv(rows, args.output_csv)
+    write_csv(merged_rows, args.output_csv)
     logger.info(
         "sensitivity.done rows={n} markdown={m} csv={c}",
-        n=len(rows),
+        n=len(merged_rows),
         m=args.output_markdown,
         c=args.output_csv,
     )
