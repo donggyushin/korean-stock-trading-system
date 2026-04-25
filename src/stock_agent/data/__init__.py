@@ -30,6 +30,11 @@ from stock_agent.data.realtime import (
     RealtimeDataStore,
     TickQuote,
 )
+from stock_agent.data.spread_samples import (
+    SpreadSample,
+    SpreadSampleCollector,
+    SpreadSampleCollectorError,
+)
 from stock_agent.data.universe import (
     KospiUniverse,
     UniverseLoadError,
@@ -51,6 +56,9 @@ __all__ = [
     "MinuteCsvLoadError",
     "RealtimeDataError",
     "RealtimeDataStore",
+    "SpreadSample",
+    "SpreadSampleCollector",
+    "SpreadSampleCollectorError",
     "TickQuote",
     "UniverseLoadError",
     "YamlBusinessDayCalendar",

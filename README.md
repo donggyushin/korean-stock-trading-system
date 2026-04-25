@@ -70,7 +70,7 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 **Phase 2 1차 백테스트 FAIL (2026-04-24, ADR-0019)**. 2026-04-24 에 1년치 KIS 분봉 백필 완료 (199 심볼, 2.78 GB) + `uv run python scripts/backtest.py --loader=kis --from 2025-04-22 --to 2026-04-21` 1회 실행. 결과: **MDD -51.36%**, 총수익률 -50.05%, 샤프 -6.81, 승률 31.35%, 손익비 1.28, 트레이드당 기대값 ≈ -0.28R. Phase 2 PASS 기준 3.4배 초과 미달. **사용자 정책**: 수익률 확인 전까지 Phase 3 진입 금지 (ADR-0019). 복구 5단계 로드맵 A(민감도 그리드) → B(비용 가정 재검정) → C(유니버스 필터) → D(전략 파라미터 구조 변경) → E(전략 교체) 순차 게이팅.
 
-**ADR-0019 복구 로드맵 Step A FAIL (2026-04-25)**. 32 조합 민감도 그리드 실행 (28/32 완료 — 4 조합 미실행, 결과 뒤집힐 가능성 0% 로 즉시 종결). 세 게이트(MDD > -15% · 승률×손익비 > 1.0 · 샤프 > 0) 동시 통과 조합 **0 / 28**. 최고 수익률 -40.91%, 전 조합 샤프 음수. **Step B (비용 가정 재검정)** 로 이행 — KIS 실전 키로 1주 호가 스프레드 샘플 수집 후 슬리피지 0.1% 가정 재보정 여부 판정. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
+**ADR-0019 복구 로드맵 Step A FAIL (2026-04-25)**. 32 조합 민감도 그리드 실행 (28/32 완료 — 4 조합 미실행, 결과 뒤집힐 가능성 0% 로 즉시 종결). 세 게이트(MDD > -15% · 승률×손익비 > 1.0 · 샤프 > 0) 동시 통과 조합 **0 / 28**. 최고 수익률 -40.91%, 전 조합 샤프 음수. **Step B (비용 가정 재검정, Issue #75) 코드·테스트 레벨 완료 (2026-04-26)** — `src/stock_agent/data/spread_samples.py` (`SpreadSampleCollector`) + `scripts/collect_spread_samples.py` 신설. 잔여: 운영자 평일 1주 장중 실 호가 수집 → 종목별·시간대별 중앙값 산출 → ADR-0006 재보정 결정. 상세 설계와 각 Phase의 PASS 기준, 비용·위험 분석은 [`plan.md`](./plan.md)에 있습니다.
 
 **Phase 3 착수 전제 통과** (2026-04-21). 실전 시세 전용 APP_KEY 3종 발급·IP 화이트리스트 등록·평일 장중 `healthcheck.py` 4종 그린(WebSocket 체결 수신 OK) 완료.
 
@@ -121,12 +121,13 @@ stock-agent/
 │   │   ├── rate_limiter.py    # OrderRateLimiter — 주문 경로 전용 (2 req/s, 350ms)
 │   │   └── CLAUDE.md          # 모듈 세부 문서
 │   └── data/
-│       ├── __init__.py        # HistoricalDataStore, HistoricalDataError, DailyBar, KospiUniverse, UniverseLoadError, load_kospi200_universe, RealtimeDataStore, TickQuote, MinuteBar, RealtimeDataError, MinuteCsvBarLoader, MinuteCsvLoadError, KisMinuteBarLoader, KisMinuteBarLoadError export
+│       ├── __init__.py        # HistoricalDataStore, HistoricalDataError, DailyBar, KospiUniverse, UniverseLoadError, load_kospi200_universe, RealtimeDataStore, TickQuote, MinuteBar, RealtimeDataError, MinuteCsvBarLoader, MinuteCsvLoadError, KisMinuteBarLoader, KisMinuteBarLoadError, SpreadSample, SpreadSampleCollector, SpreadSampleCollectorError export
 │       ├── historical.py      # pykrx 일봉 SQLite 캐시 (fetch_daily_ohlcv 전용, 스키마 v3)
 │       ├── universe.py        # KOSPI 200 유니버스 YAML 로더 (load_kospi200_universe)
 │       ├── realtime.py        # 실시간 시세 (RealtimeDataStore — WebSocket 우선 + REST 폴링 fallback)
 │       ├── minute_csv.py      # CSV 과거 분봉 어댑터 (MinuteCsvBarLoader)
 │       ├── kis_minute_bars.py # KIS API 과거 분봉 어댑터 (KisMinuteBarLoader, SQLite 캐시 data/minute_bars.db)
+│       ├── spread_samples.py  # KIS 호가 스프레드 스냅샷 수집기 (SpreadSampleCollector, Step B 인프라)
 │       └── CLAUDE.md          # 모듈 세부 문서
 │   ├── strategy/
 │   │   ├── __init__.py        # EntrySignal, ExitReason, ExitSignal, ORBStrategy, Signal, Strategy, StrategyConfig, StrategyError export
@@ -178,7 +179,8 @@ stock-agent/
     ├── healthcheck.py              # KIS 모의 잔고 조회 + 텔레그램 hello (실주문 없음)
     ├── backtest.py                 # 단일 런 백테스트 CLI
     ├── sensitivity.py              # 파라미터 민감도 32 조합 그리드 (--resume 지정 시 조합 단위 incremental flush, freeze 내성)
-    └── backfill_minute_bars.py     # KIS 과거 분봉 캐시 일괄 적재 CLI
+    ├── backfill_minute_bars.py     # KIS 과거 분봉 캐시 일괄 적재 CLI
+    └── collect_spread_samples.py   # KIS 호가 스프레드 스냅샷 수집 CLI (Step B 인프라, JSONL 출력)
 ```
 
 미착수 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
