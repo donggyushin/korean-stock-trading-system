@@ -36,6 +36,7 @@ import argparse
 import functools
 import os
 import sys
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
@@ -43,10 +44,15 @@ from loguru import logger
 
 from stock_agent.backtest import (
     BacktestConfig,
+    SensitivityRow,
+    append_sensitivity_row,
     default_grid,
+    filter_remaining_combos,
+    load_sensitivity_rows,
+    merge_sensitivity_rows,
     render_markdown_table,
-    run_sensitivity,
-    run_sensitivity_parallel,
+    run_sensitivity_combos,
+    run_sensitivity_combos_parallel,
     write_csv,
 )
 from stock_agent.backtest.loader import BarLoader
@@ -160,6 +166,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "모두 워커별 새 인스턴스를 생성 (loader 는 pickle 불가)."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help=(
+            "이전 실행의 CSV 경로. 존재하면 거기 담긴 조합은 skip 하고 "
+            "미완료 조합만 실행 후 병합해 새 CSV/Markdown 으로 덮어쓴다. "
+            "경로를 지정했지만 파일이 없으면 전체 실행(신규)으로 간주. "
+            "컴퓨터 freeze / 재부팅 / 세션 종료에 대한 내성을 제공 — "
+            "같은 --output-csv 경로를 지정하면 idempotent 하게 이어서 실행 가능."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.loader == "csv" and args.csv_dir is None:
         parser.error("--loader=csv 에는 --csv-dir 이 필요합니다.")
@@ -227,67 +245,117 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     그대로 전파.
 
     `--workers` 분기 (ADR-0020):
-    - `1` → 기존 직렬 경로 `run_sensitivity` (회귀 안전망).
-    - `>= 2` → `run_sensitivity_parallel` (`ProcessPoolExecutor`). loader 는
-      워커별 새 인스턴스로 생성하므로 메인 프로세스에서 loader 를 만들지 않는다.
+    - `1` → 직렬 경로 `run_sensitivity_combos` (회귀 안전망).
+    - `>= 2` → `run_sensitivity_combos_parallel` (`ProcessPoolExecutor`).
+      loader 는 워커별 새 인스턴스로 생성하므로 메인 프로세스에서 loader 를
+      만들지 않는다.
+
+    `--resume` 분기:
+    - 미지정 → 전체 그리드 실행 (기존 동작), incremental flush 없음.
+    - 지정 + 파일 부재 → 전체 실행 + 조합 단위 incremental flush (Issue #82).
+    - 지정 + 파일 존재 → 기존 row 로드 → 미완료 조합만 실행 + 조합 단위
+      incremental flush. 이미 모두 완료된 상태면 엔진 호출 0회 + 마지막 1회
+      재렌더만. freeze / 재부팅 내성.
+
+    Incremental flush (Issue #82): `--resume` 가 지정되면 `on_row=_flush` 를
+    엔진 함수에 주입해 조합 1개 종료 시점마다 `args.output_csv` 에 atomic
+    append. 직렬·병렬 양쪽 동일. 메인 프로세스 단일 writer.
     """
     symbols = _resolve_symbols(args.symbols)
     workers = _resolve_workers(args.workers)
     base_config = BacktestConfig(starting_capital_krw=args.starting_capital)
     grid = default_grid()
+
+    existing_rows: tuple[SensitivityRow, ...] = ()
+    remaining_combos = list(grid.iter_combinations())
+    if args.resume is not None and args.resume.exists():
+        existing_rows = load_sensitivity_rows(args.resume, grid)
+        completed = {row.params for row in existing_rows}
+        remaining_combos = filter_remaining_combos(grid, completed)
+        logger.info(
+            "sensitivity.resume loaded={loaded} remaining={remaining} path={p}",
+            loaded=len(existing_rows),
+            remaining=len(remaining_combos),
+            p=args.resume,
+        )
+
     logger.info(
-        "sensitivity.start loader={l} from={s} to={e} symbols={n} combos={c} workers={w}",
+        "sensitivity.start loader={l} from={s} to={e} symbols={n} "
+        "combos_total={c} combos_remaining={r} workers={w}",
         l=args.loader,
         s=args.start,
         e=args.end,
         n=len(symbols),
         c=grid.size,
+        r=len(remaining_combos),
         w=workers,
     )
 
-    if workers == 1:
-        loader = _build_loader(args)
-        try:
-            rows = run_sensitivity(
-                loader=loader,
+    # output_csv 디렉터리 미리 생성 — incremental flush 가 첫 호출에서 디렉터리
+    # 부재로 실패하지 않도록 엔진 실행 전에 보장.
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # `--resume` 지정 시에만 incremental flush 콜백 주입 (Issue #82).
+    on_row_callback: Callable[[SensitivityRow], None] | None = None
+    if args.resume is not None:
+
+        def _flush(row: SensitivityRow) -> None:
+            append_sensitivity_row(row, args.output_csv, grid)
+
+        on_row_callback = _flush
+
+    new_rows: tuple[SensitivityRow, ...] = ()
+    if remaining_combos:
+        if workers == 1:
+            loader = _build_loader(args)
+            try:
+                new_rows = run_sensitivity_combos(
+                    loader=loader,
+                    start=args.start,
+                    end=args.end,
+                    symbols=symbols,
+                    base_config=base_config,
+                    combos=remaining_combos,
+                    on_row=on_row_callback,
+                )
+            finally:
+                close = getattr(loader, "close", None)
+                if callable(close):
+                    close()
+        else:
+            loader_factory = functools.partial(
+                _build_loader_primitive,
+                args.loader,
+                args.csv_dir,
+            )
+            new_rows = run_sensitivity_combos_parallel(
+                loader_factory=loader_factory,
                 start=args.start,
                 end=args.end,
                 symbols=symbols,
                 base_config=base_config,
-                grid=grid,
+                combos=remaining_combos,
+                max_workers=workers,
+                on_row=on_row_callback,
             )
-        finally:
-            close = getattr(loader, "close", None)
-            if callable(close):
-                close()
     else:
-        loader_factory = functools.partial(
-            _build_loader_primitive,
-            args.loader,
-            args.csv_dir,
-        )
-        rows = run_sensitivity_parallel(
-            loader_factory=loader_factory,
-            start=args.start,
-            end=args.end,
-            symbols=symbols,
-            base_config=base_config,
-            grid=grid,
-            max_workers=workers,
-        )
+        logger.info("sensitivity.skip_engine — 이미 완료된 조합으로 재렌더만 수행")
+
+    merged_rows = merge_sensitivity_rows(existing_rows, new_rows, grid)
 
     args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown_table(
-        rows,
+        merged_rows,
         sort_by=args.sort_by,
         descending=not args.ascending,
     )
     args.output_markdown.write_text(markdown, encoding="utf-8")
-    write_csv(rows, args.output_csv)
+    # 마지막 1회 fully render — incremental flush 의 최종본 (정렬·서식 일관성
+    # 보강). 동일 컨텐츠라도 멱등.
+    write_csv(merged_rows, args.output_csv)
     logger.info(
         "sensitivity.done rows={n} markdown={m} csv={c}",
-        n=len(rows),
+        n=len(merged_rows),
         m=args.output_markdown,
         c=args.output_csv,
     )
