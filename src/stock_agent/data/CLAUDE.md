@@ -14,9 +14,10 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 `RealtimeDataStore`, `RealtimeDataError`, `TickQuote`, `MinuteBar`,
 `MinuteCsvBarLoader`, `MinuteCsvLoadError`,
 `KisMinuteBarLoader`, `KisMinuteBarLoadError`,
-`BusinessDayCalendar`, `HolidayCalendar`, `HolidayCalendarError`, `YamlBusinessDayCalendar`, `load_kospi_holidays`
+`BusinessDayCalendar`, `HolidayCalendar`, `HolidayCalendarError`, `YamlBusinessDayCalendar`, `load_kospi_holidays`,
+`SpreadSample`, `SpreadSampleCollector`, `SpreadSampleCollectorError`
 
-## 현재 상태 (2026-04-23 기준)
+## 현재 상태 (2026-04-26 기준)
 
 - **`historical.py`** — Phase 1 세 번째 산출물(축소판, v3)
   - 공개 API 1종: `fetch_daily_ohlcv(symbol, start, end)` + 보조 `close()` / 컨텍스트 매니저.
@@ -109,6 +110,17 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
   - **의존성**: stdlib `csv.reader` + `heapq.merge` + `decimal.Decimal` 만. 추가 라이브러리 0.
   - **범위 제외(의도적 defer)**: SQLite 캐시(성능 실측 후 후속 PR), CSV 자동 생성·수집(운영자가 외부에서 준비). KIS 과거 분봉 API 어댑터는 `kis_minute_bars.py`로 완료(2026-04-22). 단, **KIS 서버 최대 1년 보관 제약**으로 2~3년 PASS 기준 자체를 못 맞춰 Phase 2 PASS 검증은 CSV(`minute_csv.py`)로 수행한다. 대량 백필은 전용 CLI `scripts/backfill_minute_bars.py` (Issue #47) 로 수행한다.
 
+- **`spread_samples.py`** — Phase 2 복구 로드맵 Step B 산출물 (Issue #75, 2026-04-26)
+  - **공개 API**: `SpreadSampleCollector(settings, *, pykis_factory=None, clock=None, http_timeout_s=10.0, rate_limit_wait_s=61.0, rate_limit_max_retries=3, sleep=None)` + `snapshot(symbol) -> SpreadSample | None` · `close()` (멱등) · 컨텍스트 매니저. 예외 `SpreadSampleCollectorError`. DTO `SpreadSample`(frozen dataclass: symbol, ts(KST aware), bid1, ask1, bid_qty1, ask_qty1, spread_pct).
+  - **KIS API 엔드포인트**: `/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn` (주식현재가 호가/예상체결조회), TR `FHKST01010200`. python-kis 2.1.6 미래핑 → `kis.fetch()` 로우레벨 직접 호출. 실전(live) 키 전용 — `settings.has_live_keys=False` 이면 생성자에서 `SpreadSampleCollectorError`. PyKis 인스턴스 생성 직후 `install_order_block_guard` 설치 (`kis_minute_bars.py` / `realtime.py` 와 동일 안전 가드).
+  - **응답 정규화**: `output1.bidp1` / `askp1` / `bidp_rsqn1` / `askp_rsqn1` 4 필드 사용. `_parse_decimal` / `_parse_int` 가 빈 문자열·`None`·NaN 을 안전하게 흡수. **`None` 반환 정상 케이스**: `bid1==0`(거래정지)·`ask1==""`(대량호가 빠짐)·`bid1>ask1`(cross book — `logger.warning` 후 None). 호출자는 "샘플 0건" 으로 인지.
+  - **레이트 리밋 재시도**: `EGW00201` → `sleep(rate_limit_wait_s)` 후 최대 `rate_limit_max_retries` 회 재시도, 한도 초과 시 `SpreadSampleCollectorError`. 그 외 `rt_cd != "0"` 응답은 즉시 `SpreadSampleCollectorError`.
+  - **DTO 가드 (`SpreadSample.__post_init__`)**: symbol 정규식 `^\d{6}$` · ts.tzinfo 필수 · bid1/ask1 > 0 · ask1 >= bid1 · bid_qty1/ask_qty1 >= 0 위반 시 `RuntimeError`.
+  - **테스트**: `tests/test_spread_samples.py` 38 케이스 (DTO 가드 7 + 정상 3 + 생성자 가드 5 + 지연 초기화 2 + snapshot 정상 3 + None 케이스 3 + 에러 4 + rate limit 3 + 라이프사이클 3 + symbol 가드 2 등). 외부 KIS 네트워크 접촉 0.
+  - **CLI**: `scripts/collect_spread_samples.py` 가 본 어댑터를 사용해 평일 장중 호가를 JSONL 로 누적. ADR-0019 Step B 진행용 인프라.
+  - **비스코프 (의도적 defer)**: WebSocket 호가 스트림 (Phase 5 후보) · 10단계 호가 전체 (`bidp2..bidp10`, `askp2..askp10`) — Step B 검증 목적상 1단계로 충분 · SQLite 캐시 — JSONL 누적이 분석 단순.
+  - **의존성**: stdlib + python-kis 2.1.6. 추가 라이브러리 0.
+
 ## 설계 원칙
 
 - **라이브러리 타입 누출 금지**. pykrx 의 `pandas.DataFrame`/`Timestamp`, PyYAML 의 raw dict 은 내부에서만 소비하고 상위 레이어는 DTO(`DailyBar`, `KospiUniverse`) 만 본다.
@@ -127,7 +139,8 @@ YAML 로더, 실시간 분봉 소스를 한 자리에 모아 상위 레이어
 - `calendar.py`: 외부 I/O 0 (stdlib + PyYAML + `tmp_path` 만 사용). `Path.read_text` spy 시 `autospec=True` 필수. 23 케이스 (정상 로드 4 + 오류 11 + Calendar 동작 8).
 - DB 는 `tmp_path / "test.db"` 또는 `":memory:"` 사용. `clock` 주입으로 "오늘" 판정을 고정.
 - 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root CLAUDE.md 하드 규칙).
-- 관련 테스트: `tests/test_historical.py`, `tests/test_universe.py`, `tests/test_realtime.py`, `tests/test_minute_csv.py`, `tests/test_kis_minute_bar_loader.py`.
+- `spread_samples.py`: 실 KIS API 접촉 0. `pykis_factory` 에 `MagicMock` 반환 람다 주입. DTO 가드·생성자 가드·`snapshot` 정상·None 케이스·에러·rate limit·라이프사이클 카테고리 커버. 38 케이스.
+- 관련 테스트: `tests/test_historical.py`, `tests/test_universe.py`, `tests/test_realtime.py`, `tests/test_minute_csv.py`, `tests/test_kis_minute_bar_loader.py`, `tests/test_spread_samples.py`.
 
 ## 소비자 참고
 
