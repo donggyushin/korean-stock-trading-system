@@ -280,28 +280,6 @@ def _fake_settings() -> MagicMock:
     return s
 
 
-def test_build_runtime_정상_subscribe_각_티커_호출(
-    _mock_universe: KospiUniverse, _fake_settings: MagicMock
-) -> None:
-    fake_rt = MagicMock()
-    fake_kis = MagicMock(spec=KisClient)
-    fake_scheduler = MagicMock()
-    args = _parse_args([])
-
-    build_runtime(
-        args,
-        _fake_settings,
-        kis_client_factory=lambda s: fake_kis,
-        realtime_store_factory=lambda s: fake_rt,
-        scheduler_factory=lambda: fake_scheduler,
-        universe_loader=lambda p: _mock_universe,
-        clock=lambda: _kst(9, 0),
-    )
-
-    subscribe_calls = [c[0][0] for c in fake_rt.subscribe.call_args_list]
-    assert subscribe_calls == list(_TICKERS)
-
-
 def test_build_runtime_dry_run_True_시_DryRunOrderSubmitter_주입(
     _mock_universe: KospiUniverse, _fake_settings: MagicMock
 ) -> None:
@@ -3115,4 +3093,90 @@ class TestInstallJobsRSIMRBranch:
         all_args = str(mock_logger.warning.call_args_list)
         assert "force_close" in all_args, (
             f"warning 메시지에 'force_close' 키워드가 없다. 실제={all_args}"
+        )
+
+
+# ===========================================================================
+# PR4 (lazy subscribe) — build_runtime 이 universe 사전 구독을 하지 않는다 (RED)
+# ===========================================================================
+
+
+class TestBuildRuntimeNoUniversePreSubscribe:
+    """build_runtime 호출 후 realtime_store.subscribe 가 0회 호출되어야 한다.
+
+    RED 단계: 현행 main.py:292-293 이 universe 전체를 사전 구독하므로
+    subscribe_call_count > 0 → 단언이 실패(FAIL).
+    GREEN 단계: 해당 코드 제거 후 통과.
+
+    가드레일: KIS·텔레그램·외부 HTTP 접촉 없음. realtime_store 는 MagicMock.
+    """
+
+    _FAKE_TICKERS = ("005930", "000660", "035720")
+
+    def _build(self, tickers: tuple[str, ...] = _FAKE_TICKERS) -> tuple[Any, MagicMock]:
+        """build_runtime 을 실행하고 (runtime, fake_rt) 를 반환."""
+        from types import SimpleNamespace
+
+        from stock_agent.monitor import NullNotifier
+        from stock_agent.storage import NullTradingRecorder
+
+        args = _parse_args([])
+        settings = SimpleNamespace(has_live_keys=True)
+        universe = KospiUniverse(as_of_date=_DATE, source="test", tickers=tickers)
+        fake_rt = MagicMock()
+
+        runtime = build_runtime(
+            args,
+            settings,  # type: ignore[arg-type]
+            kis_client_factory=lambda s: MagicMock(spec=KisClient),
+            realtime_store_factory=lambda s: fake_rt,
+            scheduler_factory=lambda: MagicMock(),
+            universe_loader=lambda p: universe,
+            notifier_factory=lambda s, d: NullNotifier(),
+            recorder_factory=lambda s, d: NullTradingRecorder(),
+            clock=lambda: _kst(9, 0),
+        )
+        return runtime, fake_rt
+
+    def test_build_runtime_universe_사전_구독_0회(self) -> None:
+        """build_runtime 후 realtime_store.subscribe 호출 카운트 == 0.
+
+        현행(RED): main.py 가 universe 전체 사전 구독 → subscribe 가 len(tickers) 회 호출.
+        GREEN 단계: 해당 코드 제거 후 subscribe_call_count == 0 통과.
+        """
+        _runtime, fake_rt = self._build()
+
+        subscribe_call_count = fake_rt.subscribe.call_count
+        assert subscribe_call_count == 0, (
+            f"build_runtime 후 universe 사전 구독 0회 기대, "
+            f"실제 subscribe 호출 횟수={subscribe_call_count} "
+            f"(호출 인자={[c[0][0] for c in fake_rt.subscribe.call_args_list]})"
+        )
+
+    def test_build_runtime_subscribe_calls_빈_리스트(self) -> None:
+        """realtime_store_factory 더블의 subscribe call_args_list 가 빈 리스트.
+
+        위 테스트와 동일 동작을 call_args_list 레벨에서 이중 확인.
+        GREEN 단계: call_args_list == [] 통과.
+        """
+        _runtime, fake_rt = self._build()
+
+        call_args = [c[0][0] for c in fake_rt.subscribe.call_args_list]
+        assert call_args == [], (
+            f"build_runtime 후 subscribe call_args_list 빈 리스트 기대, 실제={call_args}"
+        )
+
+    def test_build_runtime_universe_비어있지_않아도_사전_구독_0회(self) -> None:
+        """universe.tickers non-empty 와 무관하게 사전 구독은 0회.
+
+        universe 199 종목 로드 성공 여부와 subscribe 호출은 독립적임을 검증.
+        GREEN 단계: 어떤 tickers 크기여도 subscribe 0회 통과.
+        """
+        large_tickers = tuple(f"{i:06d}" for i in range(50))  # 50종목
+        _runtime, fake_rt = self._build(tickers=large_tickers)
+
+        subscribe_call_count = fake_rt.subscribe.call_count
+        assert subscribe_call_count == 0, (
+            f"universe {len(large_tickers)}종목이어도 사전 구독 0회 기대, "
+            f"실제 subscribe 호출 횟수={subscribe_call_count}"
         )

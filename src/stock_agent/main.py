@@ -289,8 +289,10 @@ def build_runtime(
     kis_client = build_kis(settings)
     realtime_store = build_rt(settings)
 
-    for ticker in universe.tickers:
-        realtime_store.subscribe(ticker)
+    # PR4 (ADR-0025 후속): universe 사전 구독 제거. RSI MR 일봉 전략은 진입 시점에만
+    # `Executor._handle_entry` 가 분봉 구독을 동적으로 켠다. KIS WebSocket 동시
+    # 구독 한도(약 41) 회피 + 보유 포지션만 분봉 데이터 흐름. restore_session 도
+    # open_positions 만 재구독.
 
     order_submitter = _build_order_submitter(args.dry_run, kis_client)
     balance_provider: BalanceProvider = LiveBalanceProvider(kis_client)

@@ -48,6 +48,13 @@ zero → skip + info 로그 + `return False` (RiskManager 미기록).
 - `step()` 분봉 루프에 가드 호출 추가: 각 bar 처리 시 `_stop_loss_guard_signals(bar)` 먼저 호출 → 발동 시 `_process_signals` 처리 + `_last_processed_bar_time[symbol]` 갱신 후 `strategy.on_bar` 호출 skip.
 - `Executor.strategy` 공개 프로퍼티 신설 — `main.py` `_install_jobs` 의 RSI MR 판정용(`isinstance(executor.strategy, RSIMRStrategy)`).
 
+**Phase 3 PR4 (KIS WebSocket lazy subscribe) 완료(2026-05-03)에 따른 확장**:
+- `BarSource` Protocol 에 `subscribe(symbol: str) -> None` / `unsubscribe(symbol: str) -> None` 추가. `RealtimeDataStore` 의 기존 동명 공개 메서드를 그대로 만족 — 추가 어댑터 불필요.
+- `_handle_entry` — fill 성공(partial/full) 후 `bar_source.subscribe(signal.symbol)` 호출. zero fill(`status == "none"`) 은 미호출(포지션 미기록과 일관).
+- `_handle_exit` — `_open_lots.pop(symbol)` 직후 `bar_source.unsubscribe(symbol)` 호출. full fill 만 이 경로에 도달(partial/none 은 `ExecutorError` 로 차단) — 자연 정합.
+- `restore_session` — `open_positions` 순회 후 각 `p.symbol` 에 대해 `bar_source.subscribe(p.symbol)` 호출(재기동 포지션의 분봉 흐름 유지).
+- 배경: ORB 시절 `main.py` 가 universe 전 종목(199개)을 사전 구독하던 루프를 제거 → KIS WebSocket 구독 한도(약 41) 문제 해소. RSI MR 일봉 전략은 진입 신호를 EOD 일봉으로 결정하므로 universe 전체 실시간 구독 불필요.
+
 Phase 3 PASS 선언은 모의투자 환경에서 **연속 10영업일 무중단 + 0 unhandled
 error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 본 PR 은 그
 조건 중 단 하나도 자동으로 충족하지 않는다 — 이번 PR 의 산출은 단위 테스트로
@@ -76,8 +83,10 @@ error + 모든 주문이 SQLite 기록 + 텔레그램 알림 100% 수신** 후. 
    하는 더블(`FakeOrderSubmitter` 등)을 쓸 수 있다.
 3. **라이브 어댑터의 얇음** — `LiveOrderSubmitter` / `LiveBalanceProvider` 는
    `KisClient` 메서드를 한 줄씩 위임하는 구조라 추가 결정이 없다. `RealtimeDataStore`
-   는 `get_minute_bars(symbol)` 시그니처가 이미 `BarSource` 를 자연스럽게
-   만족하므로 별도 어댑터가 필요 없다.
+   는 `get_minute_bars(symbol)` / `subscribe(symbol)` / `unsubscribe(symbol)` 시그니처가
+   이미 `BarSource` 를 자연스럽게 만족하므로 별도 어댑터가 필요 없다. PR4 에서
+   `subscribe/unsubscribe` 가 Protocol 에 추가됐으나 `RealtimeDataStore` 의 기존
+   공개 API 재사용이므로 어댑터 변경 없음.
 
 이 분리는 plan.md 의 "신호 → 주문 → 체결 추적 → 상태 동기화 루프" 문구를 가장
 검증 가능한 형태로 구현한 결과다.
@@ -213,6 +222,7 @@ last_reconcile: ReconcileReport | None   # property, read-only
 2. open_positions 순회 → _open_lots[symbol] = _OpenLot(entry_price, qty, stop_price=Decimal("0")).
    # OpenPositionInput Protocol 에 stop_price 미포함 — 가드 비활성.
    # 다음 EOD 일봉이 RSIMRStrategy.on_bar 에서 stop_loss 발동 시 자연 청산.
+   bar_source.subscribe(p.symbol) — 재기동 포지션 분봉 흐름 유지 (PR4).
 3. isinstance(strategy, ORBStrategy) 가 True 인 경우 (ADR-0025 PR2):
    - open_positions 의 각 symbol 에 대해 strategy.restore_long_position(symbol, ...) 호출.
    - closed_symbols \ open_symbols 에 대해 strategy.mark_session_closed(symbol, session_date) 호출.

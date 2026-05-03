@@ -9,6 +9,7 @@ BarSource 는 모두 더블(fake/mock)로 주입.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
@@ -215,16 +216,31 @@ class FakeBalanceProvider:
 
 
 class FakeBarSource:
-    """분봉 더블."""
+    """분봉 더블.
+
+    PR4 (lazy subscribe): subscribe / unsubscribe 호출 추적 필드 추가.
+    기존 get_minute_bars 시그니처·반환값 변경 없음.
+    """
 
     def __init__(self) -> None:
         self._bars: dict[str, list[MinuteBar]] = {}
+        self.subscribed: set[str] = set()
+        self.subscribe_calls: list[str] = []
+        self.unsubscribe_calls: list[str] = []
 
     def set_bars(self, symbol: str, bars: list[MinuteBar]) -> None:
         self._bars[symbol] = bars
 
     def get_minute_bars(self, symbol: str) -> list[MinuteBar]:
         return list(self._bars.get(symbol, []))
+
+    def subscribe(self, symbol: str) -> None:
+        self.subscribed.add(symbol)
+        self.subscribe_calls.append(symbol)
+
+    def unsubscribe(self, symbol: str) -> None:
+        self.subscribed.discard(symbol)
+        self.unsubscribe_calls.append(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -5523,4 +5539,750 @@ class TestStepStopLossGuard:
         # 가드 미발동 → submit_sell 없음
         assert len(fake_order_submitter.sell_calls) == 0, (
             "stop_price=0 마커 시 가드가 발동되면 안 된다"
+        )
+
+
+# ===========================================================================
+# PR4 (lazy subscribe) — BarSource.subscribe / unsubscribe 계약 (RED)
+# ===========================================================================
+
+
+class TestBarSourceSubscribeContract:
+    """Executor 가 진입/청산/restore 시점에 BarSource.subscribe/unsubscribe 를 호출해야 한다.
+
+    RED 단계: BarSource Protocol 에 subscribe/unsubscribe 가 없고 Executor 도
+    해당 호출을 하지 않으므로 전 케이스가 AssertionError 로 실패해야 한다.
+    GREEN 단계: BarSource Protocol 확장 + Executor._handle_entry/_handle_exit/
+    restore_session 에 subscribe/unsubscribe 호출 추가 후 통과.
+    """
+
+    # ------------------------------------------------------------------
+    # 공유 헬퍼
+    # ------------------------------------------------------------------
+
+    def _make_entry_executor(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+        *,
+        stop_price: Decimal = Decimal("0"),
+    ) -> tuple[Executor, MagicMock]:
+        """EntrySignal 을 1회 반환하는 mock_strategy 와 Executor 를 함께 반환."""
+        from stock_agent.strategy.base import EntrySignal
+
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=stop_price,
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+        return exc, mock_strategy
+
+    # ------------------------------------------------------------------
+    # A-1. 진입 full fill → subscribe 1회 호출
+    # ------------------------------------------------------------------
+
+    def test_handle_entry_full_fill_subscribe_1회_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """full fill 정상 진입 후 bar_source.subscribe(signal.symbol) 정확히 1회 호출.
+
+        GREEN 단계: _handle_entry 체결 확정 후 bar_source.subscribe(symbol) 호출.
+        """
+        exc, _ = self._make_entry_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+
+        assert len(risk_manager.active_positions) == 1, "진입 전제 조건 미충족"
+        assert fake_bar_source.subscribe_calls == [_SYMBOL_A], (
+            f"진입 후 subscribe({_SYMBOL_A!r}) 1회 기대, "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # A-2. 부분체결 진입도 subscribe 호출
+    # ------------------------------------------------------------------
+
+    def test_handle_entry_partial_fill_subscribe_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """status == 'partial' 진입(filled_qty < ordered_qty) 에도 subscribe 호출.
+
+        idempotent 책임은 RealtimeDataStore — Executor 는 무조건 호출.
+        GREEN 단계: partial 체결 경로에서도 bar_source.subscribe 호출.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        # fill_after=0 이지만 qty_filled < qty_ordered → partial 시뮬레이션
+        partial_submitter = FakeOrderSubmitter(fill_after=0)
+        # get_pending_orders 가 qty_filled=5(partial) 반환하도록 오버라이드
+        partial_submitter.get_pending_orders = lambda: []  # type: ignore[method-assign]
+
+        # PendingOrder qty_filled=5 로 부분체결 흉내: FakeOrderSubmitter 확장 대신
+        # 실제 partial 경로를 트리거하는 전용 더블을 인라인으로 정의한다.
+        @dataclasses.dataclass
+        class PartialSubmitter:
+            buy_calls: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+            sell_calls: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+            cancel_calls: list[str] = dataclasses.field(default_factory=list)
+            _counter: int = 0
+            _poll_count: int = 0
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-BUY-{self._counter:04d}",
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-SELL-{self._counter:04d}",
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                # 항상 즉시 체결로 응답 (partial 은 _resolve_fill 내부에서 qty_filled 확인)
+                return []
+
+            def cancel_order(self, order_number: str) -> None:
+                self.cancel_calls.append(order_number)
+
+        # partial 체결 시나리오: get_pending_orders 가 qty_filled=5 pending 을 반환하다가
+        # timeout 후 cancel, filled_qty=5 로 partial _FillOutcome 생성되는 경로를
+        # 검증하기 위해 timeout 이 즉시 발동하도록 config 를 조정한다.
+
+        cfg = ExecutorConfig(order_fill_timeout_s=0.001, order_poll_interval_s=0.001)
+
+        class PartialSubmitter2:
+            """get_pending_orders → qty_filled=5 로 1회 반환 후 빈 리스트 (timeout → partial)."""
+
+            buy_calls: list[tuple[str, int]]
+            sell_calls: list[tuple[str, int]]
+            cancel_calls: list[str]
+
+            def __init__(self) -> None:
+                self.buy_calls = []
+                self.sell_calls = []
+                self.cancel_calls = []
+                self._counter = 0
+                self._poll_count = 0
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-BUY-{self._counter:04d}",
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-SELL-{self._counter:04d}",
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                # 항상 partial pending 을 반환 → timeout 까지 keep → cancel 후 partial
+                return [
+                    PendingOrder(
+                        order_number=f"ORD-BUY-{self._counter:04d}",
+                        symbol=_SYMBOL_A,
+                        side="buy",
+                        qty_ordered=10,
+                        qty_filled=5,
+                        qty_remaining=5,
+                        price=None,
+                        submitted_at=_kst(9, 30),
+                    )
+                ]
+
+            def cancel_order(self, order_number: str) -> None:
+                self.cancel_calls.append(order_number)
+
+        ps = PartialSubmitter2()
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=Decimal("0"),
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        # advancing clock: 매 호출마다 0.5s 씩 진행 → deadline(0.001s) 즉시 초과
+        _adv_clock_partial = iter(_kst(9, 30) + timedelta(seconds=i * 0.5) for i in range(2000))
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            ps,  # type: ignore[arg-type]
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            sleep=lambda _: None,
+            clock=lambda: next(_adv_clock_partial),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+
+        # partial 체결이면 filled_qty=5 가 기록되어야 하고 subscribe 호출이 있어야 한다
+        assert fake_bar_source.subscribe_calls == [_SYMBOL_A], (
+            f"부분체결 진입 후에도 subscribe({_SYMBOL_A!r}) 1회 기대, "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # A-3. 0 체결 진입은 subscribe 호출 X
+    # ------------------------------------------------------------------
+
+    def test_handle_entry_zero_fill_subscribe_미호출(
+        self,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """status == 'none' (0체결) 진입 경로는 subscribe 호출 0.
+
+        GREEN 단계: _handle_entry return False 경로에서 subscribe 미호출.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        cfg = ExecutorConfig(order_fill_timeout_s=0.001, order_poll_interval_s=0.001)
+
+        class ZeroFillSubmitter:
+            """항상 qty_filled=0 pending 반환 → timeout → cancel → none."""
+
+            buy_calls: list[tuple[str, int]]
+            sell_calls: list[tuple[str, int]]
+            cancel_calls: list[str]
+
+            def __init__(self) -> None:
+                self.buy_calls = []
+                self.sell_calls = []
+                self.cancel_calls = []
+                self._counter = 0
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-BUY-{self._counter:04d}",
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-SELL-{self._counter:04d}",
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                return [
+                    PendingOrder(
+                        order_number=f"ORD-BUY-{self._counter:04d}",
+                        symbol=_SYMBOL_A,
+                        side="buy",
+                        qty_ordered=10,
+                        qty_filled=0,
+                        qty_remaining=10,
+                        price=None,
+                        submitted_at=_kst(9, 30),
+                    )
+                ]
+
+            def cancel_order(self, order_number: str) -> None:
+                self.cancel_calls.append(order_number)
+
+        zs = ZeroFillSubmitter()
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=Decimal("0"),
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        # advancing clock: 매 호출마다 0.5s 씩 진행 → deadline(0.001s) 즉시 초과
+        _adv_clock_zero = iter(_kst(9, 30) + timedelta(seconds=i * 0.5) for i in range(2000))
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            zs,  # type: ignore[arg-type]
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            sleep=lambda _: None,
+            clock=lambda: next(_adv_clock_zero),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+
+        assert fake_bar_source.subscribe_calls == [], (
+            f"0체결 진입 경로에서 subscribe 호출 0 기대, "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # A-4. risk 거부 시 subscribe 호출 X
+    # ------------------------------------------------------------------
+
+    def test_handle_entry_risk_rejected_subscribe_미호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """evaluate_entry 거부(insufficient_cash 등) → subscribe 호출 0.
+
+        GREEN 단계: _handle_entry risk 거부 경로에서 subscribe 미호출.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        # 잔고 0 → RiskManager 가 insufficient_cash 로 거부
+        fake_balance_provider.set_balance(_empty_balance(withdrawable=0))
+
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=Decimal("0"),
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+
+        assert len(risk_manager.active_positions) == 0, "거부 전제 조건 미충족"
+        assert fake_bar_source.subscribe_calls == [], (
+            f"risk 거부 시 subscribe 호출 0 기대, "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # B-1. 청산 full fill → unsubscribe 1회 호출
+    # ------------------------------------------------------------------
+
+    def test_handle_exit_full_fill_unsubscribe_1회_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """full fill 청산 후 bar_source.unsubscribe(signal.symbol) 정확히 1회 호출.
+
+        GREEN 단계: _handle_exit _open_lots.pop 직후 bar_source.unsubscribe(symbol) 호출.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        stop_price_val = Decimal("49000")
+
+        # 진입
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=stop_price_val,
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+        assert len(risk_manager.active_positions) == 1, "진입 전제 조건 미충족"
+
+        # 가드 발동 → 청산
+        mock_strategy.on_bar.return_value = []
+        guard_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=48_500,
+            high=49_200,
+            low=int(stop_price_val) - 100,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [guard_bar])
+        exc.step(_kst(9, 36))
+
+        assert len(risk_manager.active_positions) == 0, "청산 전제 조건 미충족"
+        assert fake_bar_source.unsubscribe_calls == [_SYMBOL_A], (
+            f"청산 후 unsubscribe({_SYMBOL_A!r}) 1회 기대, "
+            f"실제 unsubscribe_calls={fake_bar_source.unsubscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # B-2. 청산 부분체결(ExecutorError) → unsubscribe 호출 X
+    # ------------------------------------------------------------------
+
+    def test_handle_exit_partial_fill_unsubscribe_미호출(
+        self,
+        risk_manager: RiskManager,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """청산 status != 'full' → ExecutorError 승격, unsubscribe 호출 0.
+
+        포지션 잔여 상태이므로 구독은 유지돼야 한다.
+        GREEN 단계: _handle_exit ExecutorError 경로에서 unsubscribe 미호출.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        stop_price_val = Decimal("49000")
+        cfg = ExecutorConfig(order_fill_timeout_s=0.001, order_poll_interval_s=0.001)
+
+        class PartialSellSubmitter:
+            """매도 시 항상 partial pending 반환 → timeout → ExecutorError."""
+
+            buy_calls: list[tuple[str, int]]
+            sell_calls: list[tuple[str, int]]
+            cancel_calls: list[str]
+
+            def __init__(self) -> None:
+                self.buy_calls = []
+                self.sell_calls = []
+                self.cancel_calls = []
+                self._counter = 0
+                self._in_sell = False
+
+            def submit_buy(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self.buy_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-BUY-{self._counter:04d}",
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def submit_sell(self, symbol: str, qty: int) -> OrderTicket:
+                self._counter += 1
+                self._in_sell = True
+                self.sell_calls.append((symbol, qty))
+                return OrderTicket(
+                    order_number=f"ORD-SELL-{self._counter:04d}",
+                    symbol=symbol,
+                    side="sell",
+                    qty=qty,
+                    price=None,
+                    submitted_at=_kst(9, 30),
+                )
+
+            def get_pending_orders(self) -> list[PendingOrder]:
+                if self._in_sell:
+                    # lot.qty=4 (risk_manager position_pct=20% × 1M / 50000) 대비
+                    # 일부만 체결되도록 qty_filled<qty_ordered 설정 → partial 경로 트리거
+                    return [
+                        PendingOrder(
+                            order_number=f"ORD-SELL-{self._counter:04d}",
+                            symbol=_SYMBOL_A,
+                            side="sell",
+                            qty_ordered=4,
+                            qty_filled=2,
+                            qty_remaining=2,
+                            price=None,
+                            submitted_at=_kst(9, 30),
+                        )
+                    ]
+                return []
+
+            def cancel_order(self, order_number: str) -> None:
+                self.cancel_calls.append(order_number)
+
+        ps = PartialSellSubmitter()
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=stop_price_val,
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        # advancing clock: 매 호출마다 0.5s 씩 진행 → deadline(0.001s) 즉시 초과
+        # 매수 _resolve_fill(즉시 체결) + 매도 _resolve_fill(partial → timeout) 두 번 모두 처리
+        _adv_clock_exit = iter(_kst(9, 30) + timedelta(seconds=i * 0.5) for i in range(2000))
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            ps,  # type: ignore[arg-type]
+            fake_balance_provider,
+            fake_bar_source,
+            config=cfg,
+            sleep=lambda _: None,
+            clock=lambda: next(_adv_clock_exit),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # 진입 (매수는 즉시 체결)
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+        assert len(risk_manager.active_positions) == 1, "진입 전제 조건 미충족"
+
+        # subscribe 호출 카운트 리셋 (진입 시 subscribe 가 구현되면 1회 발생하므로 별도 추적)
+        subscribe_count_after_entry = len(fake_bar_source.subscribe_calls)
+
+        # 청산 트리거 (가드 발동) → partial sell → ExecutorError
+        mock_strategy.on_bar.return_value = []
+        guard_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=48_500,
+            high=49_200,
+            low=int(stop_price_val) - 100,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [guard_bar])
+        # ExecutorError 가 step 내부에서 발생하더라도 step 이 StepReport 를 반환할 수 있음
+        # (내부에서 catch 후 halt 처리 가능) — 어떤 경로든 unsubscribe 호출 0 이어야 한다.
+        with contextlib.suppress(Exception):
+            exc.step(_kst(9, 36))
+
+        assert fake_bar_source.unsubscribe_calls == [], (
+            f"청산 부분체결(ExecutorError) 시 unsubscribe 호출 0 기대, "
+            f"실제 unsubscribe_calls={fake_bar_source.unsubscribe_calls}"
+        )
+        _ = subscribe_count_after_entry  # 사용 명시
+
+    # ------------------------------------------------------------------
+    # B-3. stop_loss 가드 청산도 unsubscribe 호출
+    # ------------------------------------------------------------------
+
+    def test_stop_loss_guard_청산_unsubscribe_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """PR3 stop_loss 가드 발동 청산(ExitSignal 직접 처리) 경로에서도 unsubscribe 호출.
+
+        stop_loss 가드는 strategy.on_bar 를 거치지 않고 _handle_exit 를 직접 호출하므로
+        그 경로에도 unsubscribe 계약이 적용되어야 한다.
+        GREEN 단계: _handle_exit 가 어떤 경로로 호출되든 unsubscribe 보장.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        stop_price_val = Decimal("49000")
+
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = [
+            EntrySignal(
+                symbol=_SYMBOL_A,
+                price=Decimal("50000"),
+                ts=_kst(9, 30),
+                stop_price=stop_price_val,
+                take_price=Decimal("0"),
+            )
+        ]
+        mock_strategy.on_time.return_value = []
+
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # 진입
+        entry_bar = _bar(_SYMBOL_A, 9, 30, close=50_000)
+        fake_bar_source.set_bars(_SYMBOL_A, [entry_bar])
+        exc.step(_kst(9, 31))
+        assert len(risk_manager.active_positions) == 1, "진입 전제 조건 미충족"
+
+        # stop_loss 가드 발동
+        mock_strategy.on_bar.return_value = []
+        guard_bar = _bar(
+            _SYMBOL_A,
+            9,
+            35,
+            close=48_500,
+            high=49_200,
+            low=int(stop_price_val) - 100,
+        )
+        fake_bar_source.set_bars(_SYMBOL_A, [guard_bar])
+        exc.step(_kst(9, 36))
+
+        assert fake_bar_source.unsubscribe_calls == [_SYMBOL_A], (
+            f"stop_loss 가드 청산 후 unsubscribe({_SYMBOL_A!r}) 1회 기대, "
+            f"실제 unsubscribe_calls={fake_bar_source.unsubscribe_calls}"
+        )
+
+    # ------------------------------------------------------------------
+    # C. restore_session → 보유 N 종목만큼 subscribe 호출
+    # ------------------------------------------------------------------
+
+    def test_restore_session_open_positions_N개_subscribe_N회_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """restore_session(open_positions=[A, B]) → subscribe(A) + subscribe(B) 각 1회.
+
+        순서는 open_positions 순서와 동일하거나 set 포함 여부만 검증.
+        GREEN 단계: restore_session 내 open_positions 순회 후 bar_source.subscribe 호출.
+        """
+        exc = _make_executor(
+            MagicMock(spec=ORBStrategy),  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            symbols=(_SYMBOL_A, _SYMBOL_B),
+        )
+
+        pos_a = _FakeOpenPosition(
+            symbol=_SYMBOL_A, qty=10, entry_price=Decimal("50000"), entry_ts=_kst(9, 45)
+        )
+        pos_b = _FakeOpenPosition(
+            symbol=_SYMBOL_B, qty=5, entry_price=Decimal("60000"), entry_ts=_kst(9, 45)
+        )
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[pos_a, pos_b],
+            entries_today=2,
+            daily_realized_pnl_krw=0,
+        )
+
+        assert set(fake_bar_source.subscribe_calls) == {_SYMBOL_A, _SYMBOL_B}, (
+            f"restore_session 2종목 → subscribe 2회({_SYMBOL_A!r}, {_SYMBOL_B!r}) 기대, "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
+        )
+        assert len(fake_bar_source.subscribe_calls) == 2, (
+            f"subscribe 호출 횟수 2 기대, 실제={len(fake_bar_source.subscribe_calls)}"
+        )
+
+    def test_start_session_보유_없으면_subscribe_미호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """start_session (신규 세션, 보유 0) → subscribe 호출 0.
+
+        universe 전체 사전 구독이 없어야 한다.
+        GREEN 단계: start_session 에서 bar_source.subscribe 미호출.
+        """
+        exc = _make_executor(
+            MagicMock(spec=ORBStrategy),  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+            symbols=(_SYMBOL_A, _SYMBOL_B),
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        assert fake_bar_source.subscribe_calls == [], (
+            f"start_session 시 subscribe 호출 0 기대 (universe 사전 구독 금지), "
+            f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
         )

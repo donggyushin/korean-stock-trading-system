@@ -102,9 +102,18 @@ class BalanceProvider(Protocol):
 
 
 class BarSource(Protocol):
-    """분봉 조회 경계. `RealtimeDataStore` 가 자연스럽게 만족."""
+    """분봉 조회 + 동적 구독 경계. `RealtimeDataStore` 가 자연스럽게 만족.
+
+    PR4 (ADR-0025 후속): KIS WebSocket 동시 구독 한도(약 41) 회피 + RSI MR 일봉
+    전략 정합성을 위해 진입/청산 시점에만 동적으로 분봉 구독을 켜고 끈다.
+    `RealtimeDataStore.subscribe`/`unsubscribe` 가 이미 idempotent 하게 동작.
+    """
 
     def get_minute_bars(self, symbol: str) -> list[MinuteBar]: ...
+
+    def subscribe(self, symbol: str) -> None: ...
+
+    def unsubscribe(self, symbol: str) -> None: ...
 
 
 class OpenPositionInput(Protocol):
@@ -631,6 +640,11 @@ class Executor:
             )
             for p in positions
         }
+        # PR4 (ADR-0025 후속): 재기동 복원 포지션도 분봉 구독 재활성. 운영자가
+        # 프로세스를 재시작했을 때 진입은 했지만 미청산인 포지션의 stop_loss 가드
+        # (PR3) 와 분봉 데이터 흐름이 끊기지 않도록.
+        for p in positions:
+            self._bar_source.subscribe(p.symbol)
         self._halt = False
         self._last_reconcile = None
         logger.warning(
@@ -930,6 +944,10 @@ class Executor:
                 order_number=ticket.order_number,
             )
         )
+        # PR4 (ADR-0025 후속): 진입 체결(partial/full) 직후 분봉 구독 활성화 —
+        # 분봉 stop_loss 가드(PR3) 와 strategy.on_bar 데이터 소스 모두 보유 종목만
+        # 필요. KIS paper WebSocket 동시 구독 한도(약 41) 회피.
+        self._bar_source.subscribe(signal.symbol)
         return True
 
     def _handle_exit(self, signal: ExitSignal, now: datetime) -> bool:
@@ -1000,6 +1018,10 @@ class Executor:
         self._risk_manager.record_exit(signal.symbol, net_pnl)
         # _open_lots 미존재 fallback 경로(외부 record_entry) 에서는 키가 없을 수 있다.
         self._open_lots.pop(signal.symbol, None)
+        # PR4 (ADR-0025 후속): full fill 청산 직후 분봉 구독 해제 — 동시 구독 한도
+        # 압박 회피 + 자원 정리. partial/none 청산은 위에서 ExecutorError 로 차단되어
+        # 여기 도달 못하므로 자연스럽게 "정상 청산만 unsubscribe" 가 보장됨.
+        self._bar_source.unsubscribe(signal.symbol)
         logger.info(
             "executor.exit.filled symbol={symbol} qty={qty} fill_price={price} "
             "net_pnl={pnl} reason={reason}",

@@ -628,3 +628,19 @@ pytest **2221 passed, 4 skipped** (PR2 기준).
 - `step()` 분봉 루프에 가드 호출 추가: bar 처리 시작 시 `_stop_loss_guard_signals(bar)` 호출 → 발동 시 `_process_signals` 처리 + `strategy.on_bar` 호출 skip.
 
 pytest **2231 passed, 4 skipped** (PR3 기준 — PR2 대비 +10: `TestInstallJobsRSIMRBranch` 4건 + `TestStepStopLossGuard` 6건).
+
+### Phase 3 PR4 — KIS WebSocket lazy subscribe (2026-05-03)
+
+[x] `src/stock_agent/execution/executor.py`:
+- `BarSource` Protocol 에 `subscribe(symbol: str) -> None` / `unsubscribe(symbol: str) -> None` 추가.
+- `_handle_entry` — fill 성공(partial/full) 후 `bar_source.subscribe(signal.symbol)` 호출. zero fill 은 미호출.
+- `_handle_exit` — `_open_lots.pop(symbol)` 직후 `bar_source.unsubscribe(symbol)` 호출(full fill 만 도달 — partial/none 은 `ExecutorError` 차단, 자연 정합).
+- `restore_session` — `open_positions` 각 symbol 에 대해 `bar_source.subscribe(p.symbol)` 호출(재기동 포지션 분봉 흐름 유지).
+
+[x] `src/stock_agent/main.py` (`_build_runtime`): `for ticker in universe.tickers: realtime_store.subscribe(ticker)` 사전 구독 루프 제거. RSI MR 모드에서 시작 시 구독 0 → Executor 가 진입 시점에만 동적 구독.
+
+`RealtimeDataStore.subscribe/unsubscribe` 는 기존 공개 API 재사용 — `data/realtime.py` 변경 없음.
+
+운영 효과: 시작 시 KIS WebSocket 동시 구독 0 (기존 universe 199 → 0). RSI MR `max_positions=10` 한도 내 최대 10 구독. KIS WebSocket 구독 한도(약 41) 압박 해소.
+
+pytest **2242 passed, 4 skipped** (PR4 기준 — PR3 대비 +11: `TestBarSourceSubscribeContract` 9건 + `TestBuildRuntimeNoUniversePreSubscribe` 3건 신규, 기존 universe 사전 구독 spec 테스트 `test_build_runtime_정상_subscribe_각_티커_호출` 1건 삭제).

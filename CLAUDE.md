@@ -252,7 +252,12 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
   - `main.py` `_install_jobs` — `isinstance(runtime.executor.strategy, RSIMRStrategy)` 가드 추가. RSI MR 모드면 `on_force_close` cron 미등록 + warning 로그("RSI MR 모드 — 15:00 force_close cron 미등록, ADR-0025"). ORB 등 일중 전략은 기존대로 등록.
   - `executor.py` — `_OpenLot.stop_price: Decimal = Decimal("0")` 필드 추가(가드 비활성 마커). `_handle_entry` 가 `signal.stop_price` 를 보존. `_stop_loss_guard_signals(bar)` 헬퍼 신설 — `bar.low ≤ stop_price` 시 `ExitSignal(reason="stop_loss")` 반환. `step()` 분봉 루프에서 `strategy.on_bar` 호출 전 가드 체크 — 발동 시 strategy 호출 없이 ExitSignal 직접 처리. `Executor.strategy` 공개 프로퍼티 신설(main `_install_jobs` RSI MR 판정용).
   - `restore_session` 및 `_handle_exit` fallback 은 `stop_price=Decimal("0")` 명시(가드 비활성 — 다음 EOD 일봉 자연 청산).
-- **테스트 카운트**: pytest **2231 passed, 4 skipped** (PR3 기준 — PR2 대비 +10: `TestInstallJobsRSIMRBranch` 4건 + `TestStepStopLossGuard` 6건).
+- **Phase 3 PR4 (2026-05-03)**: KIS WebSocket lazy subscribe — ORB 시절 `main.py` 가 universe 199 종목 전부를 사전 구독하던 루프를 제거. RSI MR 일봉 전략은 진입 신호를 EOD 일봉으로 결정하므로 universe 전체 실시간 구독 불필요. 분봉 stop_loss 가드는 보유 포지션만 구독하면 충분.
+  - `executor.py` `BarSource` Protocol 에 `subscribe(symbol: str) -> None` / `unsubscribe(symbol: str) -> None` 추가. `_handle_entry` 가 fill 성공(partial/full) 후 `bar_source.subscribe(signal.symbol)` 호출. `_handle_exit` 가 `_open_lots.pop` 직후 `bar_source.unsubscribe(signal.symbol)` 호출. `restore_session` 이 `open_positions` 각 symbol 에 대해 `bar_source.subscribe(p.symbol)` 호출(재기동 포지션 분봉 흐름 유지).
+  - `main.py` `_build_runtime` 의 `for ticker in universe.tickers: realtime_store.subscribe(ticker)` 사전 구독 루프 제거.
+  - `RealtimeDataStore.subscribe/unsubscribe` 공개 API 재사용 — `data/realtime.py` 변경 없음.
+  - 운영 효과: 시작 시 보유 0 → KIS WebSocket 동시 구독 0. RSI MR `max_positions=10` 이내 동적 구독 ≤ 10.
+- **테스트 카운트**: pytest **2242 passed, 4 skipped** (PR4 기준 — PR3 대비 +11: `TestBarSourceSubscribeContract` 9건 + `TestBuildRuntimeNoUniversePreSubscribe` 3건, 기존 universe 사전 구독 spec 테스트 1건 삭제).
 - **운영자 close 대기 Issue**: #51 (Phase 2 PASS 판정 FAIL → 복구 로드맵으로 대체) · #52 (`KisMinuteBarLoader` 파싱 실패 대응, 운영자 `scripts/debug_kis_minute.py` 실행 후 댓글) · #63 (공휴일 캘린더 가드, 백필 재실행으로 `date_mismatch` 0 확인 후 댓글) · #71 (장시간 hang 방지, 2026-04-24 백필 완주 확인 — 운영자 댓글만 잔여).
 
 상세한 Phase 별 산출물·결정·테스트 카운트 변화·Issue 대응 이력은 [docs/phase-history.md](./docs/phase-history.md) 참조.

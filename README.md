@@ -113,6 +113,8 @@ ORB 시절 기본값(종목당 20%, 동시 3종목, 손절 -1.5%, 익절 +3.0%, 
 
 **Phase 3 PR3 완료 (2026-05-03)**. `main.py` `_install_jobs` 에 RSI MR 모드 판정 가드 추가 — RSI MR 전략일 때 15:00 force_close cron 미등록(ADR-0025, 일봉 전략 강제청산 부적합). `executor.py` 분봉 stop_loss 가드 추가 — `_OpenLot.stop_price` 보존 + `bar.low ≤ stop_price` 도달 시 `strategy.on_bar` 없이 즉시 `ExitSignal(reason="stop_loss")` 처리. `Executor.strategy` 공개 프로퍼티 신설. pytest **2231 passed, 4 skipped** (+10).
 
+**Phase 3 PR4 완료 (2026-05-03)**. KIS WebSocket lazy subscribe 도입 — ORB 시절 `main.py` 가 universe 199 종목 전부를 사전 구독하던 루프(`for ticker in universe.tickers: realtime_store.subscribe(ticker)`) 제거. `BarSource` Protocol 에 `subscribe/unsubscribe` 추가, Executor 가 진입 체결 시 동적 구독·청산 체결 시 구독 해제·`restore_session` 재기동 시 재구독. 시작 시 KIS WebSocket 동시 구독 0, 운영 중 최대 10(RSI MR `max_positions=10`). pytest **2242 passed, 4 skipped** (+11).
+
 **Phase 3 착수 전제 통과** (2026-04-21). 실전 시세 전용 APP_KEY 3종 발급·IP 화이트리스트 등록·평일 장중 `healthcheck.py` 4종 그린(WebSocket 체결 수신 OK) 완료.
 
 **Phase 3 첫 산출물 — Executor (코드·테스트 레벨) 완료** (2026-04-21). `execution/` 패키지 신설 — `Executor` + Protocol 3종(`OrderSubmitter`/`BalanceProvider`/`BarSource`) + 어댑터 3종(`LiveOrderSubmitter`/`LiveBalanceProvider`/`DryRunOrderSubmitter`) + `StepReport`/`ReconcileReport` DTO. pytest **605건 green**.
