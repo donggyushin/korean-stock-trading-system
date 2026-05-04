@@ -161,7 +161,7 @@ EOD cron 이 사용하는 universe 는 `main.py` 가 시작 시 1회 로드한 `
 
 ## 추적
 
-- 코드 (PR5 진행 중, 2026-05-04): `src/stock_agent/execution/executor.py` — `enqueue_pending_signals` + step buffer flush. `src/stock_agent/main.py` — `_on_eod_signal` cron + `_install_jobs` 등록.
+- 코드 (PR5 완료, #112, 2026-05-04): `src/stock_agent/execution/executor.py` — `enqueue_pending_signals` + step buffer flush. `src/stock_agent/main.py` — `_on_eod_signal` cron + `_install_jobs` 등록.
 - 관련 ADR: [ADR-0023](./0023-rsi-mr-strategy-adoption-conditional.md), [ADR-0025](./0025-rsi-mr-operational-risk-limits.md).
-- 도입 PR: PR5 (예정).
+- 도입 PR: PR5 (#112, 2026-05-04).
 - 후속 ADR: ADR-0028 (10영업일 회고 후 EOD 시각·buffer 영속화·universe 갱신 정책 갱신, 조건부).
