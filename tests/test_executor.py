@@ -6286,3 +6286,587 @@ class TestBarSourceSubscribeContract:
             f"start_session 시 subscribe 호출 0 기대 (universe 사전 구독 금지), "
             f"실제 subscribe_calls={fake_bar_source.subscribe_calls}"
         )
+
+
+# ===========================================================================
+# PR5 — pending signals queue (EOD 일봉 트리거 큐인 + step buffer flush)
+#
+# ADR-0027: on_eod_signal cron (평일 15:35 KST) 이 RSI MR 전략에서만 등록되고,
+# universe 일봉을 fetch → MinuteBar 로 wrap → strategy.on_bar → 시그널 수집 →
+# executor.enqueue_pending_signals 로 큐인한다.
+# Executor.step() 이 _pending_signals 를 reconcile 보다 먼저 소진한다.
+#
+# 검증 목표:
+#   A. enqueue_pending_signals — 누적, 빈 list 허용, 타입 가드(RuntimeError)
+#   B. step() buffer flush 계약 — reconcile 선행, 처리 후 buffer clear,
+#      _process_signals 경유 full fill EntrySignal 진입 경로 통과
+#   C. 순서 잠금 — buffer flush → reconcile → 분봉 step → on_time
+#   D. start_session / restore_session 호출 후 buffer 보존 (clear 안 함)
+#   E. force_close_all buffer 미flush (EOD 시그널과 무관)
+#   F. 혼합 buffer (EntrySignal + ExitSignal) 처리
+#   G. 빈 buffer 시 step() 조건부 skip (no-op)
+#
+# RED 단계: Executor 에 enqueue_pending_signals 메서드가 없으므로
+# AttributeError 또는 AssertionError 로 전원 실패해야 한다.
+# ===========================================================================
+
+
+class TestPendingSignalsQueue:
+    """Executor.enqueue_pending_signals + step buffer flush 계약 검증 (PR5 RED).
+
+    ADR-0027: EOD cron 이 큐인한 시그널을 다음 step() 이 reconcile 전에 소진한다.
+    """
+
+    # ------------------------------------------------------------------
+    # 공유 헬퍼
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_rsimr_executor(
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> Executor:
+        """RSIMRStrategy 를 주입한 Executor 를 반환.
+
+        PR5 pending signals 는 RSIMRStrategy 컨텍스트에서 주로 사용되지만
+        Executor 계약 자체는 Strategy-agnostic 이므로 ORBStrategy mock 으로도
+        동일 계약을 검증할 수 있다. 여기서는 ORBStrategy mock 을 사용해
+        테스트 설정을 단순화한다.
+        """
+        from stock_agent.strategy import ORBStrategy
+
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = []
+        mock_strategy.on_time.return_value = []
+        return _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+
+    # ------------------------------------------------------------------
+    # A-1. enqueue_pending_signals — EntrySignal/ExitSignal 누적
+    # ------------------------------------------------------------------
+
+    def test_enqueue_pending_signals_entry_signal_누적(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """enqueue_pending_signals([EntrySignal]) 호출 후 _pending_signals 에 보존.
+
+        GREEN 단계: Executor 에 enqueue_pending_signals 메서드 신설 후
+        내부 _pending_signals 버퍼에 누적.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        # GREEN 단계: enqueue_pending_signals 가 없으면 AttributeError 로 실패 (RED 확인)
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+
+        pending = exc._pending_signals  # type: ignore[attr-defined]
+        assert sig in pending, f"enqueue 한 EntrySignal 이 _pending_signals 에 없다. 실제={pending}"
+
+    def test_enqueue_pending_signals_빈_list_no_op(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """enqueue_pending_signals([]) 는 예외 없이 통과 (no-op).
+
+        GREEN 단계: 빈 리스트 입력도 정상 경로.
+        """
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.enqueue_pending_signals([])  # type: ignore[attr-defined]  # 예외 없어야 함
+
+        pending = exc._pending_signals  # type: ignore[attr-defined]
+        assert list(pending) == [], (
+            f"빈 list 큐인 후 _pending_signals 가 비어있어야 한다. 실제={pending}"
+        )
+
+    def test_enqueue_pending_signals_여러번_호출_누적(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """enqueue_pending_signals 를 2회 호출하면 두 리스트가 합산 누적된다."""
+        from stock_agent.strategy.base import EntrySignal, ExitSignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        sig1 = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        sig2 = ExitSignal(
+            symbol=_SYMBOL_B,
+            price=Decimal("60000"),
+            ts=_kst(9, 0),
+            reason="take_profit",
+        )
+        exc.enqueue_pending_signals([sig1])  # type: ignore[attr-defined]
+        exc.enqueue_pending_signals([sig2])  # type: ignore[attr-defined]
+
+        pending = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert len(pending) == 2, (
+            f"2회 enqueue 후 _pending_signals 길이 2 기대, 실제={len(pending)}"
+        )
+        assert sig1 in pending, "sig1 이 _pending_signals 에 없다"
+        assert sig2 in pending, "sig2 이 _pending_signals 에 없다"
+
+    # ------------------------------------------------------------------
+    # A-2. 타입 가드 — 미지원 타입 포함 시 RuntimeError
+    # ------------------------------------------------------------------
+
+    def test_enqueue_pending_signals_미지원_타입_RuntimeError(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """EntrySignal / ExitSignal 이 아닌 객체를 포함한 list 전달 시 RuntimeError.
+
+        _process_signals 와 동일 무결성 기조 — 미지원 타입은 즉시 실패.
+        """
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        invalid_signals = [object()]  # type: ignore[list-item]
+        with pytest.raises((RuntimeError, Exception)):  # ExecutorError 포함 허용
+            exc.enqueue_pending_signals(invalid_signals)  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # B-1. step() buffer flush — reconcile 보다 먼저 처리
+    # ------------------------------------------------------------------
+
+    def test_step_pending_signals_buffer_flush_reconcile_선행(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """step() 은 _pending_signals 가 비어있지 않으면 reconcile 보다 먼저 처리한다.
+
+        reconcile 이 buffer 처리 전에 halt 를 유발하면 안 된다. buffer flush 가
+        우선임을 명문화 — reconcile 결과가 pending signal 처리에 영향 없어야 함.
+
+        검증 방법: 잔고 정합 상태(mismatch=0)에서 pending EntrySignal 이
+        step() 후 실제 진입으로 처리되었는지(active_positions >= 1) 확인.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+
+        # step() 호출 시 buffer 가 소진되고 EntrySignal 이 처리되어야 한다
+        report = exc.step(_kst(9, 1))
+
+        # 처리 후 buffer clear
+        pending_after = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert pending_after == [], (
+            f"step() 후 _pending_signals 가 비어야 한다. 실제={pending_after}"
+        )
+        # EntrySignal 이 _process_signals 를 경유해 실제 진입으로 처리됨
+        # (risk_manager.evaluate_entry 승인 → record_entry → active_positions)
+        assert len(risk_manager.active_positions) >= 1 or report.orders_submitted >= 1, (
+            "pending EntrySignal 이 step() 에서 처리되어야 한다 "
+            f"(active_positions={len(risk_manager.active_positions)}, "
+            f"orders_submitted={report.orders_submitted})"
+        )
+
+    def test_step_pending_signals_처리_후_buffer_clear(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """step() 완료 후 _pending_signals 는 항상 비어있어야 한다.
+
+        처리 성공·실패 무관하게 buffer 는 소진(clear)된다.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+        exc.step(_kst(9, 1))
+
+        assert list(exc._pending_signals) == [], (  # type: ignore[attr-defined]
+            "step() 후 _pending_signals 가 비어야 한다"
+        )
+
+    # ------------------------------------------------------------------
+    # B-2. _process_signals 경유 — full fill EntrySignal 진입 전 경로 통과
+    # ------------------------------------------------------------------
+
+    def test_step_pending_entry_signal_full_fill_entry_event_발행(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """_pending_signals 에 EntrySignal 큐인 → step() 에서 full fill 처리.
+
+        _process_signals → _handle_entry → risk_manager.evaluate_entry /
+        record_entry / _open_lots 갱신 / bar_source.subscribe 전 경로 검증.
+        StepReport.entry_events 에 1건이 포함되어야 한다.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+        report = exc.step(_kst(9, 1))
+
+        # full fill → EntryEvent 1건 발행
+        assert len(report.entry_events) >= 1, (
+            f"pending EntrySignal full fill 후 entry_events 1건 이상 기대, "
+            f"실제={len(report.entry_events)}"
+        )
+        # submit_buy 가 호출되었어야 함
+        assert len(fake_order_submitter.buy_calls) >= 1, (
+            "pending EntrySignal 처리 시 submit_buy 가 호출되어야 한다"
+        )
+        # bar_source.subscribe 호출 (PR4 계약)
+        assert _SYMBOL_A in fake_bar_source.subscribe_calls, (
+            "pending EntrySignal full fill 후 bar_source.subscribe 가 호출되어야 한다"
+        )
+        # _open_lots 갱신
+        assert _SYMBOL_A in exc._open_lots, (  # type: ignore[attr-defined]
+            "pending EntrySignal full fill 후 _open_lots 에 심볼이 있어야 한다"
+        )
+
+    # ------------------------------------------------------------------
+    # C. 순서 잠금 — buffer flush → reconcile → 분봉 step → on_time
+    # ------------------------------------------------------------------
+
+    def test_step_buffer_flush_순서_검증(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """buffer flush 가 reconcile 보다 먼저 일어나야 한다.
+
+        balance_provider.get_balance 호출 전에 _pending_signals 가 소진되어
+        있어야 함을 call_order 로 검증한다.
+
+        구현 방법: get_balance 를 spy 해, 호출 시점에 _pending_signals 를
+        확인한다. flush 선행이면 get_balance 호출 시점엔 이미 비어있어야 한다.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        pending_at_reconcile: list[int] = []  # get_balance 호출 시점의 buffer 길이
+
+        original_get_balance = fake_balance_provider.get_balance
+
+        def spying_get_balance() -> object:
+            # reconcile 진입 시점의 _pending_signals 길이 기록
+            try:
+                pending_at_reconcile.append(
+                    len(list(exc._pending_signals))  # type: ignore[attr-defined]
+                )
+            except AttributeError:
+                pending_at_reconcile.append(-1)  # 속성 없음 표시
+            return original_get_balance()
+
+        fake_balance_provider.get_balance = spying_get_balance  # type: ignore[method-assign]
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+        exc.step(_kst(9, 1))
+
+        # reconcile(_handle_entry 에서 balance 조회) 시점에 _pending_signals 가
+        # 이미 flush 되었거나 처리 중이어야 한다.
+        # get_balance 는 reconcile + _handle_entry 에서 총 2회 이상 호출된다.
+        # 첫 번째 reconcile 호출 시(pending_at_reconcile[0]) buffer 가 비어있으면
+        # flush → reconcile 순서가 보장된 것.
+        assert len(pending_at_reconcile) >= 1, (
+            "get_balance 가 한 번도 호출되지 않았다 — step() 이 reconcile 을 건너뜀"
+        )
+        # flush 선행이면 첫 reconcile 호출 시점에 pending 은 0
+        first_reconcile_pending = pending_at_reconcile[0]
+        assert first_reconcile_pending == 0 or first_reconcile_pending == -1, (
+            f"buffer flush 가 reconcile 보다 선행되어야 한다. "
+            f"첫 reconcile 시점의 _pending_signals 길이={first_reconcile_pending} "
+            "(0 기대 — flush 선행 확인)"
+        )
+
+    # ------------------------------------------------------------------
+    # D. start_session / restore_session 후 buffer 보존
+    # ------------------------------------------------------------------
+
+    def test_start_session_후_pending_signals_보존(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """start_session 호출 후 _pending_signals 가 clear 되지 않아야 한다.
+
+        EOD 시그널이 세션 시작 전날 밤에 큐인된 경우, 다음 영업일
+        start_session 이 호출되더라도 시그널이 살아남아야 한다.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+
+        # start_session 호출
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        pending = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert sig in pending, (
+            f"start_session 후 _pending_signals 에 기존 시그널이 보존되어야 한다. 실제={pending}"
+        )
+
+    def test_restore_session_후_pending_signals_보존(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """restore_session 호출 후 _pending_signals 가 clear 되지 않아야 한다.
+
+        프로세스 재시작(restore_session) 전에 큐인된 EOD 시그널이
+        restore 후 첫 step() 에서 처리되어야 한다.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+
+        # restore_session 호출 (open_positions 없이)
+        exc.restore_session(
+            _DATE,
+            _STARTING_CAPITAL,
+            open_positions=[],
+            entries_today=0,
+            daily_realized_pnl_krw=0,
+        )
+
+        pending = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert sig in pending, (
+            f"restore_session 후 _pending_signals 에 기존 시그널이 보존되어야 한다. 실제={pending}"
+        )
+
+    # ------------------------------------------------------------------
+    # E. force_close_all buffer 미flush
+    # ------------------------------------------------------------------
+
+    def test_force_close_all_pending_signals_미flush(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """force_close_all() 은 _pending_signals 를 flush 하지 않는다.
+
+        EOD 시그널은 일봉 전략의 다음 영업일 첫 step 에서 처리한다.
+        15:00 강제청산(force_close_all)은 일중 단발성이므로 EOD 큐와 무관.
+        """
+        from stock_agent.strategy.base import EntrySignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        exc.enqueue_pending_signals([sig])  # type: ignore[attr-defined]
+        exc.force_close_all(_kst(15, 0))
+
+        pending = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert sig in pending, (
+            f"force_close_all 후 _pending_signals 가 그대로 유지되어야 한다. 실제={pending}"
+        )
+
+    # ------------------------------------------------------------------
+    # F. 혼합 buffer (EntrySignal + ExitSignal)
+    # ------------------------------------------------------------------
+
+    def test_step_혼합_buffer_entry_exit_처리(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """_pending_signals 에 EntrySignal + ExitSignal 이 섞여 있을 때 한 sweep 에서 처리.
+
+        청산 대상 심볼이 _open_lots 에 없는 경우 fallback 또는 ExecutorError — 어떤
+        경로든 buffer 는 소진되어야 한다.
+        """
+        from stock_agent.strategy.base import EntrySignal, ExitSignal
+
+        exc = self._make_rsimr_executor(
+            risk_manager, fake_order_submitter, fake_balance_provider, fake_bar_source
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        entry_sig = EntrySignal(
+            symbol=_SYMBOL_A,
+            price=Decimal("50000"),
+            ts=_kst(9, 0),
+            stop_price=Decimal("48500"),
+            take_price=Decimal("0"),
+        )
+        # _open_lots 에 없는 심볼의 ExitSignal → ExecutorError 또는 fallback
+        exit_sig = ExitSignal(
+            symbol=_SYMBOL_B,
+            price=Decimal("60000"),
+            ts=_kst(9, 0),
+            reason="take_profit",
+        )
+        exc.enqueue_pending_signals([entry_sig, exit_sig])  # type: ignore[attr-defined]
+
+        # ExecutorError 가 발생할 수 있으므로 suppress
+        import contextlib as _ctx
+
+        with _ctx.suppress(Exception):
+            exc.step(_kst(9, 1))
+
+        pending = list(exc._pending_signals)  # type: ignore[attr-defined]
+        assert pending == [], (
+            f"혼합 buffer step() 후 _pending_signals 가 비어야 한다. 실제={pending}"
+        )
+
+    # ------------------------------------------------------------------
+    # G. 빈 buffer 시 step() 조건부 skip (no-op 경로 검증)
+    # ------------------------------------------------------------------
+
+    def test_step_빈_buffer_on_time_정상_호출(
+        self,
+        risk_manager: RiskManager,
+        fake_order_submitter: FakeOrderSubmitter,
+        fake_balance_provider: FakeBalanceProvider,
+        fake_bar_source: FakeBarSource,
+    ) -> None:
+        """_pending_signals 가 비어있을 때 step() 은 정상적으로 on_time 까지 실행.
+
+        불필요한 flush 코드 경로를 타지 않아도 기존 분봉 처리·on_time 은 보장.
+        """
+        from stock_agent.strategy import ORBStrategy
+
+        mock_strategy = MagicMock(spec=ORBStrategy)
+        mock_strategy.on_bar.return_value = []
+        mock_strategy.on_time.return_value = []
+
+        exc = _make_executor(
+            mock_strategy,  # type: ignore[arg-type]
+            risk_manager,
+            fake_order_submitter,
+            fake_balance_provider,
+            fake_bar_source,
+        )
+        exc.start_session(_DATE, _STARTING_CAPITAL)
+
+        # buffer 비어있음을 명시적으로 확인 (속성 부재 시 무시 — RED 단계 호환)
+        with contextlib.suppress(AttributeError):
+            assert list(exc._pending_signals) == []  # type: ignore[attr-defined]
+
+        report = exc.step(_kst(9, 1))
+
+        # on_time 이 호출되었어야 함
+        mock_strategy.on_time.assert_called_once()
+        # StepReport 정상 반환
+        assert isinstance(report, StepReport)

@@ -492,6 +492,10 @@ class Executor:
         self._last_reconcile: ReconcileReport | None = None
         self._sweep_entry_events: list[EntryEvent] = []
         self._sweep_exit_events: list[ExitEvent] = []
+        # PR5 (ADR-0027): EOD 일봉 트리거가 큐인하는 다음 영업일 시초 진입용 시그널 buffer.
+        # `step()` 시작 부분에서 reconcile 직전에 flush. start_session/restore_session 은
+        # buffer clear 안 함 — EOD 시그널이 다음 영업일 09:00 첫 step 까지 살아남아야 함.
+        self._pending_signals: list[Signal] = []
 
     # ---- 세션 -----------------------------------------------------------
 
@@ -658,6 +662,26 @@ class Executor:
             pnl=daily_realized_pnl_krw,
         )
 
+    # ---- EOD 시그널 큐 (PR5, ADR-0027) ---------------------------------
+
+    def enqueue_pending_signals(self, signals: Sequence[Signal]) -> None:
+        """EOD cron 이 다음 영업일 시초 진입을 위한 시그널을 큐인.
+
+        ADR-0027 결정: RSI MR 일봉 전략은 매일 EOD 시점 (15:35 KST) 에 universe 전 종목
+        일봉을 fetch → strategy.on_bar 호출 → 발생한 시그널을 본 메서드로 버퍼링.
+        다음 영업일 09:00 후 첫 `step()` 발화 시 reconcile 직전 위치에서 flush 되어
+        시장가 시초 주문이 제출된다.
+
+        Raises:
+            RuntimeError: signals 안에 EntrySignal·ExitSignal 외 타입이 섞이면 거부.
+        """
+        for sig in signals:
+            if not isinstance(sig, EntrySignal | ExitSignal):
+                raise RuntimeError(
+                    f"Executor.enqueue_pending_signals: 미지원 시그널 타입 {type(sig).__name__}"
+                )
+        self._pending_signals.extend(signals)
+
     # ---- 주 루프 --------------------------------------------------------
 
     def step(self, now: datetime) -> StepReport:
@@ -674,9 +698,16 @@ class Executor:
 
         self._sweep_entry_events = []
         self._sweep_exit_events = []
+        # PR5 (ADR-0027): EOD cron 이 큐인한 시그널을 reconcile 보다 먼저 flush.
+        # 다음 영업일 첫 step 에서 시초가 시장가 주문 → 분봉 체결 추적 흐름.
+        # buffer 가 비어있으면 _process_signals 호출 자체를 skip (불필요 부작용 차단).
+        orders_submitted = 0
+        if self._pending_signals:
+            pending = list(self._pending_signals)
+            self._pending_signals.clear()
+            orders_submitted += self._process_signals(pending, now)
         reconcile_report = self.reconcile()
         processed_bars = 0
-        orders_submitted = 0
 
         for symbol in self._symbols:
             bars = self._bar_source.get_minute_bars(symbol)

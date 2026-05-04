@@ -16,6 +16,9 @@ stock-agent 의 오케스트레이션 경계 모듈. `ORBStrategy` (시그널) +
 `OpenPositionInput`
 (총 14종)
 
+`Executor` 공개 메서드 추가 (PR5):
+- `enqueue_pending_signals(signals: Sequence[Signal]) -> None`
+
 ## 현재 상태 (2026-04-21 기준)
 
 **Phase 3 첫 산출물 — `Executor` 단독 (코드·테스트 레벨) 완료** (2026-04-21).
@@ -47,6 +50,14 @@ zero → skip + info 로그 + `return False` (RiskManager 미기록).
 - `_stop_loss_guard_signals(bar) -> list[Signal]` 헬퍼 신설. `lot.stop_price > 0` 이고 `bar.low <= lot.stop_price` 이면 `ExitSignal(reason="stop_loss", price=lot.stop_price, ts=bar.bar_time)` 반환.
 - `step()` 분봉 루프에 가드 호출 추가: 각 bar 처리 시 `_stop_loss_guard_signals(bar)` 먼저 호출 → 발동 시 `_process_signals` 처리 + `_last_processed_bar_time[symbol]` 갱신 후 `strategy.on_bar` 호출 skip.
 - `Executor.strategy` 공개 프로퍼티 신설 — `main.py` `_install_jobs` 의 RSI MR 판정용(`isinstance(executor.strategy, RSIMRStrategy)`).
+
+**Phase 3 PR5 (EOD 일봉 트리거 + pending signals queue, ADR-0027) 완료(2026-05-04)에 따른 확장**:
+- `Executor._pending_signals: list[Signal]` 인스턴스 필드 신설 (초기값 `[]`).
+- `enqueue_pending_signals(signals: Sequence[Signal]) -> None` 신규 공개 메서드 — EOD cron 이 다음 영업일 시초 진입을 위한 시그널을 큐인. `EntrySignal`/`ExitSignal` 외 타입은 `RuntimeError`. 내부 `_pending_signals.extend(signals)`.
+- `step(now)` 흐름 변경: `_sweep_*_events` 초기화 직후, reconcile 직전 위치에서 buffer flush — `_pending_signals` 가 비어있지 않으면 `_process_signals` 호출 후 `_pending_signals.clear()`.
+- `start_session` / `restore_session` 은 buffer clear 안 함 — EOD 시그널이 다음 영업일 09:00 session_start 후 첫 step 에서 자연 처리되도록.
+- `force_close_all(now)` 는 buffer flush 안 함 — 강제청산은 일중 단발성이고 EOD 시그널과 무관.
+- buffer 는 메모리 전용. 재기동 사이 손실 가능 (ADR-0027 결정).
 
 **Phase 3 PR4 (KIS WebSocket lazy subscribe) 완료(2026-05-03)에 따른 확장**:
 - `BarSource` Protocol 에 `subscribe(symbol: str) -> None` / `unsubscribe(symbol: str) -> None` 추가. `RealtimeDataStore` 의 기존 동명 공개 메서드를 그대로 만족 — 추가 어댑터 불필요.
@@ -146,6 +157,7 @@ restore_session(
 step(now: datetime) -> StepReport          # 1 sweep
 force_close_all(now: datetime) -> StepReport
 reconcile() -> ReconcileReport
+enqueue_pending_signals(signals: Sequence[Signal]) -> None   # PR5 신설 — EOD cron 큐인용
 is_halted (property)                       # _halt or risk_manager.is_halted
 strategy (property)                        # PR3 신설 — main._install_jobs RSI MR 판정용
 ```
@@ -239,8 +251,11 @@ last_reconcile: ReconcileReport | None   # property, read-only
 
 ```text
 1. 가드: now naive → RuntimeError, 세션 미시작 → RuntimeError.
-2. reconcile() — 잔고 vs RiskManager 비교. 불일치 시 _halt = True + critical 로그.
-3. for symbol in symbols:
+2. _sweep_entry_events / _sweep_exit_events 초기화.
+3. pending_signals flush (PR5) — _pending_signals 가 비어있지 않으면
+   _process_signals(_pending_signals, now) 호출 후 _pending_signals.clear().
+4. reconcile() — 잔고 vs RiskManager 비교. 불일치 시 _halt = True + critical 로그.
+5. for symbol in symbols:
      bars = bar_source.get_minute_bars(symbol)
      for bar in bars:
          if bar.bar_time <= _last_processed_bar_time[symbol]: continue   # idempotent
@@ -254,9 +269,9 @@ last_reconcile: ReconcileReport | None   # property, read-only
          signals = strategy.on_bar(bar)
          _process_signals(signals)
          _last_processed_bar_time[symbol] = bar.bar_time
-4. signals = strategy.on_time(now)
+6. signals = strategy.on_time(now)
    _process_signals(signals)
-5. return StepReport(...)
+7. return StepReport(...)
 ```
 
 `force_close_all(now)` 는 위에서 3 단계(분봉 처리)만 생략 — 15:00 KST 단발성

@@ -216,9 +216,9 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
 
 관련 자산: [.claude/hooks/src-first-requires-tests.sh](.claude/hooks/src-first-requires-tests.sh), [.claude/hooks/doc-sync-check.sh](.claude/hooks/doc-sync-check.sh), [.claude/agents/unit-test-writer.md](.claude/agents/unit-test-writer.md) 의 "TDD 모드 계약" 섹션, [docs/adr/0010-tdd-order-enforcement.md](./docs/adr/0010-tdd-order-enforcement.md).
 
-## 현재 상태 (2026-05-03 기준)
+## 현재 상태 (2026-05-04 기준)
 
-**한 줄 진행도**: Phase 1 PASS · **Phase 2 PASS (2026-05-03 공식 선언)** — ADR-0019 복구 로드맵 Step F PR1~PR5 평가 완료, ADR-0023 으로 F5 RSI 평균회귀 1차 채택 후보 확정, C1~C4 추가 검증 전원 통과. **Phase 3 진입 가능** — `main.py` 모의투자 무중단 운영 착수 재허가.
+**한 줄 진행도**: Phase 1 PASS · **Phase 2 PASS (2026-05-03 공식 선언)** — ADR-0023 C1~C4 추가 검증 전원 통과. **Phase 3 진행 중** — `main.py` 모의투자 운영 착수. PR5 (ADR-0027): EOD 일봉 트리거 wiring 결손 해소 — 운영 첫날(2026-05-04) 결함 확인 후 즉시 수정.
 
 - **Phase 2 1차 백테스트 결과 (2026-04-24, 1년치 KIS 백필 + `--loader=kis`)**: MDD **-51.36%**, 총수익률 -50.05%, 샤프 -6.81, 승률 31.35%, 손익비 1.28, 기대값 ≈ -0.28R. Phase 2 PASS 기준 3.4 배 초과 미달.
 - **신규 Phase 2 PASS 게이트 (ADR-0019)**: (1) MDD > -15%, (2) 승률 × 손익비 > 1.0, (3) 연환산 샤프 > 0 — 세 조건 전부 충족 + walk-forward 통과 후에만 Phase 3 착수.
@@ -257,7 +257,12 @@ PR #18 에서 `ExitEvent.reason: str` 이 프로젝트 내 기존 `ExitReason = 
   - `main.py` `_build_runtime` 의 `for ticker in universe.tickers: realtime_store.subscribe(ticker)` 사전 구독 루프 제거.
   - `RealtimeDataStore.subscribe/unsubscribe` 공개 API 재사용 — `data/realtime.py` 변경 없음.
   - 운영 효과: 시작 시 보유 0 → KIS WebSocket 동시 구독 0. RSI MR `max_positions=10` 이내 동적 구독 ≤ 10.
-- **테스트 카운트**: pytest **2242 passed, 4 skipped** (PR4 기준 — PR3 대비 +11: `TestBarSourceSubscribeContract` 9건 + `TestBuildRuntimeNoUniversePreSubscribe` 3건, 기존 universe 사전 구독 spec 테스트 1건 삭제).
+- **Phase 3 PR5 (2026-05-04, ADR-0027)**: EOD 일봉 트리거 + pending signals queue — 운영 첫날(2026-05-04) `executor.entry.filled` 0건 / `step processed=0` 결함 확인. 근본 원인: `main.py` cron 에 EOD 일봉 트리거가 미등록된 상태(ADR-0025 에 언급됐으나 PR3 에서 미구현). ADR-0027 로 결정 확정.
+  - `executor.py` — `Executor._pending_signals: list[Signal]` 인스턴스 필드 신설. `enqueue_pending_signals(signals: Sequence[Signal])` 신규 공개 메서드 (EntrySignal/ExitSignal 외 타입 `RuntimeError`). `step()` 시작 부분(`_sweep_*_events` 초기화 직후, reconcile 직전)에 buffer flush 로직 — `_pending_signals` 처리 후 clear. `start_session`/`restore_session` 은 buffer clear 안 함 (EOD 시그널 다음 영업일 첫 step 까지 보존).
+  - `main.py` — `Runtime` dataclass 에 `historical_store: HistoricalDataStore` 필드 추가 (총 9 → 10 필드). `_on_eod_signal(runtime, historical_store, *, clock) -> Callable[[], None]` 신규 콜백 — universe 일봉 fetch + `DailyBar→MinuteBar(09:00 KST)` 래핑 + `strategy.on_bar` 호출 + `enqueue_pending_signals` batched enqueue. `_install_jobs` RSI MR 모드 cron 3→4 (신규: `on_eod_signal` mon-fri 15:35 KST 등록). ORB 등 비-RSI MR 모드 cron 4종 그대로.
+  - 운영 영향: 다음 영업일(2026-05-05 화)부터 EOD 15:35 KST 일봉 트리거 정상 작동. 진입/청산 시그널 → 다음 영업일 09:00 후 첫 step 에서 시초가 시장가 주문.
+  - buffer 메모리 전용 (영속화 미포함 — 재기동 사이 손실 가능). 재기동 후 EOD cron 재발화 시 시그널 재구성으로 자연 복원 가능.
+- **테스트 카운트**: pytest **2266 passed, 4 skipped** (PR5 기준 — PR4 대비 +24: `TestPendingSignalsQueue` 13건 + `TestInstallJobsEodSignalRSIMR` 4건 + `TestOnEodSignalCallback` 6건 + 기존 카운트 갱신 1건).
 - **운영자 close 대기 Issue**: #51 (Phase 2 PASS 판정 FAIL → 복구 로드맵으로 대체) · #52 (`KisMinuteBarLoader` 파싱 실패 대응, 운영자 `scripts/debug_kis_minute.py` 실행 후 댓글) · #63 (공휴일 캘린더 가드, 백필 재실행으로 `date_mismatch` 0 확인 후 댓글) · #71 (장시간 hang 방지, 2026-04-24 백필 완주 확인 — 운영자 댓글만 잔여).
 
 상세한 Phase 별 산출물·결정·테스트 카운트 변화·Issue 대응 이력은 [docs/phase-history.md](./docs/phase-history.md) 참조.

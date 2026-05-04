@@ -56,6 +56,7 @@ ADR 가 **불필요** 한 변경:
 | [0024](./0024-walk-forward-pass-threshold.md) | Walk-forward pass-threshold = 0.3 결정 (C2 검증 기준) | 승인됨 | 2026-05-02 |
 | [0025](./0025-rsi-mr-operational-risk-limits.md) | RSI MR 운영 리스크 한도 재정의 — Phase 3 모의투자 기준값 확정 | 채택 | 2026-05-03 |
 | [0026](./0026-formatter-unification-ruff-only.md) | 포매터 단일화 — ruff format 채택, black 폐기 | 승인됨 | 2026-05-03 |
+| [0027](./0027-rsi-mr-eod-trigger-and-pending-signal-queue.md) | RSI MR 운영 — EOD 일봉 트리거 + 다음 영업일 시초 진입 큐 | 승인됨 | 2026-05-04 |
 
 ## 관련 문서
 
