@@ -1917,3 +1917,264 @@ class TestLoadDailyPnlRowIsolation:
         assert r._consecutive_failures["load_daily_pnl"] == 1
         mock_logger.warning.assert_called()
         mock_logger.critical.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #113 — cross-thread sqlite 접근 회귀 테스트 (RED 모드)
+#
+# 현재 _open_connection 이 check_same_thread 인자 없이 sqlite3.connect() 를
+# 호출 → 기본 True. APScheduler 워커 스레드에서 record_daily_summary 등을
+# 호출하면 sqlite3.ProgrammingError 로 silent fail → daily_pnl 미기록.
+#
+# 해결안 A: check_same_thread=False + threading.RLock 직렬화.
+# 아래 케이스는 해결안 A 구현 전까지 전부 FAIL 해야 한다.
+# ---------------------------------------------------------------------------
+import threading  # noqa: E402 — 파일 하단에 추가하는 import
+
+
+class TestCrossThreadAccess:
+    """Issue #113 — SqliteTradingRecorder 의 cross-thread sqlite 접근 회귀 테스트.
+
+    현재 구현(check_same_thread=True)에서 워커 스레드 호출은
+    sqlite3.ProgrammingError → silent fail → _consecutive_failures 카운터 +1.
+    해결안 A(check_same_thread=False + RLock) 적용 후 전원 GREEN 전환이 목표.
+    """
+
+    # ------------------------------------------------------------------
+    # 케이스 1: record_entry 워커 스레드 정상 기록
+    # ------------------------------------------------------------------
+
+    def test_record_entry_from_worker_thread_succeeds(self, tmp_path: Path) -> None:
+        """메인 스레드에서 생성한 recorder 를 워커 스레드에서 record_entry 호출.
+
+        join 후 orders 테이블에 1행이 기록되고 연속 실패 카운터는 0.
+        """
+        from stock_agent.storage.db import _OP_RECORD_ENTRY
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                recorder.record_entry(_make_entry_event())
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        conn = _get_conn(recorder)
+        row_count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        assert row_count == 1, f"orders 행 수 기대 1, 실제 {row_count}"
+        # silent fail 없음 검증 — 카운터 0 이어야 정상 기록 의미
+        cnt = recorder._consecutive_failures[_OP_RECORD_ENTRY]
+        assert cnt == 0, f"record_entry 연속 실패 카운터={cnt} (0 기대)"
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 2: record_exit 워커 스레드 정상 기록
+    # ------------------------------------------------------------------
+
+    def test_record_exit_from_worker_thread_succeeds(self, tmp_path: Path) -> None:
+        """워커 스레드에서 record_exit 호출 → orders 테이블에 sell 행 1건 기록."""
+        from stock_agent.storage.db import _OP_RECORD_EXIT
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        # exit 기록 전에 entry 를 메인 스레드에서 먼저 삽입 (FK 없음 — 독립 삽입 가능)
+        recorder.record_entry(_make_entry_event(order_number="ORD-BUY-002"))
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                recorder.record_exit(_make_exit_event(order_number="ORD-SELL-002"))
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        conn = _get_conn(recorder)
+        sell_count = conn.execute("SELECT COUNT(*) FROM orders WHERE side='sell'").fetchone()[0]
+        assert sell_count == 1, f"sell 행 수 기대 1, 실제 {sell_count}"
+        cnt = recorder._consecutive_failures[_OP_RECORD_EXIT]
+        assert cnt == 0, f"record_exit 연속 실패 카운터={cnt} (0 기대)"
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 3: record_daily_summary 워커 스레드 — Issue #113 핵심 재현
+    # ------------------------------------------------------------------
+
+    def test_record_daily_summary_from_worker_thread_succeeds(self, tmp_path: Path) -> None:
+        """APScheduler cron 워커 스레드에서 record_daily_summary 호출.
+
+        daily_pnl 테이블에 1행이 기록되고 연속 실패 카운터는 0.
+        현재 check_same_thread=True 구현에서는 silent fail → 카운터 +1 로 FAIL.
+        """
+        from stock_agent.storage.db import _OP_RECORD_DAILY_SUMMARY
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                recorder.record_daily_summary(_make_daily_summary())
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        conn = _get_conn(recorder)
+        row_count = conn.execute("SELECT COUNT(*) FROM daily_pnl").fetchone()[0]
+        assert row_count == 1, f"daily_pnl 행 수 기대 1, 실제 {row_count}"
+        assert recorder._consecutive_failures[_OP_RECORD_DAILY_SUMMARY] == 0, (
+            "record_daily_summary 연속 실패 카운터="
+            f"{recorder._consecutive_failures[_OP_RECORD_DAILY_SUMMARY]} (0 기대)"
+        )
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 4: load_open_positions 워커 스레드
+    # ------------------------------------------------------------------
+
+    def test_load_open_positions_from_worker_thread_succeeds(self, tmp_path: Path) -> None:
+        """메인에서 record_entry 1건 → 워커에서 load_open_positions 호출 → 길이 1."""
+        from stock_agent.storage.db import _OP_LOAD_OPEN_POSITIONS
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        recorder.record_entry(_make_entry_event())
+
+        errors: list[Exception] = []
+        result: list[tuple] = []
+
+        def worker() -> None:
+            try:
+                positions = recorder.load_open_positions(_DATE)
+                result.append(positions)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        assert len(result) == 1, "워커가 반환값을 수집하지 못함"
+        assert len(result[0]) == 1, f"open positions 길이 기대 1, 실제 {len(result[0])}"
+        assert recorder._consecutive_failures[_OP_LOAD_OPEN_POSITIONS] == 0, (
+            "load_open_positions 연속 실패 카운터="
+            f"{recorder._consecutive_failures[_OP_LOAD_OPEN_POSITIONS]} (0 기대)"
+        )
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 5: load_daily_pnl 워커 스레드
+    # ------------------------------------------------------------------
+
+    def test_load_daily_pnl_from_worker_thread_succeeds(self, tmp_path: Path) -> None:
+        """메인에서 entry+exit 기록 → 워커에서 load_daily_pnl → entries_today=1, realized=8500."""
+        from stock_agent.storage.db import _OP_LOAD_DAILY_PNL
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        recorder.record_entry(_make_entry_event())
+        recorder.record_exit(_make_exit_event())
+
+        errors: list[Exception] = []
+        result: list = []
+
+        def worker() -> None:
+            try:
+                snap = recorder.load_daily_pnl(_DATE)
+                result.append(snap)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        assert len(result) == 1, "워커가 반환값을 수집하지 못함"
+        snap = result[0]
+        assert snap.entries_today == 1, f"entries_today 기대 1, 실제 {snap.entries_today}"
+        assert snap.realized_pnl_krw == 8_500, (
+            f"realized_pnl_krw 기대 8500, 실제 {snap.realized_pnl_krw}"
+        )
+        assert recorder._consecutive_failures[_OP_LOAD_DAILY_PNL] == 0, (
+            "load_daily_pnl 연속 실패 카운터="
+            f"{recorder._consecutive_failures[_OP_LOAD_DAILY_PNL]} (0 기대)"
+        )
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 6: N=10 동시 record_entry — lock 직렬화로 누락 없음
+    # ------------------------------------------------------------------
+
+    def test_concurrent_record_entry_serialized_no_loss(self, tmp_path: Path) -> None:
+        """10개 워커 스레드가 각각 다른 order_number 로 record_entry 동시 호출.
+
+        join 후 orders 테이블 행 수 == 10. lock 직렬화 회귀 방지.
+        """
+        from stock_agent.storage.db import _OP_RECORD_ENTRY
+
+        n = 10
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+        errors: list[Exception] = []
+
+        def worker(idx: int) -> None:
+            try:
+                recorder.record_entry(_make_entry_event(order_number=f"ORD-BUY-{idx:03d}"))
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+        conn = _get_conn(recorder)
+        row_count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        assert row_count == n, f"orders 행 수 기대 {n}, 실제 {row_count} (누락 발생)"
+        cnt = recorder._consecutive_failures[_OP_RECORD_ENTRY]
+        assert cnt == 0, f"record_entry 연속 실패 카운터={cnt} (0 기대)"
+        recorder.close()
+
+    # ------------------------------------------------------------------
+    # 케이스 7: ProgrammingError 미발생 확인 — silent fail 카운터 직접 검증
+    # ------------------------------------------------------------------
+
+    def test_no_programming_error_raised_in_worker(self, tmp_path: Path) -> None:
+        """워커 스레드에서 record_daily_summary 호출 시 sqlite3.ProgrammingError 가
+        내부에서 발생해도 카운터 +1 로 관측된다.
+
+        현재 check_same_thread=True 구현에서는 ProgrammingError → silent fail →
+        _consecutive_failures[_OP_RECORD_DAILY_SUMMARY] >= 1 로 FAIL.
+        해결안 A 적용 후에는 카운터 == 0 으로 GREEN 전환.
+        """
+        from stock_agent.storage.db import _OP_RECORD_DAILY_SUMMARY
+
+        recorder = SqliteTradingRecorder(db_path=tmp_path / "trading.db")
+
+        def worker() -> None:
+            # record_daily_summary 는 silent fail — 외부에 raise 하지 않음.
+            recorder.record_daily_summary(_make_daily_summary())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        # 핵심 RED 단언: cross-thread 오류 시 카운터가 1 이상이 된다.
+        # 해결안 A 적용 후 이 단언이 0 == 0 으로 GREEN 전환.
+        cnt = recorder._consecutive_failures[_OP_RECORD_DAILY_SUMMARY]
+        assert cnt == 0, (
+            f"sqlite3.ProgrammingError(cross-thread) 발생 → silent fail → "
+            f"카운터={cnt} (0 기대 — 해결안 A 미적용)"
+        )

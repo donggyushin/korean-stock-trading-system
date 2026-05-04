@@ -64,8 +64,14 @@ PRAGMA (파일 기반만)
 - `foreign_keys = ON`
 
 스레드 모델
-- 단일 프로세스·단일 caller 전용 (broker/strategy/risk/data/execution 와
-  동일). 동시 호출 금지.
+- 단일 프로세스 전용 (broker/strategy/risk/data/execution 와 동일). 단,
+  APScheduler `BlockingScheduler` 가 cron 콜백을 워커 스레드에서 실행하므로
+  **단일 프로세스 내 멀티스레드 호출은 안전**해야 한다 (Issue #113, ADR-0013
+  결과 후속). `_open_connection` 은 `check_same_thread=False` 로 cross-thread
+  호출을 허용하고, 모든 `_conn.execute*` 진입을 `self._lock` (`threading.RLock`)
+  으로 직렬화한다. WAL + autocommit 이 reader/writer 동시성을 처리하지만 같은
+  Connection 객체를 두 스레드가 동시에 만지면 sqlite3 가 `OperationalError`
+  를 발생시키므로 직렬화가 필수.
 """
 
 from __future__ import annotations
@@ -74,6 +80,7 @@ import contextlib
 import json
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -336,6 +343,7 @@ class SqliteTradingRecorder:
         self._critical_emitted: dict[str, bool] = {op: False for op in _TRACKED_OPS}
         self._threshold = consecutive_failure_threshold
         self._is_memory = isinstance(db_path, str) and db_path == ":memory:"
+        self._lock = threading.RLock()
 
         self._conn = self._open_connection(db_path)
         try:
@@ -354,12 +362,18 @@ class SqliteTradingRecorder:
     def _open_connection(db_path: str | Path) -> sqlite3.Connection:
         """connect + 디렉토리·권한 가드.
 
+        `check_same_thread=False` 로 cross-thread 호출을 허용한다 (Issue #113):
+        APScheduler `BlockingScheduler` 의 cron 콜백이 워커 스레드에서 실행되는
+        반면 connection 자체는 메인 스레드(`main._build_runtime`) 에서 생성되기
+        때문. 동시성 안전은 `SqliteTradingRecorder._lock` (`threading.RLock`) 이
+        모든 `_conn.execute*` 호출을 직렬화해 보장한다.
+
         Raises:
             StorageError: 경로가 디렉토리이거나 connect 실패.
         """
         if isinstance(db_path, str) and db_path == ":memory:":
             try:
-                return sqlite3.connect(":memory:", isolation_level=None)
+                return sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
             except sqlite3.Error as e:
                 raise StorageError(
                     f"SqliteTradingRecorder: sqlite3.connect(':memory:') 실패: {e}"
@@ -377,7 +391,7 @@ class SqliteTradingRecorder:
             with contextlib.suppress(OSError):
                 parent.mkdir(parents=True, exist_ok=True)
         try:
-            return sqlite3.connect(str(path), isolation_level=None)
+            return sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         except sqlite3.Error as e:
             raise StorageError(
                 f"SqliteTradingRecorder: sqlite3.connect({path}) 실패: {e.__class__.__name__}: {e}"
@@ -385,10 +399,11 @@ class SqliteTradingRecorder:
 
     def _apply_pragmas(self) -> None:
         """WAL·NORMAL·foreign_keys. WAL 은 파일 기반에서만 적용."""
-        if not self._is_memory:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.execute("PRAGMA synchronous = NORMAL")
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        with self._lock:
+            if not self._is_memory:
+                self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA synchronous = NORMAL")
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
     def _init_schema(self) -> None:
         """스키마 v1 을 IF NOT EXISTS 로 적용.
@@ -397,29 +412,30 @@ class SqliteTradingRecorder:
         동시 프로세스 경합 상황에서 `schema_version` 만 먼저 생성되고 나머지
         테이블은 미생성된 "부분 스키마" 상태가 남는 것을 막는다(리뷰 C3).
         """
-        cur = self._conn.cursor()
-        try:
-            cur.execute("BEGIN IMMEDIATE")
+        with self._lock:
+            cur = self._conn.cursor()
             try:
-                cur.execute(_CREATE_SCHEMA_VERSION_SQL)
-                cur.execute(_CREATE_ORDERS_SQL)
-                cur.execute(_CREATE_DAILY_PNL_SQL)
-                cur.execute(_CREATE_ORDERS_INDEX_SESSION)
-                cur.execute(_CREATE_ORDERS_INDEX_SYMBOL)
-                row = cur.execute("SELECT MAX(version) FROM schema_version").fetchone()
-                current = row[0] if row and row[0] is not None else 0
-                if current < _SCHEMA_VERSION:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
-                        (_SCHEMA_VERSION,),
-                    )
-                cur.execute("COMMIT")
-            except Exception:
-                with contextlib.suppress(sqlite3.Error):
-                    cur.execute("ROLLBACK")
-                raise
-        finally:
-            cur.close()
+                cur.execute("BEGIN IMMEDIATE")
+                try:
+                    cur.execute(_CREATE_SCHEMA_VERSION_SQL)
+                    cur.execute(_CREATE_ORDERS_SQL)
+                    cur.execute(_CREATE_DAILY_PNL_SQL)
+                    cur.execute(_CREATE_ORDERS_INDEX_SESSION)
+                    cur.execute(_CREATE_ORDERS_INDEX_SYMBOL)
+                    row = cur.execute("SELECT MAX(version) FROM schema_version").fetchone()
+                    current = row[0] if row and row[0] is not None else 0
+                    if current < _SCHEMA_VERSION:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                            (_SCHEMA_VERSION,),
+                        )
+                    cur.execute("COMMIT")
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        cur.execute("ROLLBACK")
+                    raise
+            finally:
+                cur.close()
 
     def _safe_close_conn(self) -> None:
         """예외 경로용 연결 닫기 — 실패 무시."""
@@ -457,21 +473,22 @@ class SqliteTradingRecorder:
             return
         session_date = event.timestamp.date().isoformat()
         try:
-            self._conn.execute(
-                "INSERT INTO orders "
-                "(order_number, session_date, symbol, side, qty, fill_price, "
-                " ref_price, exit_reason, net_pnl_krw, filled_at) "
-                "VALUES (?, ?, ?, 'buy', ?, ?, ?, NULL, NULL, ?)",
-                (
-                    event.order_number,
-                    session_date,
-                    event.symbol,
-                    int(event.qty),
-                    str(event.fill_price),
-                    str(event.ref_price),
-                    event.timestamp.isoformat(),
-                ),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO orders "
+                    "(order_number, session_date, symbol, side, qty, fill_price, "
+                    " ref_price, exit_reason, net_pnl_krw, filled_at) "
+                    "VALUES (?, ?, ?, 'buy', ?, ?, ?, NULL, NULL, ?)",
+                    (
+                        event.order_number,
+                        session_date,
+                        event.symbol,
+                        int(event.qty),
+                        str(event.fill_price),
+                        str(event.ref_price),
+                        event.timestamp.isoformat(),
+                    ),
+                )
             self._on_success(_OP_RECORD_ENTRY)
         except Exception as e:  # noqa: BLE001 — I2: silent fail 계약 (매매 루프 보호)
             self._on_failure(_OP_RECORD_ENTRY, e)
@@ -499,23 +516,24 @@ class SqliteTradingRecorder:
             return
         session_date = event.timestamp.date().isoformat()
         try:
-            self._conn.execute(
-                "INSERT INTO orders "
-                "(order_number, session_date, symbol, side, qty, fill_price, "
-                " ref_price, exit_reason, net_pnl_krw, filled_at) "
-                "VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, ?, ?)",
-                (
-                    event.order_number,
-                    session_date,
-                    event.symbol,
-                    int(event.qty),
-                    str(event.fill_price),
-                    str(event.fill_price),
-                    event.reason,
-                    int(event.net_pnl_krw),
-                    event.timestamp.isoformat(),
-                ),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO orders "
+                    "(order_number, session_date, symbol, side, qty, fill_price, "
+                    " ref_price, exit_reason, net_pnl_krw, filled_at) "
+                    "VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, ?, ?)",
+                    (
+                        event.order_number,
+                        session_date,
+                        event.symbol,
+                        int(event.qty),
+                        str(event.fill_price),
+                        str(event.fill_price),
+                        event.reason,
+                        int(event.net_pnl_krw),
+                        event.timestamp.isoformat(),
+                    ),
+                )
             self._on_success(_OP_RECORD_EXIT)
         except Exception as e:  # noqa: BLE001 — I2: silent fail 계약
             self._on_failure(_OP_RECORD_EXIT, e)
@@ -535,23 +553,24 @@ class SqliteTradingRecorder:
             return
         recorded_at = datetime.now(KST).isoformat()
         try:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daily_pnl "
-                "(session_date, starting_capital_krw, realized_pnl_krw, "
-                " realized_pnl_pct, entries_today, halted, mismatch_symbols, "
-                " recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    summary.session_date.isoformat(),
-                    summary.starting_capital_krw,
-                    int(summary.realized_pnl_krw),
-                    summary.realized_pnl_pct,
-                    int(summary.entries_today),
-                    1 if summary.halted else 0,
-                    json.dumps(list(summary.mismatch_symbols)),
-                    recorded_at,
-                ),
-            )
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO daily_pnl "
+                    "(session_date, starting_capital_krw, realized_pnl_krw, "
+                    " realized_pnl_pct, entries_today, halted, mismatch_symbols, "
+                    " recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        summary.session_date.isoformat(),
+                        summary.starting_capital_krw,
+                        int(summary.realized_pnl_krw),
+                        summary.realized_pnl_pct,
+                        int(summary.entries_today),
+                        1 if summary.halted else 0,
+                        json.dumps(list(summary.mismatch_symbols)),
+                        recorded_at,
+                    ),
+                )
             self._on_success(_OP_RECORD_DAILY_SUMMARY)
         except Exception as e:  # noqa: BLE001 — I2: silent fail 계약
             self._on_failure(_OP_RECORD_DAILY_SUMMARY, e)
@@ -585,11 +604,12 @@ class SqliteTradingRecorder:
             )
             return ()
         try:
-            rows = self._conn.execute(
-                "SELECT side, symbol, qty, fill_price, order_number, filled_at "
-                "FROM orders WHERE session_date = ? ORDER BY filled_at ASC, rowid ASC",
-                (session_date.isoformat(),),
-            ).fetchall()
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT side, symbol, qty, fill_price, order_number, filled_at "
+                    "FROM orders WHERE session_date = ? ORDER BY filled_at ASC, rowid ASC",
+                    (session_date.isoformat(),),
+                ).fetchall()
         except (sqlite3.Error, ValueError, TypeError) as e:
             self._on_failure(_OP_LOAD_OPEN_POSITIONS, e)
             return ()
@@ -656,10 +676,11 @@ class SqliteTradingRecorder:
             )
             return empty
         try:
-            rows = self._conn.execute(
-                "SELECT side, symbol, net_pnl_krw FROM orders WHERE session_date = ?",
-                (session_date.isoformat(),),
-            ).fetchall()
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT side, symbol, net_pnl_krw FROM orders WHERE session_date = ?",
+                    (session_date.isoformat(),),
+                ).fetchall()
         except (sqlite3.Error, ValueError, TypeError) as e:
             self._on_failure(_OP_LOAD_DAILY_PNL, e)
             return empty
@@ -700,15 +721,16 @@ class SqliteTradingRecorder:
 
     def close(self) -> None:
         """멱등 close. 실패 경로에서도 호출 가능."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._conn.close()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"storage.close: connection close 실패 (무시): {e.__class__.__name__}: {e}"
-            )
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._conn.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"storage.close: connection close 실패 (무시): {e.__class__.__name__}: {e}"
+                )
 
     def __enter__(self) -> SqliteTradingRecorder:
         return self
