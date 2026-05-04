@@ -2,11 +2,11 @@
 
 ![CI](https://github.com/donggyushin/korean-stock-trading-system/actions/workflows/ci.yml/badge.svg?branch=main)
 
-Python 기반 한국주식 **데이 트레이딩** 자동매매 시스템 (MVP 설계 단계).
+Python 기반 한국주식 자동매매 시스템. 일중 데이트레이딩 가정 폐기(ADR-0021/0023) → 일봉 RSI 평균회귀(`RSIMRStrategy`) 1차 채택 후보 확정. **Phase 2 PASS (2026-05-03 공식 선언) · Phase 3 진행 중** — `main.py` 모의투자 무중단 운영 착수.
 
 ## 개요
 
-KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동 실행하는 시스템을 구축합니다. 초기에는 한국투자증권 **모의투자** 환경에서 검증하고, 2주 이상 무사고 운영이 확인된 뒤에만 소액(100~200만원) 실전으로 전환합니다.
+KOSPI 200 대형주를 대상으로 **일봉 RSI 평균회귀(`RSIMRStrategy`)** 전략을 자동 실행하는 시스템을 구축합니다. ADR-0021/0023 결정으로 일중 데이트레이딩 가정을 폐기하고 일/월 단위 평균회귀 전략을 채택했습니다. ORB·VWAP-MR·Gap-Reversal·Cross-sectional 모멘텀·저변동성·Golden Cross·DCA 전략 코드는 baseline/회귀 검증용으로 보존됩니다. 초기에는 한국투자증권 **모의투자** 환경에서 검증하고, 2주 이상 무사고 운영이 확인된 뒤에만 소액(100~200만원) 실전으로 전환합니다.
 
 **왜 한국투자증권인가**: 토스증권은 개인 개발자용 Open API를 제공하지 않습니다(2026-04 기준). 자동매매가 가능하면서 Mac/Python 환경에서 바로 사용할 수 있는 REST API + 모의투자 지원 증권사가 한국투자증권(KIS Developers)입니다.
 
@@ -18,12 +18,15 @@ KOSPI 200 대형주를 대상으로 Opening Range Breakout(ORB) 전략을 자동
 
 ## 매매 전략
 
-**Opening Range Breakout (ORB)** — long-only
+**RSI 평균회귀 (`RSIMRStrategy`)** — long-only, 1차 채택 후보 (ADR-0023, 2026-05-02 확정)
 
-- 9:00~9:30 동안 종목별 고가(OR-High)·저가(OR-Low) 기록
-- 9:30 이후 OR-High 상향 돌파 시 시장가 매수
-- 손절 -1.5%, 익절 +3.0%, 15:00 강제 청산
-- KOSPI 200 중 9:00~9:30 거래대금 상위 N종목만 후보
+- KOSPI 200 cross-sectional 일봉 RSI(14) 기반
+- 과매도 RSI ≤ 30 진입 (EOD 15:35 KST 일봉 신호 생성 → 다음 영업일 09:00 후 첫 step 에서 시초가 시장가 매수)
+- 과매수 RSI ≥ 70 청산 (익절 고정가 없음, RSI 조건 도달 시 청산)
+- stop_loss -3% (분봉 저가 도달 시 즉시 청산 — 분봉 stop_loss 가드, ADR-0025 PR3)
+- 동시 최대 10종목, 15:00 강제청산 미사용 (일봉 전략 특성상, ADR-0025)
+
+ORB·VWAP-MR·Gap-Reversal·Cross-sectional 모멘텀·저변동성·Golden Cross·DCA 전략 코드는 baseline/회귀 검증용으로 보존.
 
 ## 리스크 관리 (Phase 3 모의투자 운영 기준값, ADR-0025)
 
@@ -60,14 +63,16 @@ ORB 시절 기본값(종목당 20%, 동시 3종목, 손절 -1.5%, 익절 +3.0%, 
 |---|---|---|
 | 0 | 2~3일 | 한투 계좌 개설, KIS 모의 키 발급, 텔레그램 봇 세팅, 레포 초기화 |
 | 1 | 4~5일 | KIS 클라이언트(토큰/주문/조회) + 데이터 파이프라인(pykrx + 분봉 폴링) |
-| 2 | 5~7일 | ORB 전략 구현, 리스크 매니저, 1년 분봉 백테스팅 리포트 (ADR-0017) |
-| 3 | 5~7일 | 모의투자 자동 실행 루프, 텔레그램 알림, **2주 이상 무사고 운영** |
+| 2 | 5~7일 | 전략 엔진·리스크 매니저·백테스트 엔진 구현 → 복구 로드맵(Step A~F) 완주 → RSI MR 1차 채택 후보 확정 (ADR-0023) · **PASS (2026-05-03)** |
+| 3 | 5~7일 | 모의투자 자동 실행 루프, 텔레그램 알림, **2주 이상 무사고 운영** ← **진행 중** |
 | 4 | 상시 | 소액 실전 전환 (초기 50만원 한도부터), 주간 회고 |
 | 5 | 지속 | 2번째 전략 A/B, 필요 시 클라우드 VPS 이전, 대시보드 |
 
 ## 현재 상태
 
-**Phase 1 PASS (코드·테스트 레벨)** (2026-04-19 선언). Phase 0 환경 준비 완료. broker(KisClient + rate_limiter) + data(historical + universe + realtime) 모두 완료. pytest **131건 green**. **paper 주문 + live 시세 하이브리드 키 정책 도입**: KIS paper 도메인에 시세 API가 없어 `RealtimeDataStore`는 별도 실전 APP_KEY로 실전 도메인을 호출하며, 실전 키 PyKis 인스턴스에는 `install_order_block_guard`를 설치해 주문 경로를 구조적으로 차단한다.
+**Phase 1 PASS · Phase 2 PASS (2026-05-03 공식 선언) · Phase 3 진행 중** — ADR-0023 C1~C4 추가 검증 전원 통과 후 Phase 3 착수. `main.py` 모의투자 무중단 운영 재허가. Phase 3 PR5(ADR-0027) 까지 완료 — EOD 일봉 트리거 결손 해소. pytest **2266 passed, 4 skipped**.
+
+**Phase 1 PASS (코드·테스트 레벨)** (2026-04-19 선언). Phase 0 환경 준비 완료. broker(KisClient + rate_limiter) + data(historical + universe + realtime) 모두 완료. **paper 주문 + live 시세 하이브리드 키 정책 도입**: KIS paper 도메인에 시세 API가 없어 `RealtimeDataStore`는 별도 실전 APP_KEY로 실전 도메인을 호출하며, 실전 키 PyKis 인스턴스에는 `install_order_block_guard`를 설치해 주문 경로를 구조적으로 차단한다.
 
 **Phase 2 진행 중 — ORB 전략 엔진 + 리스크 매니저 + 백테스트 엔진 코어 + CSV 분봉 어댑터 + 파라미터 민감도 그리드 + backtest.py CLI + KIS 과거 분봉 API 어댑터 + 백필 CLI 완료** (2026-04-20~22). `strategy/` + `risk/` + `backtest/` + `data/kis_minute_bars.py` 완료. `scripts/backtest.py`·`scripts/sensitivity.py` 에 `--loader={csv,kis}` 옵션 추가. PASS 판정은 ADR-0019 세 게이트(MDD > -15% · 승률 × 손익비 > 1.0 · 연환산 샤프 > 0) 전부 충족 + walk-forward 검증 통과 조건.
 
@@ -141,7 +146,7 @@ ORB 시절 기본값(종목당 20%, 동시 3종목, 손절 -1.5%, 익절 +3.0%, 
 
 ## 디렉토리 구조
 
-현재 존재하는 파일 (Phase 2 Step F PR5 완료 기준):
+현재 존재하는 파일 (Phase 3 PR5 완료 기준):
 
 ```text
 stock-agent/
@@ -173,6 +178,8 @@ stock-agent/
 │       ├── minute_csv.py      # CSV 과거 분봉 어댑터 (MinuteCsvBarLoader)
 │       ├── kis_minute_bars.py # KIS API 과거 분봉 어댑터 (KisMinuteBarLoader, SQLite 캐시 data/minute_bars.db)
 │       ├── spread_samples.py  # KIS 호가 스프레드 스냅샷 수집기 (SpreadSampleCollector, Step B 인프라)
+│       ├── calendar.py        # 공휴일 캘린더 (BusinessDayCalendar, YamlBusinessDayCalendar, HolidayCalendar, load_kospi_holidays — ADR-0018)
+│       ├── daily_bar_loader.py # 일봉 로더 어댑터 (DailyBarLoader, DailyBarSource — __init__.py 미재노출, 직접 import)
 │       └── CLAUDE.md          # 모듈 세부 문서
 │   ├── strategy/
 │   │   ├── __init__.py        # EntrySignal, ExitReason, ExitSignal, GapReversalConfig, GapReversalStrategy, ORBStrategy, Signal, Strategy, StrategyConfig, StrategyError, VWAPMRConfig, VWAPMRStrategy export
@@ -203,8 +210,10 @@ stock-agent/
 │   │   ├── golden_cross.py    # GoldenCrossBaselineConfig + compute_golden_cross_baseline (Step F PR2)
 │   │   ├── momentum.py        # MomentumBaselineConfig + compute_momentum_baseline (Step F PR3)
 │   │   ├── low_volatility.py  # LowVolBaselineConfig + compute_low_volatility_baseline (Step F PR4)
-│   │   ├── rsi_mr.py          # RSIMRBaselineConfig + compute_rsi_mr_baseline (Step F PR5)
-│   │   └── CLAUDE.md          # 모듈 세부 문서
+│   │   ├── rsi_mr.py              # RSIMRBaselineConfig + compute_rsi_mr_baseline (Step F PR5)
+│   │   ├── rsi_mr_sensitivity.py  # RSI MR 민감도 그리드 (RSIMRParameterAxis, RSIMRSensitivityGrid, step_f_rsi_mr_grid 등 — ADR-0023 C4)
+│   │   ├── walk_forward.py        # walk-forward 본 구현 (WalkForwardResult, run_walk_forward — ADR-0024, C2)
+│   │   └── CLAUDE.md              # 모듈 세부 문서
 │   ├── execution/
 │   │   ├── __init__.py        # Executor, ExecutorConfig, OrderSubmitter, BalanceProvider, BarSource, LiveOrderSubmitter, LiveBalanceProvider, DryRunOrderSubmitter, StepReport, ReconcileReport, EntryEvent, ExitEvent, ExecutorError export (13종)
 │   │   ├── executor.py        # Executor — 신호 → 주문 → 체결 추적 → 상태 동기화 루프
@@ -243,7 +252,10 @@ stock-agent/
     ├── collect_spread_samples.py   # KIS 호가 스프레드 스냅샷 수집 CLI (Step B 인프라, JSONL 출력)
     ├── build_liquidity_ranking.py  # KOSPI 200 유동성 랭킹 산출 CLI (Step C 인프라, CSV 출력)
     ├── build_universe_subset.py    # 유동성 랭킹 CSV → KOSPI 200 서브셋 YAML 생성 (Step C 보조)
-    └── walk_forward_rsi_mr.py      # RSI 평균회귀 walk-forward 검증 CLI (C2, step6/step3 분할, Markdown/CSV 출력)
+    ├── walk_forward_rsi_mr.py      # RSI 평균회귀 walk-forward 검증 CLI (C2, step6/step3 분할, Markdown/CSV 출력)
+    ├── c4_rsi_mr_sensitivity.py    # RSI MR 민감도 그리드 96 조합 실행 CLI (ADR-0023 C4)
+    ├── verify_069500_adjusted.py   # KODEX 200 수정주가 4단계 교차 검증 CLI (ADR-0023 C3)
+    └── debug_kis_minute.py         # KIS 과거 분봉 API 파싱 디버그 CLI (Issue #52 대응)
 ```
 
 미착수 모듈의 청사진은 [`plan.md`](./plan.md)의 디렉토리 구조 섹션 참조.
@@ -356,7 +368,9 @@ PASS 기준: 모든 windows 에서 ADR-0022 게이트 3종 통과 + degradation 
 
 ### 백테스트용 분봉 백필
 
-Phase 2 PASS 검증 전 `data/minute_bars.db` 에 1년치 KIS 분봉을 미리 적재한다.
+RSI 평균회귀(일봉 전략)의 정본 데이터 경로는 위 "백테스트용 일봉 백필" 섹션이다. 분봉 백필은 ORB·VWAP-MR·Gap-Reversal 등 분봉 기반 baseline 전략 회귀 검증용으로 보존한다.
+
+`data/minute_bars.db` 에 KIS 분봉을 적재한다.
 
 ```bash
 # 유니버스 전체 심볼에 대해 최근 1년치 분봉 백필
@@ -387,7 +401,13 @@ uv run python -m stock_agent.main
 uv run python -m stock_agent.main --dry-run --starting-capital 2000000
 ```
 
-- 스케줄: 평일(`mon-fri`) 09:00 세션 시작 → 매분 신호 처리 → 15:00 강제청산 → 15:30 일일 리포트 (모두 KST)
+- 스케줄 (RSI MR 모드, 평일 KST 기준):
+  - 09:00 세션 시작 (`session_start`)
+  - 매분 신호 처리 (`step`) — 분봉 stop_loss 가드 포함 (보유 포지션만 동적 구독, ADR-0025 PR3)
+  - 15:30 일일 리포트 (`daily_report`)
+  - 15:35 EOD 일봉 트리거 (`on_eod_signal`) — universe 일봉 fetch → `strategy.on_bar` 호출 → pending signals 큐인 → 다음 영업일 09:00 후 첫 step 에서 시초가 시장가 주문 (ADR-0027)
+  - **15:00 강제청산 cron 미등록** — 일봉 전략 특성상 부적합 (ADR-0025)
+- KIS WebSocket 구독: 시작 시 0종목 → 진입 체결 시 동적 구독 · 청산 체결 시 해제 · 최대 `max_positions=10` (ADR-0025 PR4)
 - 공휴일 자동 판정 미지원 — KRX 임시공휴일은 운영자가 프로세스를 띄우지 않는 방식으로 처리
 - SIGINT(Ctrl+C) / SIGTERM 모두 graceful shutdown 처리 (exit 0)
 
