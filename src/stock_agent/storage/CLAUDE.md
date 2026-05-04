@@ -20,6 +20,7 @@ stock-agent 의 영속화 경계 모듈. `Executor` 가 방출한 `EntryEvent`·
 **Phase 3 네 번째 산출물 — `storage/db.py` (코드·테스트 레벨) 완료** (2026-04-22).
 **Phase 3 다섯 번째 산출물 — 세션 재기동 복원 경로 (코드·테스트 레벨) 완료** (2026-04-22, Issue #33): `load_open_positions` · `load_daily_pnl` 2 메서드 + `OpenPositionRow` · `DailyPnlSnapshot` DTO 추가.
 **2026-04-22 후속 — `load_*` 행 단위 예외 격리 (Issue #40) 완료**: 쿼리 자체 실패는 빈 결과 + 카운터 +1, 개별 행 파싱 실패는 행 단위 skip + `logger.error`, 파싱 실패 1건 이상이면 메서드 카운터 +1 경로로 묶음.
+**2026-05-04 후속 — `SqliteTradingRecorder` cross-thread 안전성 보강 (Issue #113) 완료**: APScheduler 워커 스레드에서 `record_*`/`load_*` 를 호출했을 때 `sqlite3.ProgrammingError` (check_same_thread=True 기본값) 가 silent fail 로 흡수되던 경로를 차단. `_open_connection` 에 `check_same_thread=False` + `SqliteTradingRecorder._lock: threading.RLock` 으로 모든 `_conn.execute*` 호출을 직렬화. `TestCrossThreadAccess` 7 케이스 회귀 테스트 추가.
 
 의도적으로 미포함(defer):
 - 주간 회고 리포트 CLI (`scripts/weekly_report.py` 등) — MVP 는 SQL 직접 쿼리
@@ -256,12 +257,13 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
 4. `close()` 이후 `record_*` 호출 → `logger.warning` 1회 + silent 반환. 카운터 불변.
 5. naive timestamp 입력 → `logger.warning` + 카운터 +1 + silent 반환 (DTO `__post_init__` 가 이미 차단하지만 defensive depth).
 6. **`load_*` 행 단위 격리 (Issue #40)** — 쿼리 자체 실패(`sqlite3.Error`·`ValueError`·`TypeError`) → 빈 결과 + `_on_failure` + 카운터 +1. 개별 행 파싱 실패(`Decimal` 변환·`datetime.fromisoformat`·`OpenPositionRow.__post_init__` RuntimeError 등) → 해당 행만 `logger.error` 로 skip, 나머지 행 정상 반환. 파싱 실패 1건 이상이면 `_on_failure` 를 1회 호출해 메서드별 카운터 +1 + dedupe 경보 경로를 탄다. 모든 행이 실패해도 크래시 없이 빈 결과(`()` / `DailyPnlSnapshot(session_date, 0, 0, ())`). `load_daily_pnl` 내부에서 `sold.add(symbol)` 은 `int(net_pnl)` 성공 이후에 실행해, 파싱 실패 시 해당 심볼이 `closed_symbols` 에 잘못 포함되지 않도록 한다.
+7. **cross-thread 안전성 (Issue #113)** — `_open_connection` 이 `check_same_thread=False` 로 cross-thread 호출을 허용하고, 모든 `_conn.execute*` 진입을 `_lock` (`threading.RLock`) 으로 직렬화. APScheduler `BlockingScheduler` 의 cron 콜백이 메인 스레드 connection 객체를 워커 스레드에서 호출해도 `sqlite3.ProgrammingError` 가 발생하지 않는다.
 
 ## 테스트 정책
 
 - 실제 파일 I/O: `":memory:"` (단위 테스트) 또는 `tmp_path` fixture (경로 테스트). 외부 의존 0.
 - KIS 네트워크·텔레그램·시계·실파일 절대 접촉 금지.
-- 관련 테스트 파일: `tests/test_storage_db.py`. 카테고리 — 공개 심볼 노출, `SqliteTradingRecorder` 생성·스키마·PRAGMA, `record_entry`/`record_exit`/`record_daily_summary` 정상·가드·DB 행 검증, silent fail + 연속 실패 dedupe, close 후 호출 내구성, `NullTradingRecorder` no-op, `StorageError` 계약, 컨텍스트 매니저, close 멱등. Issue #40 대응으로 `TestLoadOpenPositionsRowIsolation` · `TestLoadDailyPnlRowIsolation` 클래스 추가 (행 단위 파싱 실패 격리 검증).
+- 관련 테스트 파일: `tests/test_storage_db.py`. 카테고리 — 공개 심볼 노출, `SqliteTradingRecorder` 생성·스키마·PRAGMA, `record_entry`/`record_exit`/`record_daily_summary` 정상·가드·DB 행 검증, silent fail + 연속 실패 dedupe, close 후 호출 내구성, `NullTradingRecorder` no-op, `StorageError` 계약, 컨텍스트 매니저, close 멱등. Issue #40 대응으로 `TestLoadOpenPositionsRowIsolation` · `TestLoadDailyPnlRowIsolation` 클래스 추가 (행 단위 파싱 실패 격리 검증). Issue #113 대응으로 `TestCrossThreadAccess` 클래스 추가 (cross-thread 회귀 — 워커 스레드에서 record_*/load_* 정상 기록 + N=10 동시성 직렬화 검증).
 - SKIP 케이스 3건: naive timestamp 는 DTO `__post_init__` 가드가 선점하므로 `record_*` 진입 전 `RuntimeError` — SKIP 처리. 자세한 사유는 테스트 파일 내 주석 참조.
 - 테스트 파일 작성·수정은 반드시 `unit-test-writer` 서브에이전트 경유 (root CLAUDE.md 하드 규칙).
 
@@ -290,7 +292,7 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
 - **PostgreSQL 전환** — plan.md "추후" 영역.
 - **부분체결 기록** — `Executor` 즉시 전량 체결 가정.
 - **스키마 마이그레이션 프레임워크** — `schema_version` 테이블 + 분기 훅만 준비. 실제 마이그레이션 로직은 v2 도입 시.
-- **멀티프로세스·스레드 safe** — 단일 프로세스 전용 (broker/strategy/risk/data/execution 와 동일).
+- **멀티프로세스 safe** — 단일 프로세스 전용 (broker/strategy/risk/data/execution 와 동일). 단, **단일 프로세스 내 멀티스레드 호출은 안전** — APScheduler `BlockingScheduler` 가 cron 콜백을 워커 스레드에서 실행하므로 `_open_connection` 은 `check_same_thread=False` + `_lock: threading.RLock` 직렬화로 cross-thread 호출을 받는다 (Issue #113, 2026-05-04).
 
 ## ADR
 

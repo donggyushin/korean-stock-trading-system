@@ -71,6 +71,27 @@ Phase 3 PASS 기준(plan.md:198) 은 "모의투자 연속 10영업일 무중단 
 - `order_number` 를 PK 로 쓰면 같은 session 에서 KIS 가 재사용하는 사건(일반적으로는 없음) 에서 재INSERT 가 silent fail 로 흡수된다. 실무 운영에서는 문제되지 않지만 테스트에서는 `TestPrimaryKeyConflict` 로 동작을 명시 고정.
 - `daily_pnl` 의 `INSERT OR REPLACE` 는 "같은 날 재실행 시 마지막 값 유지" 계약 — 운영자가 장중 프로세스를 재시작했을 때 덮어쓰기 vs 다중 행 보존의 선택이었다. 현재 `session_date` 를 PK 로 고정했으므로 재시작 시 마지막 실행이 정본.
 
+## 후속 (2026-05-04, Issue #113)
+
+운영 첫날 (2026-05-04 15:30) `_on_daily_report` cron 발화 시 `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread. The object was created in thread id 8276678848 and this is thread id 6176911360. consecutive=1` 1건 발생. silent fail + dedupe 경로 (결정 6) 가 운영 차단을 막았지만 daily_pnl 행이 기록되지 않아 ADR-0014 재기동 복원 경로가 무력화될 위험을 발견.
+
+근본 원인: `_open_connection` 이 `sqlite3.connect(...)` 호출 시 `check_same_thread` 인자를 지정하지 않아 기본값 True. `BlockingScheduler` (ADR-0011) 의 기본 executor 가 `ThreadPoolExecutor(max_workers=10)` 이라 cron 콜백이 워커 스레드에서 실행되는 반면 connection 자체는 `main._build_runtime` 메인 스레드에서 생성됨.
+
+후속 결정 (결정 6 silent fail 정책은 그대로 유지, 정책 번복 아님 — ADR 새로 작성 안 함):
+- `_open_connection` 의 `sqlite3.connect(...)` 양쪽 호출에 `check_same_thread=False` 추가.
+- `SqliteTradingRecorder.__init__` 에 `self._lock = threading.RLock()` 추가.
+- `_apply_pragmas`/`_init_schema`/`record_entry`/`record_exit`/`record_daily_summary`/`load_open_positions`/`load_daily_pnl`/`close` 의 `_conn.execute*` 진입을 `with self._lock:` 컨텍스트로 감쌈.
+- WAL + autocommit 이 reader/writer 동시성을 처리하지만 같은 Connection 객체를 두 스레드가 동시에 만지면 sqlite3 가 `OperationalError` 를 발생시키므로 직렬화 필수.
+
+회귀 테스트: `tests/test_storage_db.py::TestCrossThreadAccess` 7 케이스 신설 — 워커 스레드 record_*/load_* 정상 기록 + N=10 동시 record_entry 직렬화 누락 없음 + `_consecutive_failures` 카운터 0 검증.
+
+대안 비교 (Issue #113 본문):
+- B 안 (`max_workers=1` ThreadPoolExecutor): connection 생성도 같은 워커 스레드에서 해야 의미 있는데 `_build_runtime` 시점이 메인이라 단독으로는 해결 안 됨. 기각.
+- B' 안 (`threading.local` per-thread connection): close 시 모든 스레드 connection 추적 필요 + 테스트 fixture 영향 큼. YAGNI — 현재 운영은 직렬 실행이라 lock 으로 충분.
+- C 안 (queue executor): load_* 가 동기 반환이라 future/Event 신호 필요 → 복잡도 증가. 기각.
+
+A 안이 변경 비용 vs 안전성 비율 가장 좋다는 판단으로 채택.
+
 ## 추적
 
 - 코드: `src/stock_agent/storage/__init__.py`, `src/stock_agent/storage/db.py`, `src/stock_agent/execution/executor.py` (DTO 확장), `src/stock_agent/main.py` (Runtime·팩토리·콜백·close).
