@@ -162,6 +162,7 @@ stock-agent/
   - [x] 통과 확인 — 2026-04-21 평일 장중 healthcheck 4종 그린, WebSocket 체결 수신 OK.
 - [x] `execution/executor.py`: 신호 → 주문 → 체결 추적 → 상태 동기화 루프 — 완료 2026-04-21. Protocol 분리(`OrderSubmitter`/`BalanceProvider`/`BarSource`) + `DryRunOrderSubmitter` 주입으로 KIS 접촉 0 드라이런 + 재동기화 halt + `KisClientError` 지수 백오프 + `backtest/costs.py` 비용 산식 재사용. 단위 테스트 63건 green (총 605건). 의존성 추가 없음.
 - [x] `main.py`: APScheduler로 9:00 시작, 장중 루프, 15:00 청산, 15:30 리포트 — 완료 2026-04-21. `BlockingScheduler(timezone='Asia/Seoul')` + 4종 cron job(09:00 session_start·매분 step·15:00 force_close·15:30 daily_report, 평일 한정). `--dry-run` CLI 플래그로 `DryRunOrderSubmitter` 주입 → KIS 주문 접촉 0. SIGINT/SIGTERM graceful shutdown. 단위 테스트 47건 green (총 652건). `apscheduler 3.11.2` 의존성 추가. 9:30 OR 확정 별도 훅 불필요 — `ORBStrategy.on_bar` 가 분봉 경계에서 자동 처리. 공휴일 자동 판정 미도입 — 운영자 수동 처리 (ADR-0011).
+  - Phase 3 PR5 확장 (2026-05-04, ADR-0027): RSI MR 모드 전용 `on_eod_signal` cron(mon-fri 15:35 KST) 추가 — universe 일봉 fetch + `DailyBar→MinuteBar(09:00 KST)` 래핑 + `strategy.on_bar` 호출 + `executor.enqueue_pending_signals` batched enqueue. RSI MR 모드 cron 3→4종. `Runtime` dataclass 에 `historical_store: HistoricalDataStore` 필드 추가 (9→10 필드). 다음 영업일 09:00 후 첫 `step()` 에서 buffer flush → 시초가 시장가 주문.
 - [x] `monitor/notifier.py`: 진입/청산/에러/일일 요약 텔레그램 알림 — 완료 2026-04-21. `Notifier` Protocol 분리(`Executor` 는 notifier 모름) + `StepReport` 이벤트 확장(`entry_events`/`exit_events`) + 전송 실패 silent fail + 연속 실패 dedupe 경보 + 드라이런 실전송 `[DRY-RUN]` 프리픽스. ADR-0012. I1/I2 후속 정리 반영 (2026-04-22) — 연속 실패 stderr 2차 경보 + `_fmt_time` naive/non-KST 가드.
 - [x] `storage/db.py`: SQLite에 모든 주문/체결/PnL 기록 — 완료 2026-04-22. `TradingRecorder` Protocol + `SqliteTradingRecorder` + `NullTradingRecorder` + `StorageError`. 스키마 v1(orders/daily_pnl/schema_version). silent fail + 연속 실패 dedupe 경보. `EntryEvent`·`ExitEvent` 에 `order_number: str` 추가. 의존성 추가 없음.
 - **드라이런 모드**: `--dry-run` 플래그로 주문 API 호출 없이 로그만 (최종 검증용) — `main.py` 에서 구현 완료.
@@ -628,3 +629,19 @@ pytest **2221 passed, 4 skipped** (PR2 기준).
 - `step()` 분봉 루프에 가드 호출 추가: bar 처리 시작 시 `_stop_loss_guard_signals(bar)` 호출 → 발동 시 `_process_signals` 처리 + `strategy.on_bar` 호출 skip.
 
 pytest **2231 passed, 4 skipped** (PR3 기준 — PR2 대비 +10: `TestInstallJobsRSIMRBranch` 4건 + `TestStepStopLossGuard` 6건).
+
+### Phase 3 PR4 — KIS WebSocket lazy subscribe (2026-05-03)
+
+[x] `src/stock_agent/execution/executor.py`:
+- `BarSource` Protocol 에 `subscribe(symbol: str) -> None` / `unsubscribe(symbol: str) -> None` 추가.
+- `_handle_entry` — fill 성공(partial/full) 후 `bar_source.subscribe(signal.symbol)` 호출. zero fill 은 미호출.
+- `_handle_exit` — `_open_lots.pop(symbol)` 직후 `bar_source.unsubscribe(symbol)` 호출(full fill 만 도달 — partial/none 은 `ExecutorError` 차단, 자연 정합).
+- `restore_session` — `open_positions` 각 symbol 에 대해 `bar_source.subscribe(p.symbol)` 호출(재기동 포지션 분봉 흐름 유지).
+
+[x] `src/stock_agent/main.py` (`_build_runtime`): `for ticker in universe.tickers: realtime_store.subscribe(ticker)` 사전 구독 루프 제거. RSI MR 모드에서 시작 시 구독 0 → Executor 가 진입 시점에만 동적 구독.
+
+`RealtimeDataStore.subscribe/unsubscribe` 는 기존 공개 API 재사용 — `data/realtime.py` 변경 없음.
+
+운영 효과: 시작 시 KIS WebSocket 동시 구독 0 (기존 universe 199 → 0). RSI MR `max_positions=10` 한도 내 최대 10 구독. KIS WebSocket 구독 한도(약 41) 압박 해소.
+
+pytest **2242 passed, 4 skipped** (PR4 기준 — PR3 대비 +11: `TestBarSourceSubscribeContract` 9건 + `TestBuildRuntimeNoUniversePreSubscribe` 3건 신규, 기존 universe 사전 구독 spec 테스트 `test_build_runtime_정상_subscribe_각_티커_호출` 1건 삭제).

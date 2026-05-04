@@ -44,7 +44,7 @@ import signal
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -58,7 +58,9 @@ from pydantic import ValidationError
 from stock_agent.broker import KisClient
 from stock_agent.config import Settings, get_settings
 from stock_agent.data import (
+    HistoricalDataStore,
     KospiUniverse,
+    MinuteBar,
     RealtimeDataStore,
     UniverseLoadError,
     load_kospi200_universe,
@@ -85,6 +87,7 @@ from stock_agent.storage import (
     StorageError,
     TradingRecorder,
 )
+from stock_agent.strategy import Signal
 from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
 
 EXIT_OK = 0
@@ -141,6 +144,9 @@ class Runtime:
     session_status: SessionStatus
     notifier: Notifier
     recorder: TradingRecorder
+    # PR5 (ADR-0027): RSI MR EOD 일봉 트리거 cron 이 사용. 일봉 fetch 경로(pykrx +
+    # `data/stock_agent.db` SQLite 캐시). RSI MR 모드에서만 cron 발화 시 호출됨.
+    historical_store: HistoricalDataStore
 
 
 # ---- CLI -----------------------------------------------------------------
@@ -253,6 +259,7 @@ def build_runtime(
     universe_loader: Callable[[Path | None], KospiUniverse] | None = None,
     notifier_factory: Callable[[Settings, bool], Notifier] | None = None,
     recorder_factory: Callable[[Settings, bool], TradingRecorder] | None = None,
+    historical_store_factory: Callable[[], HistoricalDataStore] | None = None,
     clock: ClockFn | None = None,
 ) -> Runtime:
     """전략·리스크·브로커·시세·Executor·스케줄러를 조립해 `Runtime` 반환.
@@ -289,8 +296,10 @@ def build_runtime(
     kis_client = build_kis(settings)
     realtime_store = build_rt(settings)
 
-    for ticker in universe.tickers:
-        realtime_store.subscribe(ticker)
+    # PR4 (ADR-0025 후속): universe 사전 구독 제거. RSI MR 일봉 전략은 진입 시점에만
+    # `Executor._handle_entry` 가 분봉 구독을 동적으로 켠다. KIS WebSocket 동시
+    # 구독 한도(약 41) 회피 + 보유 포지션만 분봉 데이터 흐름. restore_session 도
+    # open_positions 만 재구독.
 
     order_submitter = _build_order_submitter(args.dry_run, kis_client)
     balance_provider: BalanceProvider = LiveBalanceProvider(kis_client)
@@ -320,6 +329,8 @@ def build_runtime(
     notifier = build_notifier(settings, args.dry_run)
     build_recorder = recorder_factory or _default_recorder_factory
     recorder = build_recorder(settings, args.dry_run)
+    build_hist = historical_store_factory or HistoricalDataStore
+    historical_store = build_hist()
     runtime = Runtime(
         scheduler=scheduler,
         executor=executor,
@@ -330,6 +341,7 @@ def build_runtime(
         session_status=SessionStatus(),
         notifier=notifier,
         recorder=recorder,
+        historical_store=historical_store,
     )
     _install_jobs(scheduler, runtime, args, clock=clock)
     return runtime
@@ -373,6 +385,14 @@ def _install_jobs(
         logger.warning(
             "main.install_jobs: RSI MR 모드 — 15:00 force_close cron 미등록 "
             "(일봉 평균회귀 전략 강제청산 부적합, ADR-0025)."
+        )
+        # PR5 (ADR-0027): RSI MR EOD 일봉 트리거 cron — universe 일봉 fetch →
+        # strategy.on_bar 호출 → 발생 시그널을 Executor pending buffer 로 큐인.
+        # 다음 영업일 09:00 후 첫 step 에서 reconcile 보다 먼저 flush.
+        scheduler.add_job(
+            _on_eod_signal(runtime, runtime.historical_store, clock=effective_clock),
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=35, second=0, timezone=tz),
+            name="on_eod_signal",
         )
     else:
         scheduler.add_job(
@@ -665,6 +685,87 @@ def _safe_pct(pnl: Any, starting: Any) -> float | None:
         return (float(pnl) / s) * 100.0
     except (TypeError, ValueError, ArithmeticError):
         return None
+
+
+def _on_eod_signal(
+    runtime: Runtime,
+    historical_store: HistoricalDataStore,
+    *,
+    clock: ClockFn,
+) -> Callable[[], None]:
+    """15:35 KST — RSI MR EOD 일봉 트리거. 다음 영업일 시초 진입용 시그널 큐인 (PR5, ADR-0027).
+
+    동작:
+    1. `clock()` → today (KST aware datetime → date).
+    2. `runtime.executor.strategy.config.universe` 의 각 종목에 대해
+       `historical_store.fetch_daily_ohlcv(symbol, today, today)` 호출. 빈 결과는 skip.
+    3. `DailyBar` 를 `MinuteBar(bar_time=today 09:00 KST)` 로 wrap → `strategy.on_bar` 호출.
+    4. 발생 시그널을 모아 `runtime.executor.enqueue_pending_signals(signals)` 1회 호출.
+       시그널 0건이면 enqueue skip.
+
+    예외 전파 금지 — ADR-0011 결정 5 와 동일 기조. APScheduler 가 다음 발화 정상 진행.
+    """
+
+    def callback() -> None:
+        try:
+            today = clock().date()
+            strategy = runtime.executor.strategy
+            if not isinstance(strategy, RSIMRStrategy):
+                logger.error("main.on_eod_signal: 비-RSIMR 전략에 EOD cron 발화 — wiring 결함.")
+                return
+            universe = strategy.config.universe
+            collected: list[Signal] = []
+            for symbol in universe:
+                try:
+                    bars = historical_store.fetch_daily_ohlcv(symbol, start=today, end=today)
+                except (RuntimeError, OSError) as e:
+                    logger.warning(
+                        "main.on_eod_signal: fetch_daily_ohlcv 실패 (sym={s}, "
+                        "err={cls}: {err}) — skip",
+                        s=symbol,
+                        cls=e.__class__.__name__,
+                        err=str(e),
+                    )
+                    continue
+                if not bars:
+                    logger.debug(
+                        "main.on_eod_signal: 일봉 빈 결과 (sym={s}, today={d}) — skip",
+                        s=symbol,
+                        d=today.isoformat(),
+                    )
+                    continue
+                bar_time = datetime.combine(today, time(9, 0), tzinfo=KST)
+                for daily_bar in bars:
+                    wrapped = MinuteBar(
+                        symbol=daily_bar.symbol,
+                        bar_time=bar_time,
+                        open=daily_bar.open,
+                        high=daily_bar.high,
+                        low=daily_bar.low,
+                        close=daily_bar.close,
+                        volume=daily_bar.volume,
+                    )
+                    collected.extend(strategy.on_bar(wrapped))
+            if collected:
+                runtime.executor.enqueue_pending_signals(collected)
+                logger.info(
+                    "main.on_eod_signal: signals queued n={n} today={d}",
+                    n=len(collected),
+                    d=today.isoformat(),
+                )
+            else:
+                logger.info(
+                    "main.on_eod_signal: 시그널 0건 today={d}",
+                    d=today.isoformat(),
+                )
+        except Exception as e:
+            logger.exception(
+                "main.on_eod_signal: 예기치 못한 예외 — {cls}: {err}",
+                cls=e.__class__.__name__,
+                err=str(e),
+            )
+
+    return callback
 
 
 def _on_daily_report(runtime: Runtime, clock: ClockFn) -> Callable[[], None]:

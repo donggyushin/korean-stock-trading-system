@@ -102,9 +102,18 @@ class BalanceProvider(Protocol):
 
 
 class BarSource(Protocol):
-    """분봉 조회 경계. `RealtimeDataStore` 가 자연스럽게 만족."""
+    """분봉 조회 + 동적 구독 경계. `RealtimeDataStore` 가 자연스럽게 만족.
+
+    PR4 (ADR-0025 후속): KIS WebSocket 동시 구독 한도(약 41) 회피 + RSI MR 일봉
+    전략 정합성을 위해 진입/청산 시점에만 동적으로 분봉 구독을 켜고 끈다.
+    `RealtimeDataStore.subscribe`/`unsubscribe` 가 이미 idempotent 하게 동작.
+    """
 
     def get_minute_bars(self, symbol: str) -> list[MinuteBar]: ...
+
+    def subscribe(self, symbol: str) -> None: ...
+
+    def unsubscribe(self, symbol: str) -> None: ...
 
 
 class OpenPositionInput(Protocol):
@@ -483,6 +492,10 @@ class Executor:
         self._last_reconcile: ReconcileReport | None = None
         self._sweep_entry_events: list[EntryEvent] = []
         self._sweep_exit_events: list[ExitEvent] = []
+        # PR5 (ADR-0027): EOD 일봉 트리거가 큐인하는 다음 영업일 시초 진입용 시그널 buffer.
+        # `step()` 시작 부분에서 reconcile 직전에 flush. start_session/restore_session 은
+        # buffer clear 안 함 — EOD 시그널이 다음 영업일 09:00 첫 step 까지 살아남아야 함.
+        self._pending_signals: list[Signal] = []
 
     # ---- 세션 -----------------------------------------------------------
 
@@ -631,6 +644,11 @@ class Executor:
             )
             for p in positions
         }
+        # PR4 (ADR-0025 후속): 재기동 복원 포지션도 분봉 구독 재활성. 운영자가
+        # 프로세스를 재시작했을 때 진입은 했지만 미청산인 포지션의 stop_loss 가드
+        # (PR3) 와 분봉 데이터 흐름이 끊기지 않도록.
+        for p in positions:
+            self._bar_source.subscribe(p.symbol)
         self._halt = False
         self._last_reconcile = None
         logger.warning(
@@ -643,6 +661,26 @@ class Executor:
             e=entries_today,
             pnl=daily_realized_pnl_krw,
         )
+
+    # ---- EOD 시그널 큐 (PR5, ADR-0027) ---------------------------------
+
+    def enqueue_pending_signals(self, signals: Sequence[Signal]) -> None:
+        """EOD cron 이 다음 영업일 시초 진입을 위한 시그널을 큐인.
+
+        ADR-0027 결정: RSI MR 일봉 전략은 매일 EOD 시점 (15:35 KST) 에 universe 전 종목
+        일봉을 fetch → strategy.on_bar 호출 → 발생한 시그널을 본 메서드로 버퍼링.
+        다음 영업일 09:00 후 첫 `step()` 발화 시 reconcile 직전 위치에서 flush 되어
+        시장가 시초 주문이 제출된다.
+
+        Raises:
+            RuntimeError: signals 안에 EntrySignal·ExitSignal 외 타입이 섞이면 거부.
+        """
+        for sig in signals:
+            if not isinstance(sig, EntrySignal | ExitSignal):
+                raise RuntimeError(
+                    f"Executor.enqueue_pending_signals: 미지원 시그널 타입 {type(sig).__name__}"
+                )
+        self._pending_signals.extend(signals)
 
     # ---- 주 루프 --------------------------------------------------------
 
@@ -660,9 +698,16 @@ class Executor:
 
         self._sweep_entry_events = []
         self._sweep_exit_events = []
+        # PR5 (ADR-0027): EOD cron 이 큐인한 시그널을 reconcile 보다 먼저 flush.
+        # 다음 영업일 첫 step 에서 시초가 시장가 주문 → 분봉 체결 추적 흐름.
+        # buffer 가 비어있으면 _process_signals 호출 자체를 skip (불필요 부작용 차단).
+        orders_submitted = 0
+        if self._pending_signals:
+            pending = list(self._pending_signals)
+            self._pending_signals.clear()
+            orders_submitted += self._process_signals(pending, now)
         reconcile_report = self.reconcile()
         processed_bars = 0
-        orders_submitted = 0
 
         for symbol in self._symbols:
             bars = self._bar_source.get_minute_bars(symbol)
@@ -930,6 +975,10 @@ class Executor:
                 order_number=ticket.order_number,
             )
         )
+        # PR4 (ADR-0025 후속): 진입 체결(partial/full) 직후 분봉 구독 활성화 —
+        # 분봉 stop_loss 가드(PR3) 와 strategy.on_bar 데이터 소스 모두 보유 종목만
+        # 필요. KIS paper WebSocket 동시 구독 한도(약 41) 회피.
+        self._bar_source.subscribe(signal.symbol)
         return True
 
     def _handle_exit(self, signal: ExitSignal, now: datetime) -> bool:
@@ -1000,6 +1049,10 @@ class Executor:
         self._risk_manager.record_exit(signal.symbol, net_pnl)
         # _open_lots 미존재 fallback 경로(외부 record_entry) 에서는 키가 없을 수 있다.
         self._open_lots.pop(signal.symbol, None)
+        # PR4 (ADR-0025 후속): full fill 청산 직후 분봉 구독 해제 — 동시 구독 한도
+        # 압박 회피 + 자원 정리. partial/none 청산은 위에서 ExecutorError 로 차단되어
+        # 여기 도달 못하므로 자연스럽게 "정상 청산만 unsubscribe" 가 보장됨.
+        self._bar_source.unsubscribe(signal.symbol)
         logger.info(
             "executor.exit.filled symbol={symbol} qty={qty} fill_price={price} "
             "net_pnl={pnl} reason={reason}",

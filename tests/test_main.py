@@ -102,6 +102,7 @@ def _make_runtime(
     session_status: SessionStatus | None = None,
     notifier: MagicMock | None = None,
     recorder: MagicMock | TradingRecorder | None = None,
+    historical_store: MagicMock | None = None,
 ) -> Runtime:
     """Runtime 더블 조립 헬퍼.
 
@@ -118,6 +119,7 @@ def _make_runtime(
     _rm = risk_manager or MagicMock(spec=RiskManager)
     _ss = session_status or SessionStatus()
     _notifier = notifier or MagicMock(spec=Notifier)
+    _hist = historical_store or MagicMock()
     if recorder is None:
         # 기본 경로를 "신규 세션"으로 유지 — load_* 가 빈 결과를 반환하도록 configure.
         _recorder = MagicMock(spec=TradingRecorder)
@@ -140,6 +142,7 @@ def _make_runtime(
         session_status=_ss,
         notifier=_notifier,
         recorder=_recorder,
+        historical_store=_hist,
     )
 
 
@@ -280,28 +283,6 @@ def _fake_settings() -> MagicMock:
     return s
 
 
-def test_build_runtime_정상_subscribe_각_티커_호출(
-    _mock_universe: KospiUniverse, _fake_settings: MagicMock
-) -> None:
-    fake_rt = MagicMock()
-    fake_kis = MagicMock(spec=KisClient)
-    fake_scheduler = MagicMock()
-    args = _parse_args([])
-
-    build_runtime(
-        args,
-        _fake_settings,
-        kis_client_factory=lambda s: fake_kis,
-        realtime_store_factory=lambda s: fake_rt,
-        scheduler_factory=lambda: fake_scheduler,
-        universe_loader=lambda p: _mock_universe,
-        clock=lambda: _kst(9, 0),
-    )
-
-    subscribe_calls = [c[0][0] for c in fake_rt.subscribe.call_args_list]
-    assert subscribe_calls == list(_TICKERS)
-
-
 def test_build_runtime_dry_run_True_시_DryRunOrderSubmitter_주입(
     _mock_universe: KospiUniverse, _fake_settings: MagicMock
 ) -> None:
@@ -373,10 +354,10 @@ def test_build_runtime_Runtime_필드_반환(
     assert runtime.recorder is fake_recorder
 
 
-def test_build_runtime_Runtime_필드_9개_반환(
+def test_build_runtime_Runtime_필드_10개_반환(
     _mock_universe: KospiUniverse, _fake_settings: MagicMock
 ) -> None:
-    """Runtime 이 9개 필드를 갖는지 명시 검증 (recorder 추가). (I1)"""
+    """Runtime 이 10개 필드를 갖는지 명시 검증 (PR5: historical_store 추가). (I1)"""
     fake_rt = MagicMock()
     args = _parse_args([])
 
@@ -389,6 +370,7 @@ def test_build_runtime_Runtime_필드_9개_반환(
         universe_loader=lambda p: _mock_universe,
         notifier_factory=lambda s, d: MagicMock(spec=Notifier),
         recorder_factory=lambda s, d: MagicMock(spec=TradingRecorder),
+        historical_store_factory=lambda: MagicMock(),
     )
 
     field_names = {f.name for f in dataclasses.fields(runtime)}
@@ -396,7 +378,8 @@ def test_build_runtime_Runtime_필드_9개_반환(
     assert "session_status" in field_names, "Runtime 에 session_status 필드가 없다"
     assert "notifier" in field_names, "Runtime 에 notifier 필드가 없다"
     assert "recorder" in field_names, "Runtime 에 recorder 필드가 없다"
-    assert len(field_names) == 9, f"Runtime 필드 수가 9이 아님: {field_names}"
+    assert "historical_store" in field_names, "Runtime 에 historical_store 필드가 없다 (PR5)"
+    assert len(field_names) == 10, f"Runtime 필드 수가 10이 아님: {field_names}"
 
 
 # ---------------------------------------------------------------------------
@@ -1173,6 +1156,7 @@ def _base_patches(mocker: Any) -> dict[str, MagicMock]:
         session_status=fake_ss,
         notifier=fake_notifier,
         recorder=fake_recorder,
+        historical_store=MagicMock(),
     )
     patches["build_runtime"].return_value = fake_runtime
 
@@ -3048,9 +3032,9 @@ class TestInstallJobsRSIMRBranch:
 
         _install_jobs(scheduler, runtime, args, clock=lambda: _kst(9, 0))
 
-        # GREEN 단계: force_close cron 미등록 → add_job 3회
-        assert scheduler.add_job.call_count == 3, (
-            f"RSIMRStrategy 모드에서 add_job 은 3회 기대, 실제={scheduler.add_job.call_count}"
+        # PR5 후: on_eod_signal cron 추가 → RSIMRStrategy 모드 add_job 4회
+        assert scheduler.add_job.call_count == 4, (
+            f"RSIMRStrategy 모드에서 add_job 은 4회 기대, 실제={scheduler.add_job.call_count}"
         )
 
     def test_install_jobs_rsimr_strategy면_on_force_close_name_부재(self) -> None:
@@ -3115,4 +3099,580 @@ class TestInstallJobsRSIMRBranch:
         all_args = str(mock_logger.warning.call_args_list)
         assert "force_close" in all_args, (
             f"warning 메시지에 'force_close' 키워드가 없다. 실제={all_args}"
+        )
+
+
+# ===========================================================================
+# PR4 (lazy subscribe) — build_runtime 이 universe 사전 구독을 하지 않는다 (RED)
+# ===========================================================================
+
+
+class TestBuildRuntimeNoUniversePreSubscribe:
+    """build_runtime 호출 후 realtime_store.subscribe 가 0회 호출되어야 한다.
+
+    RED 단계: 현행 main.py:292-293 이 universe 전체를 사전 구독하므로
+    subscribe_call_count > 0 → 단언이 실패(FAIL).
+    GREEN 단계: 해당 코드 제거 후 통과.
+
+    가드레일: KIS·텔레그램·외부 HTTP 접촉 없음. realtime_store 는 MagicMock.
+    """
+
+    _FAKE_TICKERS = ("005930", "000660", "035720")
+
+    def _build(self, tickers: tuple[str, ...] = _FAKE_TICKERS) -> tuple[Any, MagicMock]:
+        """build_runtime 을 실행하고 (runtime, fake_rt) 를 반환."""
+        from types import SimpleNamespace
+
+        from stock_agent.monitor import NullNotifier
+        from stock_agent.storage import NullTradingRecorder
+
+        args = _parse_args([])
+        settings = SimpleNamespace(has_live_keys=True)
+        universe = KospiUniverse(as_of_date=_DATE, source="test", tickers=tickers)
+        fake_rt = MagicMock()
+
+        runtime = build_runtime(
+            args,
+            settings,  # type: ignore[arg-type]
+            kis_client_factory=lambda s: MagicMock(spec=KisClient),
+            realtime_store_factory=lambda s: fake_rt,
+            scheduler_factory=lambda: MagicMock(),
+            universe_loader=lambda p: universe,
+            notifier_factory=lambda s, d: NullNotifier(),
+            recorder_factory=lambda s, d: NullTradingRecorder(),
+            clock=lambda: _kst(9, 0),
+        )
+        return runtime, fake_rt
+
+    def test_build_runtime_universe_사전_구독_0회(self) -> None:
+        """build_runtime 후 realtime_store.subscribe 호출 카운트 == 0.
+
+        현행(RED): main.py 가 universe 전체 사전 구독 → subscribe 가 len(tickers) 회 호출.
+        GREEN 단계: 해당 코드 제거 후 subscribe_call_count == 0 통과.
+        """
+        _runtime, fake_rt = self._build()
+
+        subscribe_call_count = fake_rt.subscribe.call_count
+        assert subscribe_call_count == 0, (
+            f"build_runtime 후 universe 사전 구독 0회 기대, "
+            f"실제 subscribe 호출 횟수={subscribe_call_count} "
+            f"(호출 인자={[c[0][0] for c in fake_rt.subscribe.call_args_list]})"
+        )
+
+    def test_build_runtime_subscribe_calls_빈_리스트(self) -> None:
+        """realtime_store_factory 더블의 subscribe call_args_list 가 빈 리스트.
+
+        위 테스트와 동일 동작을 call_args_list 레벨에서 이중 확인.
+        GREEN 단계: call_args_list == [] 통과.
+        """
+        _runtime, fake_rt = self._build()
+
+        call_args = [c[0][0] for c in fake_rt.subscribe.call_args_list]
+        assert call_args == [], (
+            f"build_runtime 후 subscribe call_args_list 빈 리스트 기대, 실제={call_args}"
+        )
+
+    def test_build_runtime_universe_비어있지_않아도_사전_구독_0회(self) -> None:
+        """universe.tickers non-empty 와 무관하게 사전 구독은 0회.
+
+        universe 199 종목 로드 성공 여부와 subscribe 호출은 독립적임을 검증.
+        GREEN 단계: 어떤 tickers 크기여도 subscribe 0회 통과.
+        """
+        large_tickers = tuple(f"{i:06d}" for i in range(50))  # 50종목
+        _runtime, fake_rt = self._build(tickers=large_tickers)
+
+        subscribe_call_count = fake_rt.subscribe.call_count
+        assert subscribe_call_count == 0, (
+            f"universe {len(large_tickers)}종목이어도 사전 구독 0회 기대, "
+            f"실제 subscribe 호출 횟수={subscribe_call_count}"
+        )
+
+
+# ===========================================================================
+# PR5 — on_eod_signal cron 등록 계약 + 콜백 동작 (RED)
+#
+# ADR-0027: RSI MR 모드 전용 cron `on_eod_signal` (평일 15:35 KST) 신설.
+#   - universe 일봉 fetch → 09:00 KST MinuteBar wrap → strategy.on_bar →
+#     시그널 수집 → executor.enqueue_pending_signals(signals) 큐인.
+#   - _install_jobs 에서 RSIMRStrategy 모드이면 on_eod_signal 등록
+#     (RSIMRStrategy 모드 total add_job 4회: on_session_start + on_step +
+#      on_eod_signal + on_daily_report).
+#   - 비-RSIMRStrategy 모드에서는 on_eod_signal 미등록.
+#
+# RED 단계: _on_eod_signal 미구현 + _install_jobs on_eod_signal 등록 없음.
+# ===========================================================================
+
+
+class TestInstallJobsEodSignalRSIMR:
+    """_install_jobs: RSI MR 모드에서 on_eod_signal cron 등록 검증 (PR5 RED)."""
+
+    @staticmethod
+    def _make_fake_executor_with_strategy(strategy: object) -> MagicMock:
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = strategy
+        return fake_exc
+
+    def test_install_jobs_rsimr_mode_on_eod_signal_등록(self) -> None:
+        """RSIMRStrategy 모드에서 on_eod_signal cron 이 1건 등록된다.
+
+        GREEN 단계: _install_jobs 내부에서 RSIMRStrategy 분기에
+        on_eod_signal add_job 호출 추가 후 통과.
+        """
+        from apscheduler.schedulers.blocking import BlockingScheduler
+
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        scheduler = MagicMock(spec=BlockingScheduler)
+        rsimr = RSIMRStrategy(RSIMRConfig(universe=("005930",)))
+        fake_exc = self._make_fake_executor_with_strategy(rsimr)
+        runtime = _make_runtime(scheduler=scheduler, executor=fake_exc)
+        args = _parse_args([])
+
+        _install_jobs(scheduler, runtime, args, clock=lambda: _kst(9, 0))
+
+        registered_names = [c.kwargs.get("name") for c in scheduler.add_job.call_args_list]
+        assert "on_eod_signal" in registered_names, (
+            f"RSIMRStrategy 모드에서 on_eod_signal 이 등록되어야 한다. "
+            f"등록된 names={registered_names}"
+        )
+
+    def test_install_jobs_rsimr_mode_on_eod_signal_trigger_파라미터(self) -> None:
+        """on_eod_signal cron trigger 는 mon-fri 15:35 KST 여야 한다.
+
+        GREEN 단계: CronTrigger(day_of_week='mon-fri', hour=15, minute=35,
+        timezone='Asia/Seoul') 으로 등록 후 통과.
+        """
+        from apscheduler.schedulers.blocking import BlockingScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        scheduler = MagicMock(spec=BlockingScheduler)
+        rsimr = RSIMRStrategy(RSIMRConfig(universe=("005930",)))
+        fake_exc = self._make_fake_executor_with_strategy(rsimr)
+        runtime = _make_runtime(scheduler=scheduler, executor=fake_exc)
+        args = _parse_args([])
+
+        _install_jobs(scheduler, runtime, args, clock=lambda: _kst(9, 0))
+
+        # on_eod_signal add_job 호출 찾기
+        eod_calls = [
+            c for c in scheduler.add_job.call_args_list if c.kwargs.get("name") == "on_eod_signal"
+        ]
+        assert len(eod_calls) == 1, (
+            f"on_eod_signal add_job 호출이 1건 이어야 한다. 실제={len(eod_calls)}"
+        )
+        trigger_arg = eod_calls[0].kwargs.get("trigger") or (
+            eod_calls[0].args[1] if len(eod_calls[0].args) > 1 else None
+        )
+        # trigger 가 CronTrigger 인스턴스인지 확인
+        assert isinstance(trigger_arg, CronTrigger), (
+            f"on_eod_signal trigger 는 CronTrigger 여야 한다. 실제={type(trigger_arg)}"
+        )
+        # trigger 필드 확인 (hour=15, minute=35)
+        trigger_str = str(trigger_arg)
+        assert "15" in trigger_str and "35" in trigger_str, (
+            f"on_eod_signal trigger 는 15:35 를 포함해야 한다. trigger={trigger_str}"
+        )
+
+    def test_install_jobs_non_rsimr_mode_on_eod_signal_미등록(self) -> None:
+        """비-RSIMRStrategy 모드에서 on_eod_signal 은 등록되지 않는다.
+
+        ORBStrategy 인스턴스이면 on_force_close 가 등록되고
+        on_eod_signal 은 등록되지 않아야 한다.
+        """
+        from apscheduler.schedulers.blocking import BlockingScheduler
+
+        scheduler = MagicMock(spec=BlockingScheduler)
+        orb = ORBStrategy(StrategyConfig())
+        fake_exc = self._make_fake_executor_with_strategy(orb)
+        runtime = _make_runtime(scheduler=scheduler, executor=fake_exc)
+        args = _parse_args([])
+
+        _install_jobs(scheduler, runtime, args, clock=lambda: _kst(9, 0))
+
+        registered_names = [c.kwargs.get("name") for c in scheduler.add_job.call_args_list]
+        assert "on_eod_signal" not in registered_names, (
+            f"ORBStrategy 모드에서 on_eod_signal 이 등록되면 안 된다. "
+            f"등록된 names={registered_names}"
+        )
+
+    def test_install_jobs_rsimr_mode_total_add_job_4회(self) -> None:
+        """RSIMRStrategy 모드 total add_job == 4 (on_session_start + on_step +
+        on_eod_signal + on_daily_report).
+
+        PR5 전: 3회 (force_close 미등록). PR5 후: on_eod_signal 추가로 4회.
+        """
+        from apscheduler.schedulers.blocking import BlockingScheduler
+
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        scheduler = MagicMock(spec=BlockingScheduler)
+        rsimr = RSIMRStrategy(RSIMRConfig(universe=("005930",)))
+        fake_exc = self._make_fake_executor_with_strategy(rsimr)
+        runtime = _make_runtime(scheduler=scheduler, executor=fake_exc)
+        args = _parse_args([])
+
+        _install_jobs(scheduler, runtime, args, clock=lambda: _kst(9, 0))
+
+        assert scheduler.add_job.call_count == 4, (
+            f"RSIMRStrategy 모드 add_job 4회 기대, 실제={scheduler.add_job.call_count}"
+        )
+
+
+# ===========================================================================
+# PR5 — _on_eod_signal 콜백 동작 계약 (RED)
+#
+# ADR-0027 콜백 계약:
+#   1. universe 종목 수만큼 hist_store.fetch_daily_ohlcv 호출
+#   2. 결과 없는 종목은 strategy.on_bar skip
+#   3. 시그널이 있으면 executor.enqueue_pending_signals 를 1회 호출
+#   4. executor.enqueue_pending_signals 인자: list[Signal] (EntrySignal/ExitSignal)
+#   5. hist_store 가 없거나 fetch 실패 시 로깅 후 continue (세션 중단 없음)
+#   6. strategy.on_bar 에 전달되는 MinuteBar.bar_time == 당일 09:00 KST
+#
+# RED 단계: _on_eod_signal 함수 자체가 없으므로 ImportError 로 전원 실패.
+# ===========================================================================
+
+
+class TestOnEodSignalCallback:
+    """_on_eod_signal 콜백 동작 계약 검증 (PR5 RED).
+
+    ADR-0027: EOD cron 콜백이 일봉을 fetch → MinuteBar wrap →
+    strategy.on_bar → executor.enqueue_pending_signals 경로 검증.
+    """
+
+    @staticmethod
+    def _import_on_eod_signal() -> Any:
+        """_on_eod_signal 임포트. 미구현이면 ImportError/AttributeError 로 실패."""
+        from stock_agent.main import _on_eod_signal  # type: ignore[attr-defined]
+
+        return _on_eod_signal
+
+    def test_on_eod_signal_임포트_가능(self) -> None:
+        """_on_eod_signal 이 stock_agent.main 에서 임포트 가능해야 한다.
+
+        RED 단계: 함수 없음 → ImportError.
+        GREEN 단계: 함수 신설 후 통과.
+        """
+        self._import_on_eod_signal()
+
+    def test_on_eod_signal_fetch_daily_ohlcv_universe_크기만큼_호출(self, mocker: Any) -> None:
+        """_on_eod_signal 콜백 실행 시 universe 크기만큼 fetch_daily_ohlcv 호출.
+
+        GREEN 단계: 콜백 내부가 universe.tickers 를 순회하며
+        hist_store.fetch_daily_ohlcv(symbol, ...) 를 호출해야 한다.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930", "000660", "035420")
+        rsimr = RSIMRStrategy(RSIMRConfig(universe=tickers))
+
+        # DailyBar 더블 (fetch 가 반환할 값)
+        def _make_daily_bar(symbol: str) -> DailyBar:
+            return DailyBar(
+                symbol=symbol,
+                trade_date=_DATE,
+                open=Decimal("70000"),
+                high=Decimal("71000"),
+                low=Decimal("69000"),
+                close=Decimal("70500"),
+                volume=100_000,
+            )
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.side_effect = lambda sym, **kw: [_make_daily_bar(sym)]
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr
+        runtime = _make_runtime(executor=fake_exc)
+
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()
+
+        assert fake_hist_store.fetch_daily_ohlcv.call_count == len(tickers), (
+            f"fetch_daily_ohlcv 호출 횟수 {len(tickers)} 기대, "
+            f"실제={fake_hist_store.fetch_daily_ohlcv.call_count}"
+        )
+
+    def test_on_eod_signal_빈_결과_종목_on_bar_skip(self, mocker: Any) -> None:
+        """fetch_daily_ohlcv 가 빈 리스트를 반환하는 종목은 strategy.on_bar 를 skip.
+
+        데이터 없는 종목을 강제로 on_bar 에 넘기면 잘못된 시그널이 생성될 수 있다.
+        GREEN 단계: 빈 결과 종목은 continue 해 on_bar 미호출.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930", "000660")
+        rsimr_mock = MagicMock(spec=RSIMRStrategy)
+        rsimr_mock.on_bar.return_value = []
+        rsimr_mock.config = RSIMRConfig(universe=tickers)
+
+        def _fetch(sym: str, **kw: Any) -> list[DailyBar]:
+            if sym == "005930":
+                return []  # 빈 결과 → skip
+            return [
+                DailyBar(
+                    symbol=sym,
+                    trade_date=_DATE,
+                    open=Decimal("50000"),
+                    high=Decimal("51000"),
+                    low=Decimal("49000"),
+                    close=Decimal("50500"),
+                    volume=50_000,
+                )
+            ]
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.side_effect = _fetch
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr_mock
+        # enqueue_pending_signals 는 spec 에 없으므로 configure
+        fake_exc.enqueue_pending_signals = MagicMock()
+
+        runtime = _make_runtime(executor=fake_exc)
+
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()
+
+        # 005930 은 빈 결과 → on_bar 미호출 → 총 1회 (000660 만)
+        assert rsimr_mock.on_bar.call_count == 1, (
+            f"빈 결과 종목 제외 on_bar 1회 기대, 실제={rsimr_mock.on_bar.call_count}"
+        )
+
+    def test_on_eod_signal_enqueue_pending_signals_1회_호출(self, mocker: Any) -> None:
+        """시그널이 있으면 executor.enqueue_pending_signals 를 1회 호출.
+
+        여러 종목에서 시그널이 나와도 enqueue 는 1번 합산 호출 (batched).
+        GREEN 단계: 콜백이 signals 를 모아 enqueue_pending_signals([...]) 1회.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.strategy.base import EntrySignal
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930", "000660")
+
+        # on_bar 가 EntrySignal 을 반환하도록 설정
+        def _on_bar_side_effect(bar: Any) -> list[Any]:
+            return [
+                EntrySignal(
+                    symbol=bar.symbol,
+                    price=Decimal("50000"),
+                    ts=_kst(9, 0),
+                    stop_price=Decimal("48500"),
+                    take_price=Decimal("0"),
+                )
+            ]
+
+        rsimr_mock = MagicMock(spec=RSIMRStrategy)
+        rsimr_mock.on_bar.side_effect = _on_bar_side_effect
+        rsimr_mock.config = RSIMRConfig(universe=tickers)
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.return_value = [
+            DailyBar(
+                symbol="dummy",
+                trade_date=_DATE,
+                open=Decimal("50000"),
+                high=Decimal("51000"),
+                low=Decimal("49000"),
+                close=Decimal("50500"),
+                volume=50_000,
+            )
+        ]
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr_mock
+        fake_exc.enqueue_pending_signals = MagicMock()
+
+        runtime = _make_runtime(executor=fake_exc)
+
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()
+
+        # 시그널이 있으면 enqueue_pending_signals 1회 호출
+        assert fake_exc.enqueue_pending_signals.call_count == 1, (
+            f"enqueue_pending_signals 1회 호출 기대, "
+            f"실제={fake_exc.enqueue_pending_signals.call_count}"
+        )
+
+    def test_on_eod_signal_on_bar_minutebar_bar_time_09시(self, mocker: Any) -> None:
+        """strategy.on_bar 에 전달되는 MinuteBar.bar_time 은 당일 09:00 KST.
+
+        DailyBar 를 MinuteBar 로 wrap 할 때 bar_time 은 당일 장 시작 시각.
+        GREEN 단계: MinuteBar(bar_time=today 09:00 KST) wrap 후 on_bar 호출.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.data.realtime import MinuteBar
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930",)
+
+        received_bars: list[Any] = []
+
+        def _capture_on_bar(bar: Any) -> list[Any]:
+            received_bars.append(bar)
+            return []
+
+        rsimr_mock = MagicMock(spec=RSIMRStrategy)
+        rsimr_mock.on_bar.side_effect = _capture_on_bar
+        rsimr_mock.config = RSIMRConfig(universe=tickers)
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.return_value = [
+            DailyBar(
+                symbol="005930",
+                trade_date=_DATE,
+                open=Decimal("70000"),
+                high=Decimal("71000"),
+                low=Decimal("69000"),
+                close=Decimal("70500"),
+                volume=100_000,
+            )
+        ]
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr_mock
+        fake_exc.enqueue_pending_signals = MagicMock()
+
+        runtime = _make_runtime(executor=fake_exc)
+
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()
+
+        assert len(received_bars) == 1, f"on_bar 가 1회 호출되어야 한다. 실제={len(received_bars)}"
+        bar = received_bars[0]
+        assert isinstance(bar, MinuteBar), (
+            f"on_bar 에 전달된 인자는 MinuteBar 여야 한다. 실제={type(bar)}"
+        )
+        expected_bar_time = _kst(9, 0)
+        assert bar.bar_time == expected_bar_time, (
+            f"MinuteBar.bar_time 은 당일 09:00 KST 여야 한다. "
+            f"기대={expected_bar_time}, 실제={bar.bar_time}"
+        )
+
+    def test_on_eod_signal_시그널_없으면_enqueue_미호출(self, mocker: Any) -> None:
+        """모든 종목 on_bar 가 빈 리스트 반환이면 enqueue_pending_signals 미호출.
+
+        불필요한 enqueue 로 빈 배열을 push하지 않는 설계 검증.
+        GREEN 단계: signals == [] 이면 enqueue_pending_signals skip.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930",)
+
+        rsimr_mock = MagicMock(spec=RSIMRStrategy)
+        rsimr_mock.on_bar.return_value = []  # 시그널 없음
+        rsimr_mock.config = RSIMRConfig(universe=tickers)
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.return_value = [
+            DailyBar(
+                symbol="005930",
+                trade_date=_DATE,
+                open=Decimal("70000"),
+                high=Decimal("71000"),
+                low=Decimal("69000"),
+                close=Decimal("70500"),
+                volume=100_000,
+            )
+        ]
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr_mock
+        fake_exc.enqueue_pending_signals = MagicMock()
+
+        runtime = _make_runtime(executor=fake_exc)
+
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()
+
+        assert fake_exc.enqueue_pending_signals.call_count == 0, (
+            f"시그널 없으면 enqueue_pending_signals 미호출 기대, "
+            f"실제={fake_exc.enqueue_pending_signals.call_count}"
+        )
+
+    def test_on_eod_signal_fetch_실패_시_세션_중단_없음(self, mocker: Any) -> None:
+        """fetch_daily_ohlcv 가 예외를 던져도 콜백이 중단되지 않는다.
+
+        데이터 소스 장애가 전체 EOD sweep 을 죽이지 않도록 per-symbol continue.
+        GREEN 단계: 예외 발생 종목을 로깅하고 나머지 종목 처리 계속.
+        """
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        from stock_agent.data.historical import DailyBar
+        from stock_agent.strategy.rsi_mr import RSIMRConfig, RSIMRStrategy
+
+        _on_eod_signal_fn = self._import_on_eod_signal()
+
+        tickers = ("005930", "000660")
+
+        call_count = {"n": 0}
+
+        def _fetch_with_failure(sym: str, **kw: Any) -> list[DailyBar]:
+            call_count["n"] += 1
+            if sym == "005930":
+                raise RuntimeError("KIS fetch 실패 시뮬레이션")
+            return [
+                DailyBar(
+                    symbol=sym,
+                    trade_date=_DATE,
+                    open=Decimal("50000"),
+                    high=Decimal("51000"),
+                    low=Decimal("49000"),
+                    close=Decimal("50500"),
+                    volume=50_000,
+                )
+            ]
+
+        rsimr_mock = MagicMock(spec=RSIMRStrategy)
+        rsimr_mock.on_bar.return_value = []
+        rsimr_mock.config = RSIMRConfig(universe=tickers)
+
+        fake_hist_store = MagicMock()
+        fake_hist_store.fetch_daily_ohlcv.side_effect = _fetch_with_failure
+
+        fake_exc = MagicMock(spec=Executor)
+        fake_exc.strategy = rsimr_mock
+        fake_exc.enqueue_pending_signals = MagicMock()
+
+        runtime = _make_runtime(executor=fake_exc)
+
+        # 예외가 콜백 밖으로 새어나오면 안 된다
+        callback = _on_eod_signal_fn(runtime, fake_hist_store, clock=lambda: _kst(15, 35))
+        callback()  # RuntimeError 가 여기서 터지면 테스트 FAIL
+
+        # 두 종목 모두 fetch 시도했어야 함
+        assert call_count["n"] == len(tickers), (
+            f"fetch 시도 횟수 {len(tickers)} 기대 (실패 종목도 시도), 실제={call_count['n']}"
         )
